@@ -196,7 +196,7 @@ fn main() {
     }
 
     println!("\n[Result]");
-    println!("  M01.1 verification SUCCESS: X11 connection established and environment verified cleanly.");
+    println!("  M01.1: X11 connection established; diagnostics completed.");
 }
 
 fn print_help() {
