@@ -5,4 +5,4 @@ edition = "2021"
 description = "A00 Desktop probe: validating X11 transparency, input shaping, and non-activating window behavior"
 
 [dependencies]
-x11rb = { version = "0.14.0", features = ["render", "shape"] }
+x11rb = { version = "0.14.0", features = ["render", "shape", "randr"] }
