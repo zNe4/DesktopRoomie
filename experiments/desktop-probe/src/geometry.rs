@@ -67,12 +67,26 @@ impl Rect {
         Size::new(self.width, self.height)
     }
 
-    pub fn right(&self) -> i32 {
-        self.x.saturating_add(self.width as i32)
+    /// Checked right edge x-coordinate (`x + width`) using wide arithmetic.
+    pub fn checked_right(&self) -> Option<i32> {
+        let r = (self.x as i64).checked_add(self.width as i64)?;
+        i32::try_from(r).ok()
     }
 
-    pub fn bottom(&self) -> i32 {
-        self.y.saturating_add(self.height as i32)
+    /// Checked bottom edge y-coordinate (`y + height`) using wide arithmetic.
+    pub fn checked_bottom(&self) -> Option<i32> {
+        let b = (self.y as i64).checked_add(self.height as i64)?;
+        i32::try_from(b).ok()
+    }
+
+    pub fn right(&self) -> Result<i32, PlacementError> {
+        self.checked_right()
+            .ok_or(PlacementError::CoordinateOverflow)
+    }
+
+    pub fn bottom(&self) -> Result<i32, PlacementError> {
+        self.checked_bottom()
+            .ok_or(PlacementError::CoordinateOverflow)
     }
 }
 
@@ -98,11 +112,8 @@ impl GrabOffset {
         Self { dx, dy }
     }
 
-    pub fn from_points(pointer: Point, origin: Point) -> Self {
-        Self {
-            dx: pointer.x - origin.x,
-            dy: pointer.y - origin.y,
-        }
+    pub fn from_points(pointer: Point, origin: Point) -> Result<Self, PlacementError> {
+        calculate_grab_offset(pointer, origin)
     }
 }
 
@@ -129,6 +140,18 @@ impl ValidOriginBounds {
             min_y,
             max_y,
         }
+    }
+
+    pub fn try_new(min_x: i32, max_x: i32, min_y: i32, max_y: i32) -> Result<Self, PlacementError> {
+        if min_x > max_x || min_y > max_y {
+            return Err(PlacementError::CoordinateOverflow);
+        }
+        Ok(Self {
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+        })
     }
 
     /// Clamps requested root origin to ensure the window remains entirely within valid bounds.
@@ -168,6 +191,7 @@ pub enum PlacementError {
         required_width: u32,
         required_height: u32,
     },
+    CoordinateOverflow,
 }
 
 impl fmt::Display for PlacementError {
@@ -184,6 +208,9 @@ impl fmt::Display for PlacementError {
                 "Window size ({}x{}) exceeds usable area bounds ({}x{})",
                 required_width, required_height, usable_width, usable_height
             ),
+            Self::CoordinateOverflow => {
+                write!(f, "Coordinate arithmetic overflowed representable bounds")
+            }
         }
     }
 }
@@ -191,6 +218,7 @@ impl fmt::Display for PlacementError {
 impl std::error::Error for PlacementError {}
 
 /// Computes the valid window origin range such that the entire body fits inside `usable`.
+/// Uses wider intermediate arithmetic (i64) and checked conversions to prevent wrapping/overflow.
 pub fn compute_valid_origin_bounds(
     usable: Rect,
     body: Size,
@@ -208,30 +236,77 @@ pub fn compute_valid_origin_bounds(
         });
     }
 
+    let span_x = (usable.width - body.width) as i64;
+    let span_y = (usable.height - body.height) as i64;
+
     let min_x = usable.x;
-    let max_x = usable.x + (usable.width - body.width) as i32;
+    let max_x_i64 = (usable.x as i64)
+        .checked_add(span_x)
+        .ok_or(PlacementError::CoordinateOverflow)?;
+    let max_x = i32::try_from(max_x_i64).map_err(|_| PlacementError::CoordinateOverflow)?;
+
     let min_y = usable.y;
-    let max_y = usable.y + (usable.height - body.height) as i32;
+    let max_y_i64 = (usable.y as i64)
+        .checked_add(span_y)
+        .ok_or(PlacementError::CoordinateOverflow)?;
+    let max_y = i32::try_from(max_y_i64).map_err(|_| PlacementError::CoordinateOverflow)?;
+
+    if max_x < min_x || max_y < min_y {
+        return Err(PlacementError::CoordinateOverflow);
+    }
 
     Ok(ValidOriginBounds::new(min_x, max_x, min_y, max_y))
 }
 
 /// Calculates the centered position of `body` inside `usable`.
+/// Uses wider intermediate arithmetic (i64) and checked conversions to prevent wrapping/overflow.
 pub fn calculate_centered_origin(usable: Rect, body: Size) -> Result<Point, PlacementError> {
     compute_valid_origin_bounds(usable, body)?;
-    let x = usable.x + ((usable.width - body.width) / 2) as i32;
-    let y = usable.y + ((usable.height - body.height) / 2) as i32;
+    let span_x = (usable.width - body.width) as i64;
+    let span_y = (usable.height - body.height) as i64;
+
+    let x_i64 = (usable.x as i64)
+        .checked_add(span_x / 2)
+        .ok_or(PlacementError::CoordinateOverflow)?;
+    let y_i64 = (usable.y as i64)
+        .checked_add(span_y / 2)
+        .ok_or(PlacementError::CoordinateOverflow)?;
+
+    let x = i32::try_from(x_i64).map_err(|_| PlacementError::CoordinateOverflow)?;
+    let y = i32::try_from(y_i64).map_err(|_| PlacementError::CoordinateOverflow)?;
+
     Ok(Point::new(x, y))
 }
 
+/// Checked grab offset from pointer and origin coordinates.
+pub fn checked_grab_offset(pointer: Point, origin: Point) -> Option<GrabOffset> {
+    let dx_i64 = (pointer.x as i64) - (origin.x as i64);
+    let dy_i64 = (pointer.y as i64) - (origin.y as i64);
+    let dx = i32::try_from(dx_i64).ok()?;
+    let dy = i32::try_from(dy_i64).ok()?;
+    Some(GrabOffset::new(dx, dy))
+}
+
 /// Derives the grab offset from a pointer press and window origin: `grab_offset = pointer - origin`.
-pub fn calculate_grab_offset(pointer: Point, origin: Point) -> GrabOffset {
-    GrabOffset::from_points(pointer, origin)
+pub fn calculate_grab_offset(pointer: Point, origin: Point) -> Result<GrabOffset, PlacementError> {
+    checked_grab_offset(pointer, origin).ok_or(PlacementError::CoordinateOverflow)
+}
+
+/// Checked target origin from pointer root position and grab offset.
+pub fn checked_target_origin(pointer: Point, offset: GrabOffset) -> Option<Point> {
+    let x_i64 = (pointer.x as i64) - (offset.dx as i64);
+    let y_i64 = (pointer.y as i64) - (offset.dy as i64);
+    let x = i32::try_from(x_i64).ok()?;
+    let y = i32::try_from(y_i64).ok()?;
+    Some(Point::new(x, y))
 }
 
 /// Calculates the requested origin from pointer root position and grab offset: `requested_origin = pointer - grab_offset`.
-pub fn calculate_target_origin(pointer: Point, offset: GrabOffset) -> Point {
-    Point::new(pointer.x - offset.dx, pointer.y - offset.dy)
+pub fn calculate_target_origin(
+    pointer: Point,
+    offset: GrabOffset,
+) -> Result<Point, PlacementError> {
+    checked_target_origin(pointer, offset).ok_or(PlacementError::CoordinateOverflow)
 }
 
 #[cfg(test)]
@@ -386,12 +461,12 @@ mod tests {
         let pointer_press = Point::new(955, 539);
 
         // Offset = (955 - 885, 539 - 484) = (70, 55)
-        let offset = calculate_grab_offset(pointer_press, actual_origin);
+        let offset = calculate_grab_offset(pointer_press, actual_origin).unwrap();
         assert_eq!(offset, GrabOffset::new(70, 55));
 
         // When pointer moves to (1200, 700), requested origin = (1200 - 70, 700 - 55) = (1130, 645)
         let pointer_move = Point::new(1200, 700);
-        let target = calculate_target_origin(pointer_move, offset);
+        let target = calculate_target_origin(pointer_move, offset).unwrap();
         assert_eq!(target, Point::new(1130, 645));
 
         // Clamping the requested origin
@@ -401,7 +476,7 @@ mod tests {
 
         // Extreme pointer move clamped
         let extreme_pointer = Point::new(2500, 1500);
-        let extreme_target = calculate_target_origin(extreme_pointer, offset);
+        let extreme_target = calculate_target_origin(extreme_pointer, offset).unwrap();
         let extreme_clamped = bounds.clamp(extreme_target);
         assert_eq!(extreme_clamped, Point::new(1760, 920));
     }
@@ -411,14 +486,100 @@ mod tests {
         let r = Rect::new(10, 20, 100, 200);
         assert_eq!(r.origin(), Point::new(10, 20));
         assert_eq!(r.size(), Size::new(100, 200));
-        assert_eq!(r.right(), 110);
-        assert_eq!(r.bottom(), 220);
+        assert_eq!(r.right(), Ok(110));
+        assert_eq!(r.bottom(), Ok(220));
+        assert_eq!(r.checked_right(), Some(110));
+        assert_eq!(r.checked_bottom(), Some(220));
         assert_eq!(format!("{}", r), "Rect(x=10, y=20, w=100, h=200)");
         assert_eq!(format!("{}", Point::new(5, 15)), "(5, 15)");
         assert_eq!(format!("{}", Size::new(160, 160)), "160x160");
         assert_eq!(
             format!("{}", GrabOffset::new(7, 8)),
             "GrabOffset(dx=7, dy=8)"
+        );
+    }
+
+    #[test]
+    fn test_overflow_usable_dimensions_and_inverted_bounds() {
+        let body = Size::new(160, 160);
+
+        // Usable width u32::MAX with body width 160 must not wrap into a negative max_x
+        let huge_w = Rect::new(0, 0, u32::MAX, 1000);
+        assert_eq!(
+            compute_valid_origin_bounds(huge_w, body),
+            Err(PlacementError::CoordinateOverflow)
+        );
+
+        // Usable height u32::MAX
+        let huge_h = Rect::new(0, 0, 1000, u32::MAX);
+        assert_eq!(
+            compute_valid_origin_bounds(huge_h, body),
+            Err(PlacementError::CoordinateOverflow)
+        );
+
+        // Centering calculation must also reject unrepresentable dimensions
+        assert_eq!(
+            calculate_centered_origin(huge_w, body),
+            Err(PlacementError::CoordinateOverflow)
+        );
+
+        // Inverted bounds cannot be constructed via try_new
+        assert_eq!(
+            ValidOriginBounds::try_new(500, 100, 0, 100),
+            Err(PlacementError::CoordinateOverflow)
+        );
+    }
+
+    #[test]
+    fn test_overflow_coordinates_near_limits() {
+        let body = Size::new(160, 160);
+
+        // Usable origin near i32::MAX where span causes overflow
+        let near_max_x = Rect::new(i32::MAX - 20, 0, 200, 200);
+        assert_eq!(
+            compute_valid_origin_bounds(near_max_x, body),
+            Err(PlacementError::CoordinateOverflow)
+        );
+
+        let near_max_y = Rect::new(0, i32::MAX - 20, 200, 200);
+        assert_eq!(
+            compute_valid_origin_bounds(near_max_y, body),
+            Err(PlacementError::CoordinateOverflow)
+        );
+
+        // Rect edges near i32::MAX
+        let r_overflow_x = Rect::new(i32::MAX - 5, 0, 10, 10);
+        assert_eq!(
+            r_overflow_x.right(),
+            Err(PlacementError::CoordinateOverflow)
+        );
+        assert_eq!(r_overflow_x.checked_right(), None);
+
+        let r_overflow_y = Rect::new(0, i32::MAX - 5, 10, 10);
+        assert_eq!(
+            r_overflow_y.bottom(),
+            Err(PlacementError::CoordinateOverflow)
+        );
+        assert_eq!(r_overflow_y.checked_bottom(), None);
+
+        // Grab offset overflow: distance from i32::MAX to i32::MIN exceeds i32
+        assert_eq!(
+            calculate_grab_offset(Point::new(i32::MAX, 0), Point::new(i32::MIN, 0)),
+            Err(PlacementError::CoordinateOverflow)
+        );
+        assert_eq!(
+            checked_grab_offset(Point::new(i32::MAX, 0), Point::new(i32::MIN, 0)),
+            None
+        );
+
+        // Target origin overflow: subtracting positive offset from i32::MIN or negative from i32::MAX
+        assert_eq!(
+            calculate_target_origin(Point::new(i32::MIN, 0), GrabOffset::new(10, 0)),
+            Err(PlacementError::CoordinateOverflow)
+        );
+        assert_eq!(
+            calculate_target_origin(Point::new(i32::MAX, 0), GrabOffset::new(-10, 0)),
+            Err(PlacementError::CoordinateOverflow)
         );
     }
 }

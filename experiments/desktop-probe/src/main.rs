@@ -242,16 +242,7 @@ fn main() {
             }
         };
 
-    let actual_geometry = match probe_window.query_actual_root_geometry(&conn, screen.root) {
-        Ok(geom) => geom,
-        Err(e) => {
-            eprintln!("[ERROR] Failed to query actual root geometry: {}", e);
-            let _ = probe_window.destroy(&conn);
-            process::exit(1);
-        }
-    };
-
-    println!("\n[Placement Verification]");
+    println!("\n[Window Creation]");
     println!(
         "  Window created: ID=0x{:x}, initial configured geometry={}x{} at +{}+{}",
         probe_window.window,
@@ -260,18 +251,10 @@ fn main() {
         probe_window.x,
         probe_window.y
     );
-    println!(
-        "  Startup placement: requested={}, actual={}",
-        requested_origin,
-        actual_geometry.origin()
-    );
-    println!(
-        "  Actual mapped geometry: {} (size: {})",
-        actual_geometry,
-        actual_geometry.size()
-    );
+    println!("  Requested startup placement: {}", requested_origin);
     println!("  Window properties: borderless (_MOTIF_WM_HINTS), managed, type=UTILITY");
     println!("  Input shape: X11 Shape extension applied to body silhouette and test patch");
+    println!("  Awaiting MapNotify confirmation from window manager...");
 
     // 4. Initialize double-buffered renderer
     let mut renderer = match Renderer::new(&conn, probe_window.window, probe_window.colormap) {
@@ -304,12 +287,42 @@ fn main() {
     let conn_fd = conn.stream().as_raw_fd();
     let start_time = Instant::now();
     let mut running = true;
+    let mut mapped_logged = false;
 
     while running {
         // Process incoming X11 events
         loop {
             match conn.poll_for_event() {
                 Ok(Some(event)) => match event {
+                    Event::MapNotify(ev) if ev.window == probe_window.window => {
+                        if !mapped_logged {
+                            mapped_logged = true;
+                            match probe_window.query_actual_root_geometry(&conn, screen.root) {
+                                Ok(actual_geometry) => {
+                                    println!("\n[Placement Verification (MapNotify)]");
+                                    println!(
+                                        "  Startup placement: requested={}, actual={}",
+                                        requested_origin,
+                                        actual_geometry.origin()
+                                    );
+                                    println!(
+                                        "  Actual mapped geometry: {} (size: {})",
+                                        actual_geometry,
+                                        actual_geometry.size()
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[ERROR] Failed to query actual root geometry on MapNotify: {}",
+                                        e
+                                    );
+                                    let _ = renderer.destroy(&conn);
+                                    let _ = probe_window.destroy(&conn);
+                                    process::exit(1);
+                                }
+                            }
+                        }
+                    }
                     Event::Expose(exp) if exp.window == probe_window.window => {
                         if let Err(e) = renderer.paint(&conn, probe_window.window) {
                             eprintln!("[ERROR] Repaint on Expose failed: {}", e);
