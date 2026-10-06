@@ -1,6 +1,7 @@
 mod x11;
 
 use std::env;
+use std::os::unix::io::AsRawFd;
 use std::process;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,6 +21,19 @@ struct Config {
     diagnose: bool,
     duration_secs: Option<u64>,
     delay_secs: Option<u64>,
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: std::os::raw::c_int,
+    events: std::os::raw::c_short,
+    revents: std::os::raw::c_short,
+}
+
+const POLLIN: std::os::raw::c_short = 0x0001;
+
+extern "C" {
+    fn poll(fds: *mut PollFd, nfds: usize, timeout: std::os::raw::c_int) -> std::os::raw::c_int;
 }
 
 fn parse_args() -> Result<Config, String> {
@@ -250,18 +264,11 @@ fn main() {
     }
 
     // 5. Event loop
+    let conn_fd = conn.stream().as_raw_fd();
     let start_time = Instant::now();
     let mut running = true;
 
     while running {
-        // Check timeout if configured
-        if let Some(sec) = config.duration_secs {
-            if start_time.elapsed() >= Duration::from_secs(sec) {
-                println!("  Duration limit reached ({}s). Exiting cleanly.", sec);
-                break;
-            }
-        }
-
         // Process incoming X11 events
         loop {
             match conn.poll_for_event() {
@@ -290,11 +297,11 @@ fn main() {
                         1 => match renderer.toggle_color(&conn, probe_window.window) {
                             Ok(theme) => {
                                 println!(
-                                            "[INPUT] ButtonPress: button=1 (Left) at ({}, {}) -> toggled body color to {}",
-                                            ev.event_x,
-                                            ev.event_y,
-                                            theme.name()
-                                        );
+                                    "[INPUT] ButtonPress: button=1 (Left) at ({}, {}) -> toggled body color to {}",
+                                    ev.event_x,
+                                    ev.event_y,
+                                    theme.name()
+                                );
                             }
                             Err(e) => {
                                 eprintln!("[ERROR] Color toggle on ButtonPress failed: {}", e);
@@ -305,9 +312,9 @@ fn main() {
                         },
                         3 => {
                             println!(
-                                    "[INPUT] ButtonPress: button=3 (Right) on body at ({}, {}) -> clean exit requested.",
-                                    ev.event_x, ev.event_y
-                                );
+                                "[INPUT] ButtonPress: button=3 (Right) on body at ({}, {}) -> clean exit requested.",
+                                ev.event_x, ev.event_y
+                            );
                             running = false;
                             break;
                         }
@@ -353,15 +360,70 @@ fn main() {
             }
         }
 
-        thread::sleep(Duration::from_millis(20));
+        if !running {
+            break;
+        }
+
+        // Flush any pending requests before waiting
+        if let Err(e) = conn.flush() {
+            eprintln!("[ERROR] Failed to flush X11 connection: {}", e);
+            let _ = renderer.destroy(&conn);
+            let _ = probe_window.destroy(&conn);
+            process::exit(1);
+        }
+
+        // Compute timeout until duration limit or wait indefinitely
+        let timeout_ms = match config.duration_secs {
+            Some(sec) => {
+                let duration = Duration::from_secs(sec);
+                let elapsed = start_time.elapsed();
+                if elapsed >= duration {
+                    println!("  Duration limit reached ({}s). Exiting cleanly.", sec);
+                    break;
+                }
+                let remaining = duration - elapsed;
+                remaining.as_millis().min(i32::MAX as u128) as i32
+            }
+            None => -1,
+        };
+
+        let mut pfd = PollFd {
+            fd: conn_fd,
+            events: POLLIN,
+            revents: 0,
+        };
+
+        let ret = unsafe { poll(&mut pfd as *mut _, 1, timeout_ms) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                eprintln!("[ERROR] Socket poll error: {}", err);
+                let _ = renderer.destroy(&conn);
+                let _ = probe_window.destroy(&conn);
+                process::exit(1);
+            }
+        }
     }
 
     // 6. Cleanup after clean exit
     println!("\n[Cleanup]");
-    let _ = renderer.destroy(&conn);
-    let _ = probe_window.destroy(&conn);
+    let mut cleanup_failed = false;
+    if let Err(e) = renderer.destroy(&conn) {
+        eprintln!("[ERROR] Failed to destroy renderer resources: {}", e);
+        cleanup_failed = true;
+    }
+    if let Err(e) = probe_window.destroy(&conn) {
+        eprintln!("[ERROR] Failed to destroy window resources: {}", e);
+        cleanup_failed = true;
+    }
+
+    if cleanup_failed {
+        eprintln!("[ERROR] Server-side resource cleanup failed.");
+        process::exit(1);
+    }
+
     println!("  Resources released cleanly.");
-    println!("  M01.4: Probe completed all acceptance criteria successfully.");
+    println!("  Probe exited cleanly.");
 }
 
 fn run_diagnostics(

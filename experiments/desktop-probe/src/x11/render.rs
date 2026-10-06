@@ -129,12 +129,47 @@ impl Renderer {
         Ok(self.theme)
     }
 
-    /// Releases server-side GC and Pixmap resources
+    /// Releases server-side GC and Pixmap resources, checking requests and reporting failures
     pub fn destroy(&self, conn: &impl Connection) -> Result<(), Box<dyn std::error::Error>> {
-        let _ = conn.free_gc(self.gc);
-        let _ = conn.free_pixmap(self.pixmap);
-        let _ = conn.flush();
-        Ok(())
+        let mut first_error = None;
+
+        match conn.free_gc(self.gc) {
+            Ok(cookie) => {
+                if let Err(e) = cookie.check() {
+                    first_error = Some(Box::new(e) as Box<dyn std::error::Error>);
+                }
+            }
+            Err(e) => {
+                first_error = Some(Box::new(e) as Box<dyn std::error::Error>);
+            }
+        }
+
+        match conn.free_pixmap(self.pixmap) {
+            Ok(cookie) => {
+                if let Err(e) = cookie.check() {
+                    if first_error.is_none() {
+                        first_error = Some(Box::new(e) as Box<dyn std::error::Error>);
+                    }
+                }
+            }
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(Box::new(e) as Box<dyn std::error::Error>);
+                }
+            }
+        }
+
+        if let Err(e) = conn.flush() {
+            if first_error.is_none() {
+                first_error = Some(Box::new(e) as Box<dyn std::error::Error>);
+            }
+        }
+
+        if let Some(err) = first_error {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 }
 
