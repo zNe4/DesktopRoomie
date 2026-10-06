@@ -1,7 +1,7 @@
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    AtomEnum, Colormap, ColormapAlloc, ConnectionExt as XprotoExt, CreateWindowAux, EventMask,
-    PropMode, Visualid, Window, WindowClass,
+    AtomEnum, Colormap, ColormapAlloc, ConfigureWindowAux, ConnectionExt as XprotoExt,
+    CreateWindowAux, EventMask, PropMode, Visualid, Window, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as WrapperExt;
 
@@ -177,6 +177,22 @@ impl ManagedProbeWindow {
             width,
             height,
         })
+    }
+
+    /// Sends a position-only ConfigureWindow request to move the window.
+    /// Preserves width, height, visual, shape, and hints.
+    pub fn configure_position(
+        &mut self,
+        conn: &impl Connection,
+        x: i32,
+        y: i32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let aux = ConfigureWindowAux::new().x(x).y(y);
+        conn.configure_window(self.window, &aux)?.check()?;
+        conn.flush()?;
+        self.x = x;
+        self.y = y;
+        Ok(())
     }
 
     /// Queries the window's actual root-coordinate origin using X11 `TranslateCoordinates`.

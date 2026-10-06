@@ -161,8 +161,8 @@ fn main() {
         return;
     }
 
-    // M02.2: Separate clicks from held gestures
-    println!("Mission M02.2: Separate clicks from held gestures...");
+    // M02.3: Bounded dragging and stable grab offsets
+    println!("Mission M02.3: Bounded dragging and stable grab offsets...");
 
     // 1. Discover 32-bit alpha Render visual
     let alpha_vis = match find_alpha_visual(&conn) {
@@ -235,7 +235,7 @@ fn main() {
     }
 
     // 3. Create managed borderless window
-    let probe_window =
+    let mut probe_window =
         match ManagedProbeWindow::create(&conn, screen.root, alpha_vis.visual_id, requested_origin)
         {
             Ok(w) => w,
@@ -291,6 +291,7 @@ fn main() {
     let start_time = Instant::now();
     let mut running = true;
     let mut mapped_logged = false;
+    let mut current_body_origin = requested_origin;
     let mut interaction = InteractionManager::new();
     let mut pointer_tracker = PointerCaptureTracker::new();
 
@@ -304,6 +305,7 @@ fn main() {
                             mapped_logged = true;
                             match probe_window.query_actual_root_geometry(&conn, screen.root) {
                                 Ok(actual_geometry) => {
+                                    current_body_origin = actual_geometry.origin();
                                     println!("\n[Placement Verification (MapNotify)]");
                                     println!(
                                         "  Startup placement: requested={}, actual={}",
@@ -357,13 +359,14 @@ fn main() {
                             let local = (ev.event_x, ev.event_y);
                             let actual_origin = probe_window
                                 .query_actual_root_origin(&conn, screen.root)
-                                .unwrap_or_else(|_| Point::new(probe_window.x, probe_window.y));
+                                .unwrap_or(current_body_origin);
+                            current_body_origin = actual_origin;
 
                             match interaction.handle_left_press(
                                 pointer_root,
                                 local,
                                 ev.time,
-                                actual_origin,
+                                current_body_origin,
                             ) {
                                 HostAction::AcquireGrab { time } => {
                                     match grab_pointer(&conn, probe_window.window, time) {
@@ -400,7 +403,7 @@ fn main() {
                             HostAction::ReleaseGrab { time } => {
                                 let _ = pointer_tracker.release_if_held(&conn, time);
                                 println!(
-                                    "[INPUT] ButtonPress: button=3 (Right) -> cancelled active left gesture and released capture"
+                                    "[INPUT] ButtonPress: button=3 (Right) -> cancelled active gesture and released capture"
                                 );
                             }
                             HostAction::ExitCleanly => {
@@ -423,21 +426,53 @@ fn main() {
                     },
                     Event::MotionNotify(ev) if ev.event == probe_window.window => {
                         let pointer_root = Point::new(ev.root_x as i32, ev.root_y as i32);
-                        if let HostAction::ReleaseGrab { time } =
-                            interaction.handle_motion(pointer_root, ev.time)
+                        let was_dragging = interaction.is_dragging();
+                        if let HostAction::MoveWindow { target } =
+                            interaction.handle_motion(pointer_root, ev.time, &valid_bounds)
                         {
-                            let _ = pointer_tracker.release_if_held(&conn, time);
-                            println!(
-                                "[INPUT] MotionNotify: moved to root ({}, {}) -> exceeded 4px threshold; click cancelled and capture released",
-                                ev.root_x, ev.root_y
-                            );
+                            if !was_dragging {
+                                println!(
+                                    "[INPUT] Drag started at root ({}, {}), target origin {}",
+                                    ev.root_x, ev.root_y, target
+                                );
+                            }
+                            if let Err(e) =
+                                probe_window.configure_position(&conn, target.x, target.y)
+                            {
+                                eprintln!("[ERROR] Failed to move window to {}: {}", target, e);
+                            } else {
+                                current_body_origin = target;
+                            }
                         }
                     }
                     Event::ButtonRelease(ev) if ev.event == probe_window.window => {
                         match ev.detail {
                             1 => {
+                                let pointer_root = Point::new(ev.root_x as i32, ev.root_y as i32);
                                 let local = (ev.event_x, ev.event_y);
-                                match interaction.handle_left_release(local, ev.time) {
+                                match interaction.handle_left_release(
+                                    pointer_root,
+                                    local,
+                                    ev.time,
+                                    &valid_bounds,
+                                ) {
+                                    HostAction::ReleaseGrabAndMoveWindow { time, target } => {
+                                        if let Err(e) = probe_window
+                                            .configure_position(&conn, target.x, target.y)
+                                        {
+                                            eprintln!(
+                                                "[ERROR] Failed to finalize window position at {}: {}",
+                                                target, e
+                                            );
+                                        } else {
+                                            current_body_origin = target;
+                                        }
+                                        let _ = pointer_tracker.release_if_held(&conn, time);
+                                        println!(
+                                            "[INPUT] Drag completed at root ({}, {}), final origin {}",
+                                            ev.root_x, ev.root_y, target
+                                        );
+                                    }
                                     HostAction::ReleaseGrabAndToggleColor { time } => {
                                         let _ = pointer_tracker.release_if_held(&conn, time);
                                         match renderer.toggle_color(&conn, probe_window.window) {
