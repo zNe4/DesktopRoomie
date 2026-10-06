@@ -178,6 +178,26 @@ impl InteractionManager {
         }
     }
 
+    /// Handles a batch of pointer motion events, coalescing updates while ensuring
+    /// threshold promotion is reliably detected.
+    ///
+    /// If any motion in the batch crosses the threshold while in LeftPressed, the gesture
+    /// is promoted to Dragging. The returned HostAction reflects the latest position in the batch.
+    pub fn handle_motion_batch(
+        &mut self,
+        motions: impl IntoIterator<Item = (Point, u32)>,
+        bounds: &ValidOriginBounds,
+    ) -> HostAction {
+        let mut final_action = HostAction::None;
+        for (pt, time) in motions {
+            let action = self.handle_motion(pt, time, bounds);
+            if action != HostAction::None {
+                final_action = action;
+            }
+        }
+        final_action
+    }
+
     /// Handles a left mouse button release.
     pub fn handle_left_release(
         &mut self,
@@ -690,6 +710,92 @@ mod tests {
         // Fresh right press exits cleanly
         let right_action = mgr.handle_right_press(1050);
         assert_eq!(right_action, HostAction::ExitCleanly);
+        assert_eq!(mgr.state(), InteractionState::Idle);
+    }
+
+    #[test]
+    fn test_motion_batch_promotes_to_dragging_on_intermediate_threshold() {
+        let mut mgr = InteractionManager::new();
+        let bounds = sample_bounds();
+        let root = Point::new(100, 100);
+        let origin = Point::new(80, 80);
+
+        mgr.handle_left_press(root, (80, 80), 1000, origin);
+        mgr.on_grab_acquired();
+
+        // Batch: 1st motion jitter within threshold (101, 100),
+        // 2nd motion crosses threshold (105, 100) -> promotes to dragging,
+        // 3rd motion travels further (120, 110).
+        let motions = vec![
+            (Point::new(101, 100), 1005),
+            (Point::new(105, 100), 1010),
+            (Point::new(120, 110), 1015),
+        ];
+
+        let action = mgr.handle_motion_batch(motions, &bounds);
+        // Target for final point (120, 110) with offset (20, 20) is (100, 90)
+        assert_eq!(
+            action,
+            HostAction::MoveWindow {
+                target: Point::new(100, 90)
+            }
+        );
+        assert!(mgr.is_dragging());
+    }
+
+    #[test]
+    fn test_motion_batch_within_threshold_stays_left_pressed() {
+        let mut mgr = InteractionManager::new();
+        let bounds = sample_bounds();
+        let root = Point::new(100, 100);
+        let origin = Point::new(80, 80);
+
+        mgr.handle_left_press(root, (80, 80), 1000, origin);
+        mgr.on_grab_acquired();
+
+        // Batch of small jitter motions all within 4px of (100, 100)
+        let motions = vec![
+            (Point::new(101, 100), 1005),
+            (Point::new(102, 101), 1010),
+            (Point::new(100, 102), 1015),
+        ];
+
+        let action = mgr.handle_motion_batch(motions, &bounds);
+        assert_eq!(action, HostAction::None);
+        assert!(matches!(mgr.state(), InteractionState::LeftPressed { .. }));
+    }
+
+    #[test]
+    fn test_motion_batch_crossing_and_returning_preserves_dragging() {
+        let mut mgr = InteractionManager::new();
+        let bounds = sample_bounds();
+        let root = Point::new(100, 100);
+        let origin = Point::new(80, 80);
+
+        mgr.handle_left_press(root, (80, 80), 1000, origin);
+        mgr.on_grab_acquired();
+
+        // Batch crosses threshold (150, 150) then returns to exact press point (100, 100)
+        let motions = vec![(Point::new(150, 150), 1010), (Point::new(100, 100), 1020)];
+
+        let action = mgr.handle_motion_batch(motions, &bounds);
+        assert_eq!(
+            action,
+            HostAction::MoveWindow {
+                target: Point::new(80, 80)
+            }
+        );
+        assert!(mgr.is_dragging());
+
+        // Release at press point completes as a drag, NOT a click toggle
+        let release_action = mgr.handle_left_release(root, (80, 80), 1030, &bounds);
+        assert_eq!(
+            release_action,
+            HostAction::ReleaseGrabAndMoveWindow {
+                time: 1030,
+                target: Point::new(80, 80),
+            }
+        );
         assert_eq!(mgr.state(), InteractionState::Idle);
     }
 }
