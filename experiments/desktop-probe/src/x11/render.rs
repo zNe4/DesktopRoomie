@@ -128,6 +128,14 @@ impl Renderer {
         self.paint(conn, window)?;
         Ok(self.theme)
     }
+
+    /// Releases server-side GC and Pixmap resources
+    pub fn destroy(&self, conn: &impl Connection) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = conn.free_gc(self.gc);
+        let _ = conn.free_pixmap(self.pixmap);
+        let _ = conn.flush();
+        Ok(())
+    }
 }
 
 /// Generates a 160x160 little-endian premultiplied ARGB buffer:

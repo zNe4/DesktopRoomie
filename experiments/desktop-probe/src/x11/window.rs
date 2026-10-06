@@ -132,6 +132,17 @@ impl ManagedProbeWindow {
         )?
         .check()?;
 
+        // EWMH _NET_WM_USER_TIME = 0: explicitly informs window manager not to take focus on map
+        let net_wm_user_time = conn.intern_atom(false, b"_NET_WM_USER_TIME")?.reply()?.atom;
+        conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            net_wm_user_time,
+            AtomEnum::CARDINAL,
+            &[0],
+        )?
+        .check()?;
+
         // 7. Set window title and class
         conn.change_property8(
             PropMode::REPLACE,

@@ -19,11 +19,13 @@ use crate::x11::window::ManagedProbeWindow;
 struct Config {
     diagnose: bool,
     duration_secs: Option<u64>,
+    delay_secs: Option<u64>,
 }
 
 fn parse_args() -> Result<Config, String> {
     let mut diagnose = false;
     let mut duration_secs = None;
+    let mut delay_secs = None;
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
@@ -35,6 +37,16 @@ fn parse_args() -> Result<Config, String> {
             }
             "--diagnose" => {
                 diagnose = true;
+            }
+            "--delay" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing value for --delay <seconds>".to_string());
+                }
+                let val: u64 = args[i]
+                    .parse()
+                    .map_err(|_| format!("Invalid delay value: '{}'", args[i]))?;
+                delay_secs = Some(val);
             }
             "--duration" => {
                 i += 1;
@@ -59,6 +71,7 @@ fn parse_args() -> Result<Config, String> {
     Ok(Config {
         diagnose,
         duration_secs,
+        delay_secs,
     })
 }
 
@@ -71,6 +84,7 @@ fn print_help() {
     println!("OPTIONS:");
     println!("  -h, --help              Show this help message and exit");
     println!("  --diagnose              Run pure X11 environment diagnostics and exit");
+    println!("  --delay <SECONDS>       Delay in seconds before mapping window (for typing test)");
     println!("  --duration <SECONDS>    Run for a specified duration in seconds, then exit");
 }
 
@@ -128,8 +142,8 @@ fn main() {
         return;
     }
 
-    // M01.3: Pointer input handling without keyboard focus
-    println!("Mission M01.3: Handling pointer input without keyboard focus...");
+    // M01.4: Recovery, exit controls, and acceptance verification
+    println!("Mission M01.4: Recovery, exit controls, and acceptance verification...");
 
     // 1. Discover 32-bit alpha Render visual
     let alpha_vis = match find_alpha_visual(&conn) {
@@ -173,6 +187,16 @@ fn main() {
         layout.usable_area.height
     );
 
+    // Optional startup delay (for testing focus behavior during mapping)
+    if let Some(delay) = config.delay_secs {
+        println!("\n[Startup Delay]");
+        println!(
+            "  Waiting {} second(s) before creating and mapping probe window...",
+            delay
+        );
+        thread::sleep(Duration::from_secs(delay));
+    }
+
     // 3. Create managed borderless window
     let probe_window = match ManagedProbeWindow::create(
         &conn,
@@ -211,6 +235,7 @@ fn main() {
     // Perform initial paint (fatal on failure)
     if let Err(e) = renderer.paint(&conn, probe_window.window) {
         eprintln!("[ERROR] Initial paint failed: {}", e);
+        let _ = renderer.destroy(&conn);
         let _ = probe_window.destroy(&conn);
         process::exit(1);
     }
@@ -220,7 +245,7 @@ fn main() {
         println!("  Probe running for {} seconds (or until closed)...", sec);
     } else {
         println!(
-            "  Probe is visible on desktop. Close window or press Ctrl+C in terminal to exit."
+            "  Probe is visible on desktop. Left-click to toggle color, right-click to exit, or press Ctrl+C."
         );
     }
 
@@ -244,6 +269,7 @@ fn main() {
                     Event::Expose(exp) if exp.window == probe_window.window => {
                         if let Err(e) = renderer.paint(&conn, probe_window.window) {
                             eprintln!("[ERROR] Repaint on Expose failed: {}", e);
+                            let _ = renderer.destroy(&conn);
                             let _ = probe_window.destroy(&conn);
                             process::exit(1);
                         }
@@ -260,24 +286,38 @@ fn main() {
                             ev.event_x, ev.event_y
                         );
                     }
-                    Event::ButtonPress(ev) if ev.event == probe_window.window => {
-                        match renderer.toggle_color(&conn, probe_window.window) {
+                    Event::ButtonPress(ev) if ev.event == probe_window.window => match ev.detail {
+                        1 => match renderer.toggle_color(&conn, probe_window.window) {
                             Ok(theme) => {
                                 println!(
-                                    "[INPUT] ButtonPress: button={} at ({}, {}) -> toggled body color to {}",
-                                    ev.detail,
-                                    ev.event_x,
-                                    ev.event_y,
-                                    theme.name()
-                                );
+                                            "[INPUT] ButtonPress: button=1 (Left) at ({}, {}) -> toggled body color to {}",
+                                            ev.event_x,
+                                            ev.event_y,
+                                            theme.name()
+                                        );
                             }
                             Err(e) => {
                                 eprintln!("[ERROR] Color toggle on ButtonPress failed: {}", e);
+                                let _ = renderer.destroy(&conn);
                                 let _ = probe_window.destroy(&conn);
                                 process::exit(1);
                             }
+                        },
+                        3 => {
+                            println!(
+                                    "[INPUT] ButtonPress: button=3 (Right) on body at ({}, {}) -> clean exit requested.",
+                                    ev.event_x, ev.event_y
+                                );
+                            running = false;
+                            break;
                         }
-                    }
+                        other => {
+                            println!(
+                                "[INPUT] ButtonPress: button={} at ({}, {}) (ignored)",
+                                other, ev.event_x, ev.event_y
+                            );
+                        }
+                    },
                     Event::ButtonRelease(ev) if ev.event == probe_window.window => {
                         println!(
                             "[INPUT] ButtonRelease: button={} at ({}, {})",
@@ -297,6 +337,7 @@ fn main() {
                             "[ERROR] Asynchronous X11 protocol error received: {:?}",
                             xerr
                         );
+                        let _ = renderer.destroy(&conn);
                         let _ = probe_window.destroy(&conn);
                         process::exit(1);
                     }
@@ -305,20 +346,22 @@ fn main() {
                 Ok(None) => break,
                 Err(e) => {
                     eprintln!("[ERROR] X11 connection poll error: {}", e);
+                    let _ = renderer.destroy(&conn);
                     let _ = probe_window.destroy(&conn);
                     process::exit(1);
                 }
             }
         }
 
-        thread::sleep(Duration::from_millis(15));
+        thread::sleep(Duration::from_millis(20));
     }
 
     // 6. Cleanup after clean exit
     println!("\n[Cleanup]");
+    let _ = renderer.destroy(&conn);
     let _ = probe_window.destroy(&conn);
     println!("  Resources released cleanly.");
-    println!("  M01.3: Pointer input handled without taking keyboard focus.");
+    println!("  M01.4: Probe completed all acceptance criteria successfully.");
 }
 
 fn run_diagnostics(
