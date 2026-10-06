@@ -1,3 +1,4 @@
+mod geometry;
 mod x11;
 
 use std::env;
@@ -12,8 +13,9 @@ use x11rb::protocol::shape::ConnectionExt as ShapeExt;
 use x11rb::protocol::xproto::VisualClass;
 use x11rb::protocol::Event;
 
+use crate::geometry::{calculate_centered_origin, compute_valid_origin_bounds, Size};
 use crate::x11::monitors::query_desktop_layout;
-use crate::x11::render::Renderer;
+use crate::x11::render::{Renderer, WINDOW_HEIGHT, WINDOW_WIDTH};
 use crate::x11::visual::find_alpha_visual;
 use crate::x11::window::ManagedProbeWindow;
 
@@ -156,8 +158,8 @@ fn main() {
         return;
     }
 
-    // M01.4: Recovery, exit controls, and acceptance verification
-    println!("Mission M01.4: Recovery, exit controls, and acceptance verification...");
+    // M02.1: Establish actual coordinates and safe bounds
+    println!("Mission M02.1: Establish actual coordinates and safe bounds...");
 
     // 1. Discover 32-bit alpha Render visual
     let alpha_vis = match find_alpha_visual(&conn) {
@@ -185,7 +187,24 @@ fn main() {
         alpha_vis.blue_shift,
     );
 
-    // 2. Report target placement
+    // 2. Validate geometry & bounds
+    let body_size = Size::new(WINDOW_WIDTH as u32, WINDOW_HEIGHT as u32);
+    let valid_bounds = match compute_valid_origin_bounds(layout.usable_area, body_size) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("\n[ERROR] Bounded placement validation failed: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let requested_origin = match calculate_centered_origin(layout.usable_area, body_size) {
+        Ok(pt) => pt,
+        Err(e) => {
+            eprintln!("\n[ERROR] Failed to calculate centered origin: {}", e);
+            process::exit(1);
+        }
+    };
+
     if let Some(ref pm) = layout.primary_monitor {
         println!(
             "  Primary display: '{}' ({}x{} at +{}+{})",
@@ -200,6 +219,7 @@ fn main() {
         layout.usable_area.width,
         layout.usable_area.height
     );
+    println!("  Valid origin bounds: {}", valid_bounds);
 
     // Optional startup delay (for testing focus behavior during mapping)
     if let Some(delay) = config.delay_secs {
@@ -212,26 +232,43 @@ fn main() {
     }
 
     // 3. Create managed borderless window
-    let probe_window = match ManagedProbeWindow::create(
-        &conn,
-        screen.root,
-        alpha_vis.visual_id,
-        layout.usable_area,
-    ) {
-        Ok(w) => w,
+    let probe_window =
+        match ManagedProbeWindow::create(&conn, screen.root, alpha_vis.visual_id, requested_origin)
+        {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("[ERROR] Failed to create managed probe window: {}", e);
+                process::exit(1);
+            }
+        };
+
+    let actual_geometry = match probe_window.query_actual_root_geometry(&conn, screen.root) {
+        Ok(geom) => geom,
         Err(e) => {
-            eprintln!("[ERROR] Failed to create managed probe window: {}", e);
+            eprintln!("[ERROR] Failed to query actual root geometry: {}", e);
+            let _ = probe_window.destroy(&conn);
             process::exit(1);
         }
     };
 
+    println!("\n[Placement Verification]");
     println!(
-        "  Window created: ID=0x{:x}, geometry={}x{} at +{}+{}",
+        "  Window created: ID=0x{:x}, initial configured geometry={}x{} at +{}+{}",
         probe_window.window,
         probe_window.width,
         probe_window.height,
         probe_window.x,
         probe_window.y
+    );
+    println!(
+        "  Startup placement: requested={}, actual={}",
+        requested_origin,
+        actual_geometry.origin()
+    );
+    println!(
+        "  Actual mapped geometry: {} (size: {})",
+        actual_geometry,
+        actual_geometry.size()
     );
     println!("  Window properties: borderless (_MOTIF_WM_HINTS), managed, type=UTILITY");
     println!("  Input shape: X11 Shape extension applied to body silhouette and test patch");

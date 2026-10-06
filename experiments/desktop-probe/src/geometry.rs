@@ -1,0 +1,424 @@
+#![allow(dead_code)]
+
+use std::fmt;
+
+/// A signed 2D coordinate representing a position in root or client coordinate space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Point {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl Point {
+    pub const fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+}
+
+impl fmt::Display for Point {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({}, {})", self.x, self.y)
+    }
+}
+
+/// 2D dimensions with non-negative magnitude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Size {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Size {
+    pub const fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+}
+
+impl fmt::Display for Size {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}x{}", self.width, self.height)
+    }
+}
+
+/// A 2D rectangle in signed screen coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Rect {
+    pub const fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub fn origin(&self) -> Point {
+        Point::new(self.x, self.y)
+    }
+
+    pub fn size(&self) -> Size {
+        Size::new(self.width, self.height)
+    }
+
+    pub fn right(&self) -> i32 {
+        self.x.saturating_add(self.width as i32)
+    }
+
+    pub fn bottom(&self) -> i32 {
+        self.y.saturating_add(self.height as i32)
+    }
+}
+
+impl fmt::Display for Rect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Rect(x={}, y={}, w={}, h={})",
+            self.x, self.y, self.width, self.height
+        )
+    }
+}
+
+/// Vector displacement between a pointer root position and a window origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GrabOffset {
+    pub dx: i32,
+    pub dy: i32,
+}
+
+impl GrabOffset {
+    pub const fn new(dx: i32, dy: i32) -> Self {
+        Self { dx, dy }
+    }
+
+    pub fn from_points(pointer: Point, origin: Point) -> Self {
+        Self {
+            dx: pointer.x - origin.x,
+            dy: pointer.y - origin.y,
+        }
+    }
+}
+
+impl fmt::Display for GrabOffset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GrabOffset(dx={}, dy={})", self.dx, self.dy)
+    }
+}
+
+/// An inclusive range of valid window origins within an allowable desktop area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidOriginBounds {
+    pub min_x: i32,
+    pub max_x: i32,
+    pub min_y: i32,
+    pub max_y: i32,
+}
+
+impl ValidOriginBounds {
+    pub const fn new(min_x: i32, max_x: i32, min_y: i32, max_y: i32) -> Self {
+        Self {
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+        }
+    }
+
+    /// Clamps requested root origin to ensure the window remains entirely within valid bounds.
+    pub fn clamp(&self, target: Point) -> Point {
+        Point {
+            x: target.x.clamp(self.min_x, self.max_x),
+            y: target.y.clamp(self.min_y, self.max_y),
+        }
+    }
+
+    /// Checks if the target origin is within valid bounds.
+    pub fn contains(&self, target: Point) -> bool {
+        target.x >= self.min_x
+            && target.x <= self.max_x
+            && target.y >= self.min_y
+            && target.y <= self.max_y
+    }
+}
+
+impl fmt::Display for ValidOriginBounds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "x={}..={}, y={}..={}",
+            self.min_x, self.max_x, self.min_y, self.max_y
+        )
+    }
+}
+
+/// Errors when validating placement against a usable desktop area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementError {
+    EmptyUsableArea,
+    WindowExceedsBounds {
+        usable_width: u32,
+        usable_height: u32,
+        required_width: u32,
+        required_height: u32,
+    },
+}
+
+impl fmt::Display for PlacementError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyUsableArea => write!(f, "Usable area is empty (width or height is 0)"),
+            Self::WindowExceedsBounds {
+                usable_width,
+                usable_height,
+                required_width,
+                required_height,
+            } => write!(
+                f,
+                "Window size ({}x{}) exceeds usable area bounds ({}x{})",
+                required_width, required_height, usable_width, usable_height
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PlacementError {}
+
+/// Computes the valid window origin range such that the entire body fits inside `usable`.
+pub fn compute_valid_origin_bounds(
+    usable: Rect,
+    body: Size,
+) -> Result<ValidOriginBounds, PlacementError> {
+    if usable.width == 0 || usable.height == 0 {
+        return Err(PlacementError::EmptyUsableArea);
+    }
+
+    if usable.width < body.width || usable.height < body.height {
+        return Err(PlacementError::WindowExceedsBounds {
+            usable_width: usable.width,
+            usable_height: usable.height,
+            required_width: body.width,
+            required_height: body.height,
+        });
+    }
+
+    let min_x = usable.x;
+    let max_x = usable.x + (usable.width - body.width) as i32;
+    let min_y = usable.y;
+    let max_y = usable.y + (usable.height - body.height) as i32;
+
+    Ok(ValidOriginBounds::new(min_x, max_x, min_y, max_y))
+}
+
+/// Calculates the centered position of `body` inside `usable`.
+pub fn calculate_centered_origin(usable: Rect, body: Size) -> Result<Point, PlacementError> {
+    compute_valid_origin_bounds(usable, body)?;
+    let x = usable.x + ((usable.width - body.width) / 2) as i32;
+    let y = usable.y + ((usable.height - body.height) / 2) as i32;
+    Ok(Point::new(x, y))
+}
+
+/// Derives the grab offset from a pointer press and window origin: `grab_offset = pointer - origin`.
+pub fn calculate_grab_offset(pointer: Point, origin: Point) -> GrabOffset {
+    GrabOffset::from_points(pointer, origin)
+}
+
+/// Calculates the requested origin from pointer root position and grab offset: `requested_origin = pointer - grab_offset`.
+pub fn calculate_target_origin(pointer: Point, offset: GrabOffset) -> Point {
+    Point::new(pointer.x - offset.dx, pointer.y - offset.dy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_exact_four_edges() {
+        let usable = Rect::new(100, 200, 800, 600);
+        let body = Size::new(160, 160);
+        let bounds = compute_valid_origin_bounds(usable, body).unwrap();
+
+        assert_eq!(bounds.min_x, 100);
+        assert_eq!(bounds.max_x, 100 + (800 - 160)); // 740
+        assert_eq!(bounds.min_y, 200);
+        assert_eq!(bounds.max_y, 200 + (600 - 160)); // 640
+
+        // Beyond left edge
+        assert_eq!(bounds.clamp(Point::new(50, 300)), Point::new(100, 300));
+        // Beyond right edge
+        assert_eq!(bounds.clamp(Point::new(800, 300)), Point::new(740, 300));
+        // Beyond top edge
+        assert_eq!(bounds.clamp(Point::new(300, 150)), Point::new(300, 200));
+        // Beyond bottom edge
+        assert_eq!(bounds.clamp(Point::new(300, 700)), Point::new(300, 640));
+    }
+
+    #[test]
+    fn test_all_corners() {
+        let usable = Rect::new(10, 48, 1910, 1032);
+        let body = Size::new(160, 160);
+        let bounds = compute_valid_origin_bounds(usable, body).unwrap();
+
+        // Top-left
+        assert_eq!(bounds.clamp(Point::new(-100, -50)), Point::new(10, 48));
+        // Top-right
+        assert_eq!(bounds.clamp(Point::new(3000, -50)), Point::new(1760, 48));
+        // Bottom-left
+        assert_eq!(bounds.clamp(Point::new(-100, 2000)), Point::new(10, 920));
+        // Bottom-right
+        assert_eq!(bounds.clamp(Point::new(3000, 2000)), Point::new(1760, 920));
+    }
+
+    #[test]
+    fn test_negative_origin() {
+        // Multi-head monitor setup with negative display origin (e.g. secondary monitor to the left)
+        let usable = Rect::new(-1920, -100, 1920, 1080);
+        let body = Size::new(160, 160);
+        let bounds = compute_valid_origin_bounds(usable, body).unwrap();
+
+        assert_eq!(bounds.min_x, -1920);
+        assert_eq!(bounds.max_x, -1920 + 1920 - 160); // -160
+        assert_eq!(bounds.min_y, -100);
+        assert_eq!(bounds.max_y, -100 + 1080 - 160); // 820
+
+        // Clamping inside negative origin
+        assert_eq!(
+            bounds.clamp(Point::new(-2000, -200)),
+            Point::new(-1920, -100)
+        );
+        assert_eq!(bounds.clamp(Point::new(0, 900)), Point::new(-160, 820));
+
+        // Centered origin calculation
+        let centered = calculate_centered_origin(usable, body).unwrap();
+        assert_eq!(centered.x, -1920 + (1920 - 160) / 2); // -1040
+        assert_eq!(centered.y, -100 + (1080 - 160) / 2); // 360
+        assert!(bounds.contains(centered));
+    }
+
+    #[test]
+    fn test_panel_reduced_region() {
+        // Simulated Openbox desktop workarea with panel reservation:
+        // Full screen is 1920x1080, top panel occupies 48px, side dock occupies 10px
+        let usable = Rect::new(10, 48, 1910, 1032);
+        let body = Size::new(160, 160);
+
+        let bounds = compute_valid_origin_bounds(usable, body).unwrap();
+        assert_eq!(bounds.min_x, 10);
+        assert_eq!(bounds.max_x, 10 + 1910 - 160); // 1760
+        assert_eq!(bounds.min_y, 48);
+        assert_eq!(bounds.max_y, 48 + 1032 - 160); // 920
+
+        let centered = calculate_centered_origin(usable, body).unwrap();
+        assert_eq!(centered.x, 10 + (1910 - 160) / 2); // 885
+        assert_eq!(centered.y, 48 + (1032 - 160) / 2); // 484
+        assert!(bounds.contains(centered));
+    }
+
+    #[test]
+    fn test_body_exactly_filling_area() {
+        let usable = Rect::new(50, 100, 160, 160);
+        let body = Size::new(160, 160);
+
+        let bounds = compute_valid_origin_bounds(usable, body).unwrap();
+        assert_eq!(bounds.min_x, 50);
+        assert_eq!(bounds.max_x, 50);
+        assert_eq!(bounds.min_y, 100);
+        assert_eq!(bounds.max_y, 100);
+
+        // Any requested point clamps to the single valid origin
+        assert_eq!(bounds.clamp(Point::new(0, 0)), Point::new(50, 100));
+        assert_eq!(bounds.clamp(Point::new(200, 300)), Point::new(50, 100));
+
+        let centered = calculate_centered_origin(usable, body).unwrap();
+        assert_eq!(centered, Point::new(50, 100));
+    }
+
+    #[test]
+    fn test_body_too_large_and_empty_region() {
+        let body = Size::new(160, 160);
+
+        // Empty area
+        let empty_w = Rect::new(0, 0, 0, 100);
+        assert_eq!(
+            compute_valid_origin_bounds(empty_w, body),
+            Err(PlacementError::EmptyUsableArea)
+        );
+        let empty_h = Rect::new(0, 0, 100, 0);
+        assert_eq!(
+            compute_valid_origin_bounds(empty_h, body),
+            Err(PlacementError::EmptyUsableArea)
+        );
+
+        // Body too wide
+        let too_narrow = Rect::new(0, 0, 150, 200);
+        assert_eq!(
+            compute_valid_origin_bounds(too_narrow, body),
+            Err(PlacementError::WindowExceedsBounds {
+                usable_width: 150,
+                usable_height: 200,
+                required_width: 160,
+                required_height: 160,
+            })
+        );
+
+        // Body too tall
+        let too_short = Rect::new(0, 0, 200, 150);
+        assert_eq!(
+            compute_valid_origin_bounds(too_short, body),
+            Err(PlacementError::WindowExceedsBounds {
+                usable_width: 200,
+                usable_height: 150,
+                required_width: 160,
+                required_height: 160,
+            })
+        );
+    }
+
+    #[test]
+    fn test_grab_offset_and_target_calculation() {
+        let actual_origin = Point::new(885, 484);
+        let pointer_press = Point::new(955, 539);
+
+        // Offset = (955 - 885, 539 - 484) = (70, 55)
+        let offset = calculate_grab_offset(pointer_press, actual_origin);
+        assert_eq!(offset, GrabOffset::new(70, 55));
+
+        // When pointer moves to (1200, 700), requested origin = (1200 - 70, 700 - 55) = (1130, 645)
+        let pointer_move = Point::new(1200, 700);
+        let target = calculate_target_origin(pointer_move, offset);
+        assert_eq!(target, Point::new(1130, 645));
+
+        // Clamping the requested origin
+        let bounds = ValidOriginBounds::new(10, 1760, 48, 920);
+        let clamped = bounds.clamp(target);
+        assert_eq!(clamped, Point::new(1130, 645)); // Inside bounds
+
+        // Extreme pointer move clamped
+        let extreme_pointer = Point::new(2500, 1500);
+        let extreme_target = calculate_target_origin(extreme_pointer, offset);
+        let extreme_clamped = bounds.clamp(extreme_target);
+        assert_eq!(extreme_clamped, Point::new(1760, 920));
+    }
+
+    #[test]
+    fn test_rect_methods_and_display() {
+        let r = Rect::new(10, 20, 100, 200);
+        assert_eq!(r.origin(), Point::new(10, 20));
+        assert_eq!(r.size(), Size::new(100, 200));
+        assert_eq!(r.right(), 110);
+        assert_eq!(r.bottom(), 220);
+        assert_eq!(format!("{}", r), "Rect(x=10, y=20, w=100, h=200)");
+        assert_eq!(format!("{}", Point::new(5, 15)), "(5, 15)");
+        assert_eq!(format!("{}", Size::new(160, 160)), "160x160");
+        assert_eq!(
+            format!("{}", GrabOffset::new(7, 8)),
+            "GrabOffset(dx=7, dy=8)"
+        );
+    }
+}

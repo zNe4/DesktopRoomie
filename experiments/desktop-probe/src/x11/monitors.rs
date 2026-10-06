@@ -13,13 +13,7 @@ pub struct MonitorGeometry {
     pub height: u16,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Rect {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-}
+pub use crate::geometry::Rect;
 
 pub struct DesktopLayout {
     pub primary_monitor: Option<MonitorGeometry>,

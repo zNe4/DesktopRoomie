@@ -5,9 +5,9 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::wrapper::ConnectionExt as WrapperExt;
 
-use super::monitors::Rect;
 use super::render::{WINDOW_HEIGHT, WINDOW_WIDTH};
 use super::shape::apply_body_input_shape;
+use crate::geometry::{Point, Rect};
 
 pub struct ManagedProbeWindow {
     pub window: Window,
@@ -24,18 +24,18 @@ impl ManagedProbeWindow {
         conn: &impl Connection,
         root: Window,
         visual_id: Visualid,
-        usable_area: Rect,
+        initial_origin: Point,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // 1. Create a colormap for the 32-bit visual (required in X11 to prevent BadMatch)
         let colormap = conn.generate_id()?;
         conn.create_colormap(ColormapAlloc::NONE, colormap, root, visual_id)?
             .check()?;
 
-        // 2. Position the window centered inside the usable area on the primary display
+        // 2. Position the window at initial_origin on the primary display
         let width = WINDOW_WIDTH;
         let height = WINDOW_HEIGHT;
-        let x = usable_area.x + ((usable_area.width.saturating_sub(width as u32)) / 2) as i32;
-        let y = usable_area.y + ((usable_area.height.saturating_sub(height as u32)) / 2) as i32;
+        let x = initial_origin.x;
+        let y = initial_origin.y;
 
         // 3. Create the managed 32-bit window (override_redirect is false by default)
         // Request exposure, structure, and mouse pointer events (enter, leave, button clicks)
@@ -177,6 +177,36 @@ impl ManagedProbeWindow {
             width,
             height,
         })
+    }
+
+    /// Queries the window's actual root-coordinate origin using X11 `TranslateCoordinates`.
+    /// When managed by a window manager, the client window may be reparented into a WM frame,
+    /// so client-window coordinates relative to parent may differ from root coordinates.
+    pub fn query_actual_root_origin(
+        &self,
+        conn: &impl Connection,
+        root: Window,
+    ) -> Result<Point, Box<dyn std::error::Error>> {
+        let reply = conn
+            .translate_coordinates(self.window, root, 0, 0)?
+            .reply()?;
+        Ok(Point::new(reply.dst_x as i32, reply.dst_y as i32))
+    }
+
+    /// Queries the window's actual root-coordinate origin and size.
+    pub fn query_actual_root_geometry(
+        &self,
+        conn: &impl Connection,
+        root: Window,
+    ) -> Result<Rect, Box<dyn std::error::Error>> {
+        let origin = self.query_actual_root_origin(conn, root)?;
+        let geom = conn.get_geometry(self.window)?.reply()?;
+        Ok(Rect::new(
+            origin.x,
+            origin.y,
+            geom.width as u32,
+            geom.height as u32,
+        ))
     }
 
     /// Releases server-side Window and Colormap resources, checking requests and reporting failures
