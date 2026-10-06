@@ -128,8 +128,8 @@ fn main() {
         return;
     }
 
-    // M01.2: Render borderless transparent test body
-    println!("Mission M01.2: Rendering borderless transparent test body...");
+    // M01.3: Pointer input handling without keyboard focus
+    println!("Mission M01.3: Handling pointer input without keyboard focus...");
 
     // 1. Discover 32-bit alpha Render visual
     let alpha_vis = match find_alpha_visual(&conn) {
@@ -196,9 +196,10 @@ fn main() {
         probe_window.y
     );
     println!("  Window properties: borderless (_MOTIF_WM_HINTS), managed, type=UTILITY");
+    println!("  Input shape: X11 Shape extension applied to body silhouette and test patch");
 
     // 4. Initialize double-buffered renderer
-    let renderer = match Renderer::new(&conn, probe_window.window, probe_window.colormap) {
+    let mut renderer = match Renderer::new(&conn, probe_window.window, probe_window.colormap) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[ERROR] Failed to initialize renderer: {}", e);
@@ -247,6 +248,42 @@ fn main() {
                             process::exit(1);
                         }
                     }
+                    Event::EnterNotify(ev) if ev.event == probe_window.window => {
+                        println!(
+                            "[INPUT] Pointer entered body at ({}, {})",
+                            ev.event_x, ev.event_y
+                        );
+                    }
+                    Event::LeaveNotify(ev) if ev.event == probe_window.window => {
+                        println!(
+                            "[INPUT] Pointer left body at ({}, {})",
+                            ev.event_x, ev.event_y
+                        );
+                    }
+                    Event::ButtonPress(ev) if ev.event == probe_window.window => {
+                        match renderer.toggle_color(&conn, probe_window.window) {
+                            Ok(theme) => {
+                                println!(
+                                    "[INPUT] ButtonPress: button={} at ({}, {}) -> toggled body color to {}",
+                                    ev.detail,
+                                    ev.event_x,
+                                    ev.event_y,
+                                    theme.name()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("[ERROR] Color toggle on ButtonPress failed: {}", e);
+                                let _ = probe_window.destroy(&conn);
+                                process::exit(1);
+                            }
+                        }
+                    }
+                    Event::ButtonRelease(ev) if ev.event == probe_window.window => {
+                        println!(
+                            "[INPUT] ButtonRelease: button={} at ({}, {})",
+                            ev.detail, ev.event_x, ev.event_y
+                        );
+                    }
                     Event::ClientMessage(msg) if msg.window == probe_window.window => {
                         let data = msg.data.as_data32();
                         if data[0] == probe_window.wm_delete_window {
@@ -281,7 +318,7 @@ fn main() {
     println!("\n[Cleanup]");
     let _ = probe_window.destroy(&conn);
     println!("  Resources released cleanly.");
-    println!("  M01.2: Borderless transparent test body executed successfully.");
+    println!("  M01.3: Pointer input handled without taking keyboard focus.");
 }
 
 fn run_diagnostics(

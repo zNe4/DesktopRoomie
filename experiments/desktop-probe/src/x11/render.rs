@@ -6,11 +6,27 @@ use x11rb::protocol::xproto::{
 pub const WINDOW_WIDTH: u16 = 160;
 pub const WINDOW_HEIGHT: u16 = 160;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorTheme {
+    Lavender,
+    Coral,
+}
+
+impl ColorTheme {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Lavender => "Lavender (Default)",
+            Self::Coral => "Coral (Clicked)",
+        }
+    }
+}
+
 pub struct Renderer {
     pub pixmap: Pixmap,
     pub gc: Gcontext,
     pub width: u16,
     pub height: u16,
+    pub theme: ColorTheme,
 }
 
 impl Renderer {
@@ -21,6 +37,7 @@ impl Renderer {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let width = WINDOW_WIDTH;
         let height = WINDOW_HEIGHT;
+        let theme = ColorTheme::Lavender;
 
         // 1. Create depth-32 Pixmap for double buffering
         let pixmap = conn.generate_id()?;
@@ -32,7 +49,7 @@ impl Renderer {
         conn.create_gc(gc, pixmap, &CreateGCAux::new())?.check()?;
 
         // 3. Generate 32-bit ARGB image buffer
-        let buffer = generate_test_body_pattern(width as usize, height as usize);
+        let buffer = generate_test_body_pattern(width as usize, height as usize, theme);
 
         // 4. Upload buffer into Pixmap
         conn.put_image(
@@ -54,6 +71,7 @@ impl Renderer {
             gc,
             width,
             height,
+            theme,
         })
     }
 
@@ -78,11 +96,43 @@ impl Renderer {
         conn.flush()?;
         Ok(())
     }
+
+    /// Toggles the body color palette on mouse click for immediate visual feedback
+    pub fn toggle_color(
+        &mut self,
+        conn: &impl Connection,
+        window: Window,
+    ) -> Result<ColorTheme, Box<dyn std::error::Error>> {
+        self.theme = match self.theme {
+            ColorTheme::Lavender => ColorTheme::Coral,
+            ColorTheme::Coral => ColorTheme::Lavender,
+        };
+
+        let buffer =
+            generate_test_body_pattern(self.width as usize, self.height as usize, self.theme);
+
+        conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            self.pixmap,
+            self.gc,
+            self.width,
+            self.height,
+            0,
+            0,
+            0,
+            32,
+            &buffer,
+        )?
+        .check()?;
+
+        self.paint(conn, window)?;
+        Ok(self.theme)
+    }
 }
 
 /// Generates a 160x160 little-endian premultiplied ARGB buffer:
 /// Byte order in memory: [B, G, R, A]
-fn generate_test_body_pattern(width: usize, height: usize) -> Vec<u8> {
+fn generate_test_body_pattern(width: usize, height: usize, theme: ColorTheme) -> Vec<u8> {
     let mut data = vec![0u8; width * height * 4];
 
     for y in 0..height {
@@ -104,11 +154,22 @@ fn generate_test_body_pattern(width: usize, height: usize) -> Vec<u8> {
                     data[idx + 2] = 255;
                     data[idx + 3] = 255;
                 } else {
-                    // Solid body: Vibrant Lavender/Purple (A=255, R=165, G=95, B=225)
-                    data[idx] = 225; // B
-                    data[idx + 1] = 95; // G
-                    data[idx + 2] = 165; // R
-                    data[idx + 3] = 255; // A
+                    match theme {
+                        ColorTheme::Lavender => {
+                            // Vibrant Lavender/Purple (A=255, R=165, G=95, B=225)
+                            data[idx] = 225; // B
+                            data[idx + 1] = 95; // G
+                            data[idx + 2] = 165; // R
+                            data[idx + 3] = 255; // A
+                        }
+                        ColorTheme::Coral => {
+                            // Warm Coral/Orange-Pink (A=255, R=240, G=110, B=80)
+                            data[idx] = 80; // B
+                            data[idx + 1] = 110; // G
+                            data[idx + 2] = 240; // R
+                            data[idx + 3] = 255; // A
+                        }
+                    }
                 }
             } else if (15..=65).contains(&x) && (15..=65).contains(&y) {
                 // Translucent test patch: 50% opacity Cyan (A=128, R=0, G=200, B=255)

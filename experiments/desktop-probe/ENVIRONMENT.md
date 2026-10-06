@@ -55,7 +55,9 @@ Recorded: 2026-10-05.
 - **Managed Borderless Window (M01.2):** Created managed window (`override_redirect = false`) with `_MOTIF_WM_HINTS` (`decorations = 0`) and `_NET_WM_WINDOW_TYPE_UTILITY`. Openbox manages window without borders or titlebar.
 - **Alpha Blending & Compositing (M01.2):** Verified under Picom: empty region is genuinely transparent, translucent cyan patch blends with underlying desktop windows, and opaque body is crisp.
 - **RENDER Extension:** Supported (v0.11), required for alpha composition and blending.
-- **SHAPE Extension:** Supported (v1.1), ready for bounding and input shaping in M01.3.
+- **SHAPE Extension & Hit Testing (M01.3):** Verified `shape_rectangles` with `SK::INPUT` and `SO::SET` (v1.1). Transparent padding rejects pointer clicks (passing through to underlying windows/desktop), while solid body and translucent patch capture pointer events.
+- **Focus Isolation (M01.3):** Verified ICCCM No-Input model (`WM_HINTS` with `input = false` and omitting `WM_TAKE_FOCUS`). Clicking on the probe body does not steal keyboard focus (`_NET_ACTIVE_WINDOW` remains unchanged).
+- **Pointer Feedback & Repaint (M01.3):** Handles `EnterNotify`, `LeaveNotify`, `ButtonPress`, and `ButtonRelease`. Left clicking the body toggles palette between Lavender (`#6C5CE7`) and Coral (`#E76F51`) with immediate double-buffered blit.
 
 ---
 

@@ -7,6 +7,7 @@ use x11rb::wrapper::ConnectionExt as WrapperExt;
 
 use super::monitors::Rect;
 use super::render::{WINDOW_HEIGHT, WINDOW_WIDTH};
+use super::shape::apply_body_input_shape;
 
 pub struct ManagedProbeWindow {
     pub window: Window,
@@ -37,12 +38,20 @@ impl ManagedProbeWindow {
         let y = usable_area.y + ((usable_area.height.saturating_sub(height as u32)) / 2) as i32;
 
         // 3. Create the managed 32-bit window (override_redirect is false by default)
+        // Request exposure, structure, and mouse pointer events (enter, leave, button clicks)
         let window = conn.generate_id()?;
         let win_aux = CreateWindowAux::new()
             .background_pixel(0)
             .border_pixel(0)
             .colormap(colormap)
-            .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY);
+            .event_mask(
+                EventMask::EXPOSURE
+                    | EventMask::STRUCTURE_NOTIFY
+                    | EventMask::ENTER_WINDOW
+                    | EventMask::LEAVE_WINDOW
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE,
+            );
 
         conn.create_window(
             32, // depth
@@ -75,6 +84,11 @@ impl ManagedProbeWindow {
         size_hints.max_size = Some((width as i32, height as i32));
         size_hints.set_normal_hints(conn, window)?.check()?;
 
+        // Set WM_HINTS: explicitly request no keyboard focus (ICCCM No-Input model)
+        let mut wm_hints = x11rb::properties::WmHints::new();
+        wm_hints.input = Some(false);
+        wm_hints.set(conn, window)?.check()?;
+
         // 4. Motif hints: borderless (decorations = 0)
         let motif_atom = conn.intern_atom(false, b"_MOTIF_WM_HINTS")?.reply()?.atom;
         // flags = 2 (MWM_HINTS_DECORATIONS), decorations = 0
@@ -106,7 +120,7 @@ impl ManagedProbeWindow {
         )?
         .check()?;
 
-        // 6. Set WM_PROTOCOLS: WM_DELETE_WINDOW (clean graceful close on WM request)
+        // 6. Set WM_PROTOCOLS: WM_DELETE_WINDOW (clean graceful close; omits WM_TAKE_FOCUS)
         let wm_protocols = conn.intern_atom(false, b"WM_PROTOCOLS")?.reply()?.atom;
         let wm_delete_window = conn.intern_atom(false, b"WM_DELETE_WINDOW")?.reply()?.atom;
         conn.change_property32(
@@ -136,7 +150,10 @@ impl ManagedProbeWindow {
         )?
         .check()?;
 
-        // 8. Map window to screen
+        // 8. Apply X11 Shape extension: restrict pointer input exclusively to the test shapes
+        apply_body_input_shape(conn, window, width, height)?;
+
+        // 9. Map window to screen
         conn.map_window(window)?.check()?;
         conn.flush()?;
 
