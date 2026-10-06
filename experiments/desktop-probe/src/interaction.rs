@@ -82,14 +82,18 @@ impl InteractionManager {
         body_origin: Point,
     ) -> HostAction {
         match self.state {
-            InteractionState::Idle => {
+            InteractionState::Idle | InteractionState::SuppressedUntilRelease { .. } => {
                 if !is_in_interactive_silhouette(local.0, local.1) {
+                    self.state = InteractionState::Idle;
                     return HostAction::None;
                 }
 
                 let offset = match calculate_grab_offset(pointer_root, body_origin) {
                     Ok(off) => off,
-                    Err(_) => return HostAction::None,
+                    Err(_) => {
+                        self.state = InteractionState::Idle;
+                        return HostAction::None;
+                    }
                 };
 
                 self.pending_press = Some((pointer_root, body_origin, time, offset));
@@ -183,9 +187,24 @@ impl InteractionManager {
         bounds: &ValidOriginBounds,
     ) -> HostAction {
         match self.state {
-            InteractionState::LeftPressed { .. } => {
+            InteractionState::LeftPressed {
+                press_root,
+                press_origin,
+                grab_offset,
+                ..
+            } => {
                 self.state = InteractionState::Idle;
-                if is_in_interactive_silhouette(local.0, local.1) {
+                if exceeds_drag_threshold(press_root, pointer_root) {
+                    // Fast drag completed without intervening motion events:
+                    // Complete the drag using the clamped release target, do NOT toggle color!
+                    let unconstrained =
+                        calculate_target_origin(pointer_root, grab_offset).unwrap_or(press_origin);
+                    let final_target = bounds.clamp(unconstrained);
+                    HostAction::ReleaseGrabAndMoveWindow {
+                        time,
+                        target: final_target,
+                    }
+                } else if is_in_interactive_silhouette(local.0, local.1) {
                     HostAction::ReleaseGrabAndToggleColor { time }
                 } else {
                     HostAction::ReleaseGrab { time }
@@ -221,11 +240,11 @@ impl InteractionManager {
                 self.state = InteractionState::SuppressedUntilRelease { button: 1 };
                 HostAction::ReleaseGrab { time }
             }
-            InteractionState::Idle => {
-                // While idle, right press triggers clean exit (M01 baseline preserved)
+            InteractionState::Idle | InteractionState::SuppressedUntilRelease { .. } => {
+                // While idle or recovering from missed release, right press triggers clean exit
+                self.state = InteractionState::Idle;
                 HostAction::ExitCleanly
             }
-            InteractionState::SuppressedUntilRelease { .. } => HostAction::None,
         }
     }
 
@@ -583,6 +602,93 @@ mod tests {
         // Local (5, 5) is transparent padding
         let action = mgr.handle_left_press(root, (5, 5), 1000, origin);
         assert_eq!(action, HostAction::None);
+        assert_eq!(mgr.state(), InteractionState::Idle);
+    }
+
+    #[test]
+    fn test_fast_drag_without_motion_events_completes_drag() {
+        let mut mgr = InteractionManager::new();
+        let bounds = sample_bounds();
+        let root_press = Point::new(100, 100);
+        let origin = Point::new(80, 80);
+
+        // Press at center (local 80, 80) -> grab offset is (20, 20)
+        mgr.handle_left_press(root_press, (80, 80), 1000, origin);
+        mgr.on_grab_acquired();
+        assert!(matches!(mgr.state(), InteractionState::LeftPressed { .. }));
+
+        // Fast swipe release 20px away without intervening motion event.
+        // Release root is (120, 100) (dx=20 >= 4px threshold).
+        // Release local is (100, 80) which is still on the circular body (dist=20 <= 45).
+        // Must complete as a drag to clamped target (100, 80), NOT toggle color!
+        let release_action =
+            mgr.handle_left_release(Point::new(120, 100), (100, 80), 1010, &bounds);
+        assert_eq!(
+            release_action,
+            HostAction::ReleaseGrabAndMoveWindow {
+                time: 1010,
+                target: Point::new(100, 80),
+            }
+        );
+        assert_eq!(mgr.state(), InteractionState::Idle);
+    }
+
+    #[test]
+    fn test_suppressed_state_recovers_on_fresh_left_press() {
+        let mut mgr = InteractionManager::new();
+        let bounds = sample_bounds();
+        let root = Point::new(100, 100);
+        let origin = Point::new(80, 80);
+
+        // 1. Start gesture
+        mgr.handle_left_press(root, (80, 80), 1000, origin);
+        mgr.on_grab_acquired();
+
+        // 2. Right click cancels the gesture and releases capture
+        let cancel_action = mgr.handle_right_press(1010);
+        assert_eq!(cancel_action, HostAction::ReleaseGrab { time: 1010 });
+        assert_eq!(
+            mgr.state(),
+            InteractionState::SuppressedUntilRelease { button: 1 }
+        );
+
+        // 3. User releases button 1 outside our window over another application
+        // (probe receives NO button release event, so probe is still in SuppressedUntilRelease)
+
+        // 4. User brings cursor back and initiates a fresh left press
+        let fresh_action = mgr.handle_left_press(root, (80, 80), 1050, origin);
+        assert_eq!(fresh_action, HostAction::AcquireGrab { time: 1050 });
+
+        // 5. Acquisition succeeds and a new click/drag cycle proceeds normally
+        mgr.on_grab_acquired();
+        assert!(matches!(mgr.state(), InteractionState::LeftPressed { .. }));
+
+        let click_action = mgr.handle_left_release(root, (80, 80), 1060, &bounds);
+        assert_eq!(
+            click_action,
+            HostAction::ReleaseGrabAndToggleColor { time: 1060 }
+        );
+        assert_eq!(mgr.state(), InteractionState::Idle);
+    }
+
+    #[test]
+    fn test_suppressed_state_recovers_on_fresh_right_press() {
+        let mut mgr = InteractionManager::new();
+        let root = Point::new(100, 100);
+        let origin = Point::new(80, 80);
+
+        // Start and cancel gesture
+        mgr.handle_left_press(root, (80, 80), 1000, origin);
+        mgr.on_grab_acquired();
+        mgr.handle_right_press(1010);
+        assert_eq!(
+            mgr.state(),
+            InteractionState::SuppressedUntilRelease { button: 1 }
+        );
+
+        // Fresh right press exits cleanly
+        let right_action = mgr.handle_right_press(1050);
+        assert_eq!(right_action, HostAction::ExitCleanly);
         assert_eq!(mgr.state(), InteractionState::Idle);
     }
 }

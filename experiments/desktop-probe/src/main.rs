@@ -291,7 +291,6 @@ fn main() {
     let start_time = Instant::now();
     let mut running = true;
     let mut mapped_logged = false;
-    let mut current_body_origin = requested_origin;
     let mut interaction = InteractionManager::new();
     let mut pointer_tracker = PointerCaptureTracker::new();
 
@@ -305,7 +304,6 @@ fn main() {
                             mapped_logged = true;
                             match probe_window.query_actual_root_geometry(&conn, screen.root) {
                                 Ok(actual_geometry) => {
-                                    current_body_origin = actual_geometry.origin();
                                     println!("\n[Placement Verification (MapNotify)]");
                                     println!(
                                         "  Startup placement: requested={}, actual={}",
@@ -319,26 +317,29 @@ fn main() {
                                     );
                                 }
                                 Err(e) => {
-                                    eprintln!(
-                                        "[ERROR] Failed to query actual root geometry on MapNotify: {}",
-                                        e
+                                    fatal_host_error(
+                                        &format!(
+                                            "Failed to query actual root geometry on MapNotify: {}",
+                                            e
+                                        ),
+                                        &conn,
+                                        &mut pointer_tracker,
+                                        &renderer,
+                                        &probe_window,
                                     );
-                                    let _ =
-                                        pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
-                                    let _ = renderer.destroy(&conn);
-                                    let _ = probe_window.destroy(&conn);
-                                    process::exit(1);
                                 }
                             }
                         }
                     }
                     Event::Expose(exp) if exp.window == probe_window.window => {
                         if let Err(e) = renderer.paint(&conn, probe_window.window) {
-                            eprintln!("[ERROR] Repaint on Expose failed: {}", e);
-                            let _ = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
-                            let _ = renderer.destroy(&conn);
-                            let _ = probe_window.destroy(&conn);
-                            process::exit(1);
+                            fatal_host_error(
+                                &format!("Repaint on Expose failed: {}", e),
+                                &conn,
+                                &mut pointer_tracker,
+                                &renderer,
+                                &probe_window,
+                            );
                         }
                     }
                     Event::EnterNotify(ev) if ev.event == probe_window.window => {
@@ -357,16 +358,28 @@ fn main() {
                         1 => {
                             let pointer_root = Point::new(ev.root_x as i32, ev.root_y as i32);
                             let local = (ev.event_x, ev.event_y);
-                            let actual_origin = probe_window
-                                .query_actual_root_origin(&conn, screen.root)
-                                .unwrap_or(current_body_origin);
-                            current_body_origin = actual_origin;
+                            let actual_origin =
+                                match probe_window.query_actual_root_origin(&conn, screen.root) {
+                                    Ok(origin) => origin,
+                                    Err(e) => {
+                                        fatal_host_error(
+                                            &format!(
+                                                "Failed to query actual window origin on press: {}",
+                                                e
+                                            ),
+                                            &conn,
+                                            &mut pointer_tracker,
+                                            &renderer,
+                                            &probe_window,
+                                        );
+                                    }
+                                };
 
                             match interaction.handle_left_press(
                                 pointer_root,
                                 local,
                                 ev.time,
-                                current_body_origin,
+                                actual_origin,
                             ) {
                                 HostAction::AcquireGrab { time } => {
                                     match grab_pointer(&conn, probe_window.window, time) {
@@ -386,8 +399,13 @@ fn main() {
                                             );
                                         }
                                         Err(e) => {
-                                            eprintln!("[ERROR] GrabPointer request failed: {}", e);
-                                            interaction.on_grab_denied();
+                                            fatal_host_error(
+                                                &format!("GrabPointer request failed: {}", e),
+                                                &conn,
+                                                &mut pointer_tracker,
+                                                &renderer,
+                                                &probe_window,
+                                            );
                                         }
                                     }
                                 }
@@ -401,7 +419,18 @@ fn main() {
                         }
                         3 => match interaction.handle_right_press(ev.time) {
                             HostAction::ReleaseGrab { time } => {
-                                let _ = pointer_tracker.release_if_held(&conn, time);
+                                if let Err(e) = pointer_tracker.release_if_held(&conn, time) {
+                                    fatal_host_error(
+                                        &format!(
+                                            "Failed to release pointer capture on cancel: {}",
+                                            e
+                                        ),
+                                        &conn,
+                                        &mut pointer_tracker,
+                                        &renderer,
+                                        &probe_window,
+                                    );
+                                }
                                 println!(
                                     "[INPUT] ButtonPress: button=3 (Right) -> cancelled active gesture and released capture"
                                 );
@@ -439,9 +468,13 @@ fn main() {
                             if let Err(e) =
                                 probe_window.configure_position(&conn, target.x, target.y)
                             {
-                                eprintln!("[ERROR] Failed to move window to {}: {}", target, e);
-                            } else {
-                                current_body_origin = target;
+                                fatal_host_error(
+                                    &format!("Failed to move window to {}: {}", target, e),
+                                    &conn,
+                                    &mut pointer_tracker,
+                                    &renderer,
+                                    &probe_window,
+                                );
                             }
                         }
                     }
@@ -460,21 +493,49 @@ fn main() {
                                         if let Err(e) = probe_window
                                             .configure_position(&conn, target.x, target.y)
                                         {
-                                            eprintln!(
-                                                "[ERROR] Failed to finalize window position at {}: {}",
-                                                target, e
+                                            fatal_host_error(
+                                                &format!(
+                                                    "Failed to finalize window position at {}: {}",
+                                                    target, e
+                                                ),
+                                                &conn,
+                                                &mut pointer_tracker,
+                                                &renderer,
+                                                &probe_window,
                                             );
-                                        } else {
-                                            current_body_origin = target;
                                         }
-                                        let _ = pointer_tracker.release_if_held(&conn, time);
+                                        if let Err(e) = pointer_tracker.release_if_held(&conn, time)
+                                        {
+                                            fatal_host_error(
+                                                &format!(
+                                                    "Failed to release pointer capture on drag completion: {}",
+                                                    e
+                                                ),
+                                                &conn,
+                                                &mut pointer_tracker,
+                                                &renderer,
+                                                &probe_window,
+                                            );
+                                        }
                                         println!(
                                             "[INPUT] Drag completed at root ({}, {}), final origin {}",
                                             ev.root_x, ev.root_y, target
                                         );
                                     }
                                     HostAction::ReleaseGrabAndToggleColor { time } => {
-                                        let _ = pointer_tracker.release_if_held(&conn, time);
+                                        if let Err(e) = pointer_tracker.release_if_held(&conn, time)
+                                        {
+                                            fatal_host_error(
+                                                &format!(
+                                                    "Failed to release pointer capture on click release: {}",
+                                                    e
+                                                ),
+                                                &conn,
+                                                &mut pointer_tracker,
+                                                &renderer,
+                                                &probe_window,
+                                            );
+                                        }
                                         match renderer.toggle_color(&conn, probe_window.window) {
                                             Ok(theme) => {
                                                 println!(
@@ -485,20 +546,33 @@ fn main() {
                                             );
                                             }
                                             Err(e) => {
-                                                eprintln!(
-                                                "[ERROR] Color toggle on ButtonRelease failed: {}",
-                                                e
-                                            );
-                                                let _ = pointer_tracker
-                                                    .release_if_held(&conn, x11rb::CURRENT_TIME);
-                                                let _ = renderer.destroy(&conn);
-                                                let _ = probe_window.destroy(&conn);
-                                                process::exit(1);
+                                                fatal_host_error(
+                                                    &format!(
+                                                        "Color toggle on ButtonRelease failed: {}",
+                                                        e
+                                                    ),
+                                                    &conn,
+                                                    &mut pointer_tracker,
+                                                    &renderer,
+                                                    &probe_window,
+                                                );
                                             }
                                         }
                                     }
                                     HostAction::ReleaseGrab { time } => {
-                                        let _ = pointer_tracker.release_if_held(&conn, time);
+                                        if let Err(e) = pointer_tracker.release_if_held(&conn, time)
+                                        {
+                                            fatal_host_error(
+                                                &format!(
+                                                    "Failed to release pointer capture on click cancellation: {}",
+                                                    e
+                                                ),
+                                                &conn,
+                                                &mut pointer_tracker,
+                                                &renderer,
+                                                &probe_window,
+                                            );
+                                        }
                                         println!(
                                         "[INPUT] ButtonRelease: button=1 (Left) at ({}, {}) outside shape -> click cancelled without toggle",
                                         ev.event_x, ev.event_y
@@ -526,30 +600,44 @@ fn main() {
                         let data = msg.data.as_data32();
                         if data[0] == probe_window.wm_delete_window {
                             println!("  Received WM_DELETE_WINDOW. Exiting cleanly.");
-                            let _ = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
+                            if let Err(e) =
+                                pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME)
+                            {
+                                fatal_host_error(
+                                    &format!(
+                                        "Failed to release pointer capture on WM_DELETE_WINDOW: {}",
+                                        e
+                                    ),
+                                    &conn,
+                                    &mut pointer_tracker,
+                                    &renderer,
+                                    &probe_window,
+                                );
+                            }
                             running = false;
                             break;
                         }
                     }
                     Event::Error(xerr) => {
-                        eprintln!(
-                            "[ERROR] Asynchronous X11 protocol error received: {:?}",
-                            xerr
+                        fatal_host_error(
+                            &format!("Asynchronous X11 protocol error received: {:?}", xerr),
+                            &conn,
+                            &mut pointer_tracker,
+                            &renderer,
+                            &probe_window,
                         );
-                        let _ = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
-                        let _ = renderer.destroy(&conn);
-                        let _ = probe_window.destroy(&conn);
-                        process::exit(1);
                     }
                     _ => {}
                 },
                 Ok(None) => break,
                 Err(e) => {
-                    eprintln!("[ERROR] X11 connection poll error: {}", e);
-                    let _ = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
-                    let _ = renderer.destroy(&conn);
-                    let _ = probe_window.destroy(&conn);
-                    process::exit(1);
+                    fatal_host_error(
+                        &format!("X11 connection poll error: {}", e),
+                        &conn,
+                        &mut pointer_tracker,
+                        &renderer,
+                        &probe_window,
+                    );
                 }
             }
         }
@@ -560,11 +648,13 @@ fn main() {
 
         // Flush any pending requests before waiting
         if let Err(e) = conn.flush() {
-            eprintln!("[ERROR] Failed to flush X11 connection: {}", e);
-            let _ = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
-            let _ = renderer.destroy(&conn);
-            let _ = probe_window.destroy(&conn);
-            process::exit(1);
+            fatal_host_error(
+                &format!("Failed to flush X11 connection: {}", e),
+                &conn,
+                &mut pointer_tracker,
+                &renderer,
+                &probe_window,
+            );
         }
 
         // Compute timeout until duration limit or wait indefinitely
@@ -574,7 +664,15 @@ fn main() {
                 let elapsed = start_time.elapsed();
                 if elapsed >= duration {
                     println!("  Duration limit reached ({}s). Exiting cleanly.", sec);
-                    let _ = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
+                    if let Err(e) = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME) {
+                        fatal_host_error(
+                            &format!("Failed to release pointer capture on timeout: {}", e),
+                            &conn,
+                            &mut pointer_tracker,
+                            &renderer,
+                            &probe_window,
+                        );
+                    }
                     break;
                 }
                 let remaining = duration - elapsed;
@@ -593,11 +691,13 @@ fn main() {
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() != std::io::ErrorKind::Interrupted {
-                eprintln!("[ERROR] Socket poll error: {}", err);
-                let _ = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
-                let _ = renderer.destroy(&conn);
-                let _ = probe_window.destroy(&conn);
-                process::exit(1);
+                fatal_host_error(
+                    &format!("Socket poll error: {}", err),
+                    &conn,
+                    &mut pointer_tracker,
+                    &renderer,
+                    &probe_window,
+                );
             }
         }
     }
@@ -625,6 +725,25 @@ fn main() {
 
     println!("  Resources released cleanly.");
     println!("  Probe exited cleanly.");
+}
+
+fn fatal_host_error(
+    err_msg: &str,
+    conn: &impl Connection,
+    pointer_tracker: &mut PointerCaptureTracker,
+    renderer: &Renderer,
+    probe_window: &ManagedProbeWindow,
+) -> ! {
+    eprintln!("[ERROR] {}", err_msg);
+    if let Err(e) = pointer_tracker.release_if_held(conn, x11rb::CURRENT_TIME) {
+        eprintln!(
+            "[ERROR] Failed to release pointer capture during error exit: {}",
+            e
+        );
+    }
+    let _ = renderer.destroy(conn);
+    let _ = probe_window.destroy(conn);
+    process::exit(1);
 }
 
 fn run_diagnostics(

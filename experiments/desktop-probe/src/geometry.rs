@@ -309,13 +309,14 @@ pub fn calculate_target_origin(
     checked_target_origin(pointer, offset).ok_or(PlacementError::CoordinateOverflow)
 }
 
-pub const DRAG_THRESHOLD_SQUARED: i64 = 16;
+pub const DRAG_THRESHOLD_SQUARED: i128 = 16;
 
 /// Returns true if the Euclidean distance between two points reaches or exceeds 4 pixels
-/// (squared distance dx*dx + dy*dy >= 16) using wide signed arithmetic.
+/// (squared distance dx*dx + dy*dy >= 16) using 128-bit signed arithmetic to prevent
+/// overflow when squaring differences between extreme i32 coordinates.
 pub fn exceeds_drag_threshold(p1: Point, p2: Point) -> bool {
-    let dx = (p2.x as i64) - (p1.x as i64);
-    let dy = (p2.y as i64) - (p1.y as i64);
+    let dx = (p2.x as i128) - (p1.x as i128);
+    let dy = (p2.y as i128) - (p1.y as i128);
     dx * dx + dy * dy >= DRAG_THRESHOLD_SQUARED
 }
 
@@ -632,6 +633,14 @@ mod tests {
 
         // Large distance
         assert!(exceeds_drag_threshold(p0, Point::new(200, 300)));
+
+        // Extreme coordinate ranges (i32::MIN to i32::MAX) must not overflow i128
+        let p_min = Point::new(i32::MIN, i32::MIN);
+        let p_max = Point::new(i32::MAX, i32::MAX);
+        assert!(exceeds_drag_threshold(p_min, p_max));
+        assert!(exceeds_drag_threshold(p_max, p_min));
+        assert!(!exceeds_drag_threshold(p_min, p_min));
+        assert!(!exceeds_drag_threshold(p_max, p_max));
     }
 
     #[test]

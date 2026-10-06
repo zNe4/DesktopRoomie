@@ -17,7 +17,10 @@ pub fn grab_pointer(
     window: Window,
     time: u32,
 ) -> Result<GrabStatus, Box<dyn std::error::Error>> {
-    let mask = EventMask::BUTTON_RELEASE | EventMask::BUTTON_MOTION | EventMask::POINTER_MOTION;
+    let mask = EventMask::BUTTON_PRESS
+        | EventMask::BUTTON_RELEASE
+        | EventMask::BUTTON_MOTION
+        | EventMask::POINTER_MOTION;
     let cookie = conn.grab_pointer(
         false, // owner_events: do not report events to other client windows
         window,
@@ -59,14 +62,15 @@ impl PointerCaptureTracker {
     }
 
     /// Releases pointer capture if currently held. Returns Ok(true) if ungrab was sent.
+    /// Only clears internal ownership state after ungrab succeeds.
     pub fn release_if_held(
         &mut self,
         conn: &impl Connection,
         time: u32,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         if self.has_grab {
-            self.has_grab = false;
             ungrab_pointer(conn, time)?;
+            self.has_grab = false;
             Ok(true)
         } else {
             Ok(false)
