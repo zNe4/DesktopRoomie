@@ -10,13 +10,20 @@ use super::render::{WINDOW_HEIGHT, WINDOW_WIDTH};
 use super::shape::apply_body_input_shape;
 use crate::geometry::{Point, Rect, Size};
 
+use std::collections::VecDeque;
+
 /// Outcomes of reconciling a ConfigureNotify event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigureReconciliation {
-    /// Window configuration matches expected dimensions and requested origin.
+    /// Window configuration matches expected dimensions and the latest requested origin.
     Confirmed { origin: Point, size: Size },
-    /// Position differs between requested and confirmed coordinates.
-    PositionMismatch { requested: Point, confirmed: Point },
+    /// An older in-flight movement request was confirmed while newer moves remain pending.
+    InFlightCatchUp {
+        confirmed: Point,
+        remaining_in_flight: usize,
+    },
+    /// Genuine position mismatch: confirmed origin differs from all in-flight and requested positions.
+    GenuineMismatch { requested: Point, confirmed: Point },
     /// Unexpected size change from window manager.
     UnexpectedSizeChange { expected: Size, actual: Size },
 }
@@ -42,6 +49,7 @@ pub struct ManagedProbeWindow {
     pub wm_delete_window: u32,
     pub requested_origin: Point,
     pub confirmed_origin: Point,
+    pub in_flight_moves: VecDeque<Point>,
     pub width: u16,
     pub height: u16,
 }
@@ -197,6 +205,7 @@ impl ManagedProbeWindow {
 
         let requested_origin = initial_origin;
         let confirmed_origin = initial_origin;
+        let in_flight_moves = VecDeque::new();
 
         Ok(Self {
             window,
@@ -204,6 +213,7 @@ impl ManagedProbeWindow {
             wm_delete_window,
             requested_origin,
             confirmed_origin,
+            in_flight_moves,
             width,
             height,
         })
@@ -236,7 +246,54 @@ impl ManagedProbeWindow {
         let aux = ConfigureWindowAux::new().x(target.x).y(target.y);
         conn.configure_window(self.window, &aux)?;
         self.requested_origin = target;
+        self.in_flight_moves.push_back(target);
         Ok(())
+    }
+
+    /// Reconciles an incoming confirmed root origin against in-flight requests and current requested origin.
+    pub fn reconcile_origin(
+        &mut self,
+        confirmed_origin: Point,
+        size: Size,
+    ) -> ConfigureReconciliation {
+        self.confirmed_origin = confirmed_origin;
+
+        // Check if confirmed_origin matches any in-flight move
+        if let Some(pos) = self
+            .in_flight_moves
+            .iter()
+            .position(|&p| p == confirmed_origin)
+        {
+            // Drain all moves up to and including this one
+            self.in_flight_moves.drain(..=pos);
+            if self.in_flight_moves.is_empty() {
+                ConfigureReconciliation::Confirmed {
+                    origin: confirmed_origin,
+                    size,
+                }
+            } else {
+                ConfigureReconciliation::InFlightCatchUp {
+                    confirmed: confirmed_origin,
+                    remaining_in_flight: self.in_flight_moves.len(),
+                }
+            }
+        } else if self.in_flight_moves.is_empty() && confirmed_origin == self.requested_origin {
+            ConfigureReconciliation::Confirmed {
+                origin: confirmed_origin,
+                size,
+            }
+        } else {
+            ConfigureReconciliation::GenuineMismatch {
+                requested: self.requested_origin,
+                confirmed: confirmed_origin,
+            }
+        }
+    }
+
+    /// Resets in-flight move tracking and aligns requested origin with confirmed origin.
+    pub fn cancel_in_flight_moves(&mut self) {
+        self.in_flight_moves.clear();
+        self.requested_origin = self.confirmed_origin;
     }
 
     /// Evaluates a ConfigureNotify event to determine whether coordinates are synthetic (root space)
@@ -268,6 +325,32 @@ impl ManagedProbeWindow {
         }
     }
 
+    /// Evaluates and reconciles a ConfigureNotify event, using a custom root-translation closure if needed.
+    pub fn handle_configure_notify_with<F>(
+        &mut self,
+        ev: &ConfigureNotifyEvent,
+        mut translate_fn: F,
+    ) -> Result<ConfigureReconciliation, Box<dyn std::error::Error>>
+    where
+        F: FnMut() -> Result<Point, Box<dyn std::error::Error>>,
+    {
+        let analysis =
+            Self::evaluate_configure_event(Size::new(self.width as u32, self.height as u32), ev);
+
+        match analysis {
+            ConfigureEventAnalysis::UnexpectedSizeChange { expected, actual } => {
+                Ok(ConfigureReconciliation::UnexpectedSizeChange { expected, actual })
+            }
+            ConfigureEventAnalysis::SyntheticRootOrigin { origin, size } => {
+                Ok(self.reconcile_origin(origin, size))
+            }
+            ConfigureEventAnalysis::RequiresRootTranslation { size, .. } => {
+                let origin = translate_fn()?;
+                Ok(self.reconcile_origin(origin, size))
+            }
+        }
+    }
+
     /// Reconciles actual root geometry upon receiving a ConfigureNotify event.
     ///
     /// Distinguishes ICCCM synthetic events from the WM (where `response_type & 0x80 != 0`
@@ -279,37 +362,10 @@ impl ManagedProbeWindow {
         root: Window,
         ev: &ConfigureNotifyEvent,
     ) -> Result<ConfigureReconciliation, Box<dyn std::error::Error>> {
-        let analysis =
-            Self::evaluate_configure_event(Size::new(self.width as u32, self.height as u32), ev);
-
-        match analysis {
-            ConfigureEventAnalysis::UnexpectedSizeChange { expected, actual } => {
-                Ok(ConfigureReconciliation::UnexpectedSizeChange { expected, actual })
-            }
-            ConfigureEventAnalysis::SyntheticRootOrigin { origin, size } => {
-                self.confirmed_origin = origin;
-                if origin != self.requested_origin {
-                    Ok(ConfigureReconciliation::PositionMismatch {
-                        requested: self.requested_origin,
-                        confirmed: origin,
-                    })
-                } else {
-                    Ok(ConfigureReconciliation::Confirmed { origin, size })
-                }
-            }
-            ConfigureEventAnalysis::RequiresRootTranslation { size, .. } => {
-                let origin = self.query_actual_root_origin(conn, root)?;
-                self.confirmed_origin = origin;
-                if origin != self.requested_origin {
-                    Ok(ConfigureReconciliation::PositionMismatch {
-                        requested: self.requested_origin,
-                        confirmed: origin,
-                    })
-                } else {
-                    Ok(ConfigureReconciliation::Confirmed { origin, size })
-                }
-            }
-        }
+        let window = self.window;
+        self.handle_configure_notify_with(ev, || {
+            Self::query_window_actual_root_origin(conn, window, root)
+        })
     }
 
     /// Queries the window's actual root-coordinate origin using X11 `TranslateCoordinates`.
@@ -320,9 +376,16 @@ impl ManagedProbeWindow {
         conn: &impl Connection,
         root: Window,
     ) -> Result<Point, Box<dyn std::error::Error>> {
-        let reply = conn
-            .translate_coordinates(self.window, root, 0, 0)?
-            .reply()?;
+        Self::query_window_actual_root_origin(conn, self.window, root)
+    }
+
+    /// Static helper to query actual root-coordinate origin for a given window.
+    pub fn query_window_actual_root_origin(
+        conn: &impl Connection,
+        window: Window,
+        root: Window,
+    ) -> Result<Point, Box<dyn std::error::Error>> {
+        let reply = conn.translate_coordinates(window, root, 0, 0)?.reply()?;
         Ok(Point::new(reply.dst_x as i32, reply.dst_y as i32))
     }
 
@@ -466,5 +529,221 @@ mod tests {
                 actual: Size::new(320, 240),
             }
         );
+    }
+
+    #[test]
+    fn test_delayed_older_confirmations_accepted_without_mismatch() {
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(80, 80),
+            confirmed_origin: Point::new(80, 80),
+            in_flight_moves: VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+
+        // Queue in-flight moves P1, P2, P3
+        let p1 = Point::new(100, 100);
+        let p2 = Point::new(110, 100);
+        let p3 = Point::new(120, 100);
+        window.in_flight_moves.push_back(p1);
+        window.in_flight_moves.push_back(p2);
+        window.in_flight_moves.push_back(p3);
+        window.requested_origin = p3;
+
+        // Confirmation for older move P1 arrives while P2, P3 remain in flight
+        let res1 = window.reconcile_origin(p1, Size::new(160, 160));
+        assert_eq!(
+            res1,
+            ConfigureReconciliation::InFlightCatchUp {
+                confirmed: p1,
+                remaining_in_flight: 2,
+            }
+        );
+        assert_eq!(window.confirmed_origin, p1);
+        assert_eq!(window.in_flight_moves.len(), 2);
+
+        // Confirmation for P3 arrives (Openbox coalesced P2)
+        let res3 = window.reconcile_origin(p3, Size::new(160, 160));
+        assert_eq!(
+            res3,
+            ConfigureReconciliation::Confirmed {
+                origin: p3,
+                size: Size::new(160, 160),
+            }
+        );
+        assert_eq!(window.confirmed_origin, p3);
+        assert!(window.in_flight_moves.is_empty());
+    }
+
+    #[test]
+    fn test_genuine_mismatch_detected_during_moves() {
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(100, 100),
+            confirmed_origin: Point::new(80, 80),
+            in_flight_moves: VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+
+        window.in_flight_moves.push_back(Point::new(100, 100));
+
+        // Openbox clamps/refuses move and reports (50, 50) which was never requested
+        let unexpected = Point::new(50, 50);
+        let res = window.reconcile_origin(unexpected, Size::new(160, 160));
+        assert_eq!(
+            res,
+            ConfigureReconciliation::GenuineMismatch {
+                requested: Point::new(100, 100),
+                confirmed: unexpected,
+            }
+        );
+        assert_eq!(window.confirmed_origin, unexpected);
+    }
+
+    #[test]
+    fn test_settled_genuine_mismatch_detected() {
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(100, 100),
+            confirmed_origin: Point::new(100, 100),
+            in_flight_moves: VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+
+        // Settled state (no in-flight moves), but incoming configuration reports unexpected coordinates
+        let unexpected = Point::new(150, 200);
+        let res = window.reconcile_origin(unexpected, Size::new(160, 160));
+        assert_eq!(
+            res,
+            ConfigureReconciliation::GenuineMismatch {
+                requested: Point::new(100, 100),
+                confirmed: unexpected,
+            }
+        );
+    }
+
+    #[test]
+    fn test_configure_notify_geometry_query_failure_propagates_error() {
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(100, 100),
+            confirmed_origin: Point::new(100, 100),
+            in_flight_moves: VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+
+        // Server structure event (response_type & 0x80 == 0) requires root translation
+        let ev = ConfigureNotifyEvent {
+            response_type: 22, // without synthetic bit
+            sequence: 1,
+            event: 100,
+            window: 100,
+            above_sibling: 0,
+            x: 10,
+            y: 10,
+            width: 160,
+            height: 160,
+            border_width: 0,
+            override_redirect: false,
+        };
+
+        // If the root translation query fails, handle_configure_notify_with must propagate the error
+        let query_err = "Simulated X11 TranslateCoordinates failure";
+        let result = window.handle_configure_notify_with(&ev, || {
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                query_err,
+            )))
+        });
+
+        assert!(result.is_err());
+        let err_str = result.err().unwrap().to_string();
+        assert!(err_str.contains(query_err));
+        // Confirm origin was not modified on error
+        assert_eq!(window.confirmed_origin, Point::new(100, 100));
+    }
+
+    #[test]
+    fn test_configure_notify_requires_root_translation_reconciles_on_success() {
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(120, 120),
+            confirmed_origin: Point::new(100, 100),
+            in_flight_moves: VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+        window.in_flight_moves.push_back(Point::new(120, 120));
+
+        let ev = ConfigureNotifyEvent {
+            response_type: 22, // server structure event
+            sequence: 1,
+            event: 100,
+            window: 100,
+            above_sibling: 0,
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 160,
+            border_width: 0,
+            override_redirect: false,
+        };
+
+        let result = window.handle_configure_notify_with(&ev, || Ok(Point::new(120, 120)));
+        assert_eq!(
+            result.unwrap(),
+            ConfigureReconciliation::Confirmed {
+                origin: Point::new(120, 120),
+                size: Size::new(160, 160),
+            }
+        );
+        assert_eq!(window.confirmed_origin, Point::new(120, 120));
+        assert!(window.in_flight_moves.is_empty());
+    }
+
+    #[test]
+    fn test_mismatch_cancellation_lifecycle() {
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(150, 150),
+            confirmed_origin: Point::new(80, 80),
+            in_flight_moves: VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+        window.in_flight_moves.push_back(Point::new(100, 100));
+        window.in_flight_moves.push_back(Point::new(150, 150));
+
+        // WM refuses and clamps window to (80, 80)
+        let res = window.reconcile_origin(Point::new(80, 80), Size::new(160, 160));
+        assert_eq!(
+            res,
+            ConfigureReconciliation::GenuineMismatch {
+                requested: Point::new(150, 150),
+                confirmed: Point::new(80, 80),
+            }
+        );
+
+        // Host cancels in-flight moves
+        window.cancel_in_flight_moves();
+        assert!(window.in_flight_moves.is_empty());
+        assert_eq!(window.requested_origin, Point::new(80, 80));
+        assert_eq!(window.confirmed_origin, Point::new(80, 80));
     }
 }

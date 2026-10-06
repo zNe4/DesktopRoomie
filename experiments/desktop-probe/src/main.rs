@@ -294,27 +294,46 @@ fn main() {
     let mut interaction = InteractionManager::new();
     let mut pointer_tracker = PointerCaptureTracker::new();
     let mut pending_move: Option<Point> = None;
+    let mut buffered_event: Option<Event> = None;
+    let mut awaiting_final_confirmation: Option<Point> = None;
 
     const MAX_EVENT_BATCH: usize = 64;
 
     while running {
-        // 1. Drain a bounded batch of available X11 events
-        let mut event_batch = Vec::new();
-        while event_batch.len() < MAX_EVENT_BATCH {
-            match conn.poll_for_event() {
-                Ok(Some(event)) => event_batch.push(event),
-                Ok(None) => break,
-                Err(e) => {
+        // Check duration deadline at start of each iteration
+        if let Some(sec) = config.duration_secs {
+            let duration = Duration::from_secs(sec);
+            let elapsed = start_time.elapsed();
+            if elapsed >= duration {
+                println!("  Duration limit reached ({}s). Exiting cleanly.", sec);
+                if let Err(e) = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME) {
                     fatal_host_error(
-                        &format!("X11 connection poll error: {}", e),
+                        &format!("Failed to release pointer capture on timeout: {}", e),
                         &conn,
                         &mut pointer_tracker,
                         &renderer,
                         &probe_window,
                     );
                 }
+                break;
             }
         }
+
+        // 1. Drain a bounded batch of available X11 events
+        let event_batch = match drain_events_bounded(&mut buffered_event, MAX_EVENT_BATCH, || {
+            conn.poll_for_event()
+        }) {
+            Ok(b) => b,
+            Err(e) => {
+                fatal_host_error(
+                    &format!("X11 connection poll error: {}", e),
+                    &conn,
+                    &mut pointer_tracker,
+                    &renderer,
+                    &probe_window,
+                );
+            }
+        };
 
         // 2. Process drained events
         for event in event_batch {
@@ -379,8 +398,49 @@ fn main() {
                         }
                         Event::ConfigureNotify(ev) if ev.window == probe_window.window => {
                             match probe_window.handle_configure_notify(&conn, screen.root, &ev) {
-                                Ok(ConfigureReconciliation::Confirmed { .. }) => {}
-                                Ok(ConfigureReconciliation::PositionMismatch { .. }) => {}
+                                Ok(ConfigureReconciliation::Confirmed { origin, .. }) => {
+                                    if awaiting_final_confirmation.take().is_some() {
+                                        println!(
+                                            "[INPUT] Final placement confirmed by WM at {}",
+                                            origin
+                                        );
+                                    }
+                                }
+                                Ok(ConfigureReconciliation::InFlightCatchUp { .. }) => {}
+                                Ok(ConfigureReconciliation::GenuineMismatch {
+                                    requested,
+                                    confirmed,
+                                }) => {
+                                    eprintln!(
+                                        "[WARN] Window manager refused or adjusted requested movement: requested {}, confirmed {}; cancelling interaction.",
+                                        requested, confirmed
+                                    );
+                                    if awaiting_final_confirmation.take().is_some() {
+                                        eprintln!(
+                                            "[WARN] Final placement adjusted by WM to {}",
+                                            confirmed
+                                        );
+                                    }
+                                    if let HostAction::ReleaseGrab { time } =
+                                        interaction.cancel_on_wm_mismatch(x11rb::CURRENT_TIME)
+                                    {
+                                        if let Err(e) = pointer_tracker.release_if_held(&conn, time)
+                                        {
+                                            fatal_host_error(
+                                                &format!(
+                                                    "Failed to release pointer capture on mismatch cancellation: {}",
+                                                    e
+                                                ),
+                                                &conn,
+                                                &mut pointer_tracker,
+                                                &renderer,
+                                                &probe_window,
+                                            );
+                                        }
+                                    }
+                                    pending_move = None;
+                                    probe_window.cancel_in_flight_moves();
+                                }
                                 Ok(ConfigureReconciliation::UnexpectedSizeChange {
                                     expected,
                                     actual,
@@ -583,19 +643,20 @@ fn main() {
                                                     &probe_window,
                                                 );
                                             }
-                                            let confirmed_origin = match probe_window
-                                                .query_actual_root_origin(&conn, screen.root)
+                                            if probe_window.in_flight_moves.is_empty()
+                                                && probe_window.confirmed_origin() == target
                                             {
-                                                Ok(orig) => {
-                                                    probe_window.confirmed_origin = orig;
-                                                    orig
-                                                }
-                                                Err(_) => probe_window.confirmed_origin(),
-                                            };
-                                            println!(
-                                                "[INPUT] Drag completed at root ({}, {}), requested origin {}, confirmed origin {}",
-                                                ev.root_x, ev.root_y, target, confirmed_origin
-                                            );
+                                                println!(
+                                                    "[INPUT] Drag completed at root ({}, {}), target origin {} (already confirmed by WM)",
+                                                    ev.root_x, ev.root_y, target
+                                                );
+                                            } else {
+                                                awaiting_final_confirmation = Some(target);
+                                                println!(
+                                                    "[INPUT] Drag completed at root ({}, {}), requested origin {}; awaiting WM confirmation",
+                                                    ev.root_x, ev.root_y, target
+                                                );
+                                            }
                                         }
                                         HostAction::ReleaseGrabAndToggleColor { time } => {
                                             if let Err(e) =
@@ -742,23 +803,36 @@ fn main() {
             );
         }
 
+        // Before sleeping on the socket, verify no events remain buffered in x11rb
+        // (which can occur if the drained batch reached MAX_EVENT_BATCH or if
+        // synchronous reply() calls received and queued incoming server events).
+        if buffered_event.is_some() {
+            continue;
+        }
+        match conn.poll_for_event() {
+            Ok(Some(ev)) => {
+                buffered_event = Some(ev);
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                fatal_host_error(
+                    &format!("X11 connection poll error: {}", e),
+                    &conn,
+                    &mut pointer_tracker,
+                    &renderer,
+                    &probe_window,
+                );
+            }
+        }
+
         // Compute timeout until duration limit or wait indefinitely
         let timeout_ms = match config.duration_secs {
             Some(sec) => {
                 let duration = Duration::from_secs(sec);
                 let elapsed = start_time.elapsed();
                 if elapsed >= duration {
-                    println!("  Duration limit reached ({}s). Exiting cleanly.", sec);
-                    if let Err(e) = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME) {
-                        fatal_host_error(
-                            &format!("Failed to release pointer capture on timeout: {}", e),
-                            &conn,
-                            &mut pointer_tracker,
-                            &renderer,
-                            &probe_window,
-                        );
-                    }
-                    break;
+                    continue; // Loop top will perform clean shutdown
                 }
                 let remaining = duration - elapsed;
                 remaining.as_millis().min(i32::MAX as u128) as i32
@@ -810,6 +884,28 @@ fn main() {
 
     println!("  Resources released cleanly.");
     println!("  Probe exited cleanly.");
+}
+
+/// Drains available X11 events into a bounded batch, prepending any previously buffered event.
+pub fn drain_events_bounded<E, F>(
+    buffered_event: &mut Option<Event>,
+    max_batch: usize,
+    mut poll_fn: F,
+) -> Result<Vec<Event>, E>
+where
+    F: FnMut() -> Result<Option<Event>, E>,
+{
+    let mut batch = Vec::new();
+    if let Some(ev) = buffered_event.take() {
+        batch.push(ev);
+    }
+    while batch.len() < max_batch {
+        match poll_fn()? {
+            Some(ev) => batch.push(ev),
+            None => break,
+        }
+    }
+    Ok(batch)
 }
 
 fn flush_pending_move(
@@ -943,4 +1039,141 @@ fn run_diagnostics(
         layout.usable_area.width,
         layout.usable_area.height
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use x11rb::protocol::xproto::{ButtonReleaseEvent, KeyButMask, Motion, MotionNotifyEvent};
+
+    #[test]
+    fn test_drain_events_bounded_preserves_buffered_event() {
+        let mut buffered_event = Some(Event::MotionNotify(MotionNotifyEvent {
+            response_type: 6,
+            detail: Motion::NORMAL,
+            sequence: 1,
+            time: 100,
+            root: 1,
+            event: 10,
+            child: 0,
+            root_x: 50,
+            root_y: 50,
+            event_x: 5,
+            event_y: 5,
+            state: KeyButMask::from(0u16),
+            same_screen: true,
+        }));
+
+        let mut queue = vec![Event::MotionNotify(MotionNotifyEvent {
+            response_type: 6,
+            detail: Motion::NORMAL,
+            sequence: 2,
+            time: 101,
+            root: 1,
+            event: 10,
+            child: 0,
+            root_x: 60,
+            root_y: 60,
+            event_x: 15,
+            event_y: 15,
+            state: KeyButMask::from(0u16),
+            same_screen: true,
+        })];
+
+        let batch: Vec<Event> = drain_events_bounded(&mut buffered_event, 64, || {
+            Ok::<_, ()>(if queue.is_empty() {
+                None
+            } else {
+                Some(queue.remove(0))
+            })
+        })
+        .unwrap();
+
+        assert_eq!(batch.len(), 2);
+        assert!(buffered_event.is_none());
+    }
+
+    #[test]
+    fn test_buffered_events_exceeding_batch_limit_drains_release_last() {
+        // Create 70 events: 69 motions followed by 1 release
+        let mut queue = std::collections::VecDeque::new();
+        for i in 0..69 {
+            queue.push_back(Event::MotionNotify(MotionNotifyEvent {
+                response_type: 6,
+                detail: Motion::NORMAL,
+                sequence: i as u16,
+                time: 1000 + i,
+                root: 1,
+                event: 10,
+                child: 0,
+                root_x: 100 + i as i16,
+                root_y: 100,
+                event_x: 10,
+                event_y: 10,
+                state: KeyButMask::BUTTON1,
+                same_screen: true,
+            }));
+        }
+        queue.push_back(Event::ButtonRelease(ButtonReleaseEvent {
+            response_type: 5,
+            detail: 1,
+            sequence: 70,
+            time: 1070,
+            root: 1,
+            event: 10,
+            child: 0,
+            root_x: 168,
+            root_y: 100,
+            event_x: 10,
+            event_y: 10,
+            state: KeyButMask::from(0u16),
+            same_screen: true,
+        }));
+
+        let mut buffered_event = None;
+        let mut processed_events = Vec::new();
+
+        // Simulate event loop across batches without sleeping on socket
+        let mut loops = 0;
+        while loops < 10 && (!queue.is_empty() || buffered_event.is_some()) {
+            loops += 1;
+            // 1. Drain batch
+            let batch: Vec<Event> =
+                drain_events_bounded(&mut buffered_event, 64, || Ok::<_, ()>(queue.pop_front()))
+                    .unwrap();
+
+            let batch_len = batch.len();
+            for ev in batch {
+                processed_events.push(ev);
+            }
+
+            // Verify batch 1 hit max_batch limit
+            if loops == 1 {
+                assert_eq!(batch_len, 64);
+            }
+
+            // 2. Before blocking, check if more events remain buffered in poll_fn
+            if buffered_event.is_none() {
+                if let Some(next_ev) = queue.pop_front() {
+                    buffered_event = Some(next_ev);
+                    continue;
+                }
+            }
+        }
+
+        assert_eq!(
+            loops, 2,
+            "Should drain all 70 events in exactly 2 batches without blocking"
+        );
+        assert_eq!(processed_events.len(), 70);
+
+        // Verify the 70th event processed is the ButtonRelease event
+        match &processed_events[69] {
+            Event::ButtonRelease(ev) => {
+                assert_eq!(ev.detail, 1);
+                assert_eq!(ev.root_x, 168);
+            }
+            other => panic!("Expected ButtonRelease at end of stream, found {:?}", other),
+        }
+    }
 }

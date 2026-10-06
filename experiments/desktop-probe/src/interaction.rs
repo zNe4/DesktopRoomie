@@ -294,6 +294,21 @@ impl InteractionManager {
             }
         }
     }
+
+    /// Cancels an active gesture due to window manager refusal/mismatch.
+    ///
+    /// Transitions active gestures to SuppressedUntilRelease so that the eventual
+    /// button release is safely ignored rather than triggering a click toggle.
+    pub fn cancel_on_wm_mismatch(&mut self, time: u32) -> HostAction {
+        self.pending_press = None;
+        match self.state {
+            InteractionState::LeftPressed { .. } | InteractionState::Dragging { .. } => {
+                self.state = InteractionState::SuppressedUntilRelease { button: 1 };
+                HostAction::ReleaseGrab { time }
+            }
+            _ => HostAction::None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -796,6 +811,59 @@ mod tests {
                 target: Point::new(80, 80),
             }
         );
+        assert_eq!(mgr.state(), InteractionState::Idle);
+    }
+
+    #[test]
+    fn test_cancel_on_wm_mismatch_from_dragging_suppresses_release() {
+        let mut mgr = InteractionManager::new();
+        let bounds = sample_bounds();
+        let origin = Point::new(80, 80);
+        let root = Point::new(100, 100);
+
+        mgr.handle_left_press(root, (80, 80), 1000, origin);
+        mgr.on_grab_acquired();
+
+        // Cross threshold to enter Dragging
+        let action = mgr.handle_motion(Point::new(120, 100), 1010, &bounds);
+        assert!(matches!(action, HostAction::MoveWindow { .. }));
+        assert!(mgr.is_dragging());
+
+        // WM mismatch triggers cancellation
+        let cancel_action = mgr.cancel_on_wm_mismatch(1020);
+        assert_eq!(cancel_action, HostAction::ReleaseGrab { time: 1020 });
+        assert_eq!(
+            mgr.state(),
+            InteractionState::SuppressedUntilRelease { button: 1 }
+        );
+
+        // Eventual release over window does NOT trigger color toggle or move window
+        let release_action = mgr.handle_left_release(Point::new(120, 100), (80, 80), 1030, &bounds);
+        assert_eq!(release_action, HostAction::None);
+        assert_eq!(mgr.state(), InteractionState::Idle);
+    }
+
+    #[test]
+    fn test_cancel_on_wm_mismatch_from_left_pressed() {
+        let mut mgr = InteractionManager::new();
+        let bounds = sample_bounds();
+        let origin = Point::new(80, 80);
+        let root = Point::new(100, 100);
+
+        mgr.handle_left_press(root, (80, 80), 1000, origin);
+        mgr.on_grab_acquired();
+
+        // While still in LeftPressed (e.g. before motion or before threshold)
+        let cancel_action = mgr.cancel_on_wm_mismatch(1010);
+        assert_eq!(cancel_action, HostAction::ReleaseGrab { time: 1010 });
+        assert_eq!(
+            mgr.state(),
+            InteractionState::SuppressedUntilRelease { button: 1 }
+        );
+
+        // Eventual release does not toggle color
+        let release_action = mgr.handle_left_release(root, (80, 80), 1020, &bounds);
+        assert_eq!(release_action, HostAction::None);
         assert_eq!(mgr.state(), InteractionState::Idle);
     }
 }
