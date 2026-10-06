@@ -1,4 +1,5 @@
 mod geometry;
+mod interaction;
 mod x11;
 
 use std::env;
@@ -10,11 +11,13 @@ use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::render::ConnectionExt as RenderExt;
 use x11rb::protocol::shape::ConnectionExt as ShapeExt;
-use x11rb::protocol::xproto::VisualClass;
+use x11rb::protocol::xproto::{GrabStatus, VisualClass};
 use x11rb::protocol::Event;
 
-use crate::geometry::{calculate_centered_origin, compute_valid_origin_bounds, Size};
+use crate::geometry::{calculate_centered_origin, compute_valid_origin_bounds, Point, Size};
+use crate::interaction::{HostAction, InteractionManager};
 use crate::x11::monitors::query_desktop_layout;
+use crate::x11::pointer::{grab_pointer, PointerCaptureTracker};
 use crate::x11::render::{Renderer, WINDOW_HEIGHT, WINDOW_WIDTH};
 use crate::x11::visual::find_alpha_visual;
 use crate::x11::window::ManagedProbeWindow;
@@ -158,8 +161,8 @@ fn main() {
         return;
     }
 
-    // M02.1: Establish actual coordinates and safe bounds
-    println!("Mission M02.1: Establish actual coordinates and safe bounds...");
+    // M02.2: Separate clicks from held gestures
+    println!("Mission M02.2: Separate clicks from held gestures...");
 
     // 1. Discover 32-bit alpha Render visual
     let alpha_vis = match find_alpha_visual(&conn) {
@@ -288,6 +291,8 @@ fn main() {
     let start_time = Instant::now();
     let mut running = true;
     let mut mapped_logged = false;
+    let mut interaction = InteractionManager::new();
+    let mut pointer_tracker = PointerCaptureTracker::new();
 
     while running {
         // Process incoming X11 events
@@ -316,6 +321,8 @@ fn main() {
                                         "[ERROR] Failed to query actual root geometry on MapNotify: {}",
                                         e
                                     );
+                                    let _ =
+                                        pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
                                     let _ = renderer.destroy(&conn);
                                     let _ = probe_window.destroy(&conn);
                                     process::exit(1);
@@ -326,6 +333,7 @@ fn main() {
                     Event::Expose(exp) if exp.window == probe_window.window => {
                         if let Err(e) = renderer.paint(&conn, probe_window.window) {
                             eprintln!("[ERROR] Repaint on Expose failed: {}", e);
+                            let _ = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
                             let _ = renderer.destroy(&conn);
                             let _ = probe_window.destroy(&conn);
                             process::exit(1);
@@ -344,47 +352,146 @@ fn main() {
                         );
                     }
                     Event::ButtonPress(ev) if ev.event == probe_window.window => match ev.detail {
-                        1 => match renderer.toggle_color(&conn, probe_window.window) {
-                            Ok(theme) => {
+                        1 => {
+                            let pointer_root = Point::new(ev.root_x as i32, ev.root_y as i32);
+                            let local = (ev.event_x, ev.event_y);
+                            let actual_origin = probe_window
+                                .query_actual_root_origin(&conn, screen.root)
+                                .unwrap_or_else(|_| Point::new(probe_window.x, probe_window.y));
+
+                            match interaction.handle_left_press(
+                                pointer_root,
+                                local,
+                                ev.time,
+                                actual_origin,
+                            ) {
+                                HostAction::AcquireGrab { time } => {
+                                    match grab_pointer(&conn, probe_window.window, time) {
+                                        Ok(GrabStatus::SUCCESS) => {
+                                            pointer_tracker.set_grabbed(true);
+                                            interaction.on_grab_acquired();
+                                            println!(
+                                                "[INPUT] ButtonPress: button=1 (Left) at ({}, {}) -> pointer capture acquired",
+                                                ev.event_x, ev.event_y
+                                            );
+                                        }
+                                        Ok(status) => {
+                                            interaction.on_grab_denied();
+                                            println!(
+                                                "[INPUT] ButtonPress: button=1 (Left) -> pointer capture denied ({:?}), recovered to Idle",
+                                                status
+                                            );
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[ERROR] GrabPointer request failed: {}", e);
+                                            interaction.on_grab_denied();
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    println!(
+                                        "[INPUT] ButtonPress: button=1 (Left) at ({}, {}) (outside interactive shape)",
+                                        ev.event_x, ev.event_y
+                                    );
+                                }
+                            }
+                        }
+                        3 => match interaction.handle_right_press(ev.time) {
+                            HostAction::ReleaseGrab { time } => {
+                                let _ = pointer_tracker.release_if_held(&conn, time);
                                 println!(
-                                    "[INPUT] ButtonPress: button=1 (Left) at ({}, {}) -> toggled body color to {}",
-                                    ev.event_x,
-                                    ev.event_y,
-                                    theme.name()
+                                    "[INPUT] ButtonPress: button=3 (Right) -> cancelled active left gesture and released capture"
                                 );
                             }
-                            Err(e) => {
-                                eprintln!("[ERROR] Color toggle on ButtonPress failed: {}", e);
-                                let _ = renderer.destroy(&conn);
-                                let _ = probe_window.destroy(&conn);
-                                process::exit(1);
+                            HostAction::ExitCleanly => {
+                                println!(
+                                    "[INPUT] ButtonPress: button=3 (Right) on body at ({}, {}) -> clean exit requested.",
+                                    ev.event_x, ev.event_y
+                                );
+                                running = false;
+                                break;
                             }
+                            _ => {}
                         },
-                        3 => {
-                            println!(
-                                "[INPUT] ButtonPress: button=3 (Right) on body at ({}, {}) -> clean exit requested.",
-                                ev.event_x, ev.event_y
-                            );
-                            running = false;
-                            break;
-                        }
                         other => {
+                            interaction.handle_other_button_press(other, ev.time);
                             println!(
                                 "[INPUT] ButtonPress: button={} at ({}, {}) (ignored)",
                                 other, ev.event_x, ev.event_y
                             );
                         }
                     },
+                    Event::MotionNotify(ev) if ev.event == probe_window.window => {
+                        let pointer_root = Point::new(ev.root_x as i32, ev.root_y as i32);
+                        if let HostAction::ReleaseGrab { time } =
+                            interaction.handle_motion(pointer_root, ev.time)
+                        {
+                            let _ = pointer_tracker.release_if_held(&conn, time);
+                            println!(
+                                "[INPUT] MotionNotify: moved to root ({}, {}) -> exceeded 4px threshold; click cancelled and capture released",
+                                ev.root_x, ev.root_y
+                            );
+                        }
+                    }
                     Event::ButtonRelease(ev) if ev.event == probe_window.window => {
-                        println!(
-                            "[INPUT] ButtonRelease: button={} at ({}, {})",
-                            ev.detail, ev.event_x, ev.event_y
-                        );
+                        match ev.detail {
+                            1 => {
+                                let local = (ev.event_x, ev.event_y);
+                                match interaction.handle_left_release(local, ev.time) {
+                                    HostAction::ReleaseGrabAndToggleColor { time } => {
+                                        let _ = pointer_tracker.release_if_held(&conn, time);
+                                        match renderer.toggle_color(&conn, probe_window.window) {
+                                            Ok(theme) => {
+                                                println!(
+                                                "[INPUT] ButtonRelease: button=1 (Left) at ({}, {}) on shape -> completed click, toggled body color to {}",
+                                                ev.event_x,
+                                                ev.event_y,
+                                                theme.name()
+                                            );
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                "[ERROR] Color toggle on ButtonRelease failed: {}",
+                                                e
+                                            );
+                                                let _ = pointer_tracker
+                                                    .release_if_held(&conn, x11rb::CURRENT_TIME);
+                                                let _ = renderer.destroy(&conn);
+                                                let _ = probe_window.destroy(&conn);
+                                                process::exit(1);
+                                            }
+                                        }
+                                    }
+                                    HostAction::ReleaseGrab { time } => {
+                                        let _ = pointer_tracker.release_if_held(&conn, time);
+                                        println!(
+                                        "[INPUT] ButtonRelease: button=1 (Left) at ({}, {}) outside shape -> click cancelled without toggle",
+                                        ev.event_x, ev.event_y
+                                    );
+                                    }
+                                    HostAction::None => {
+                                        println!(
+                                        "[INPUT] ButtonRelease: button=1 (Left) at ({}, {}) (stale/suppressed)",
+                                        ev.event_x, ev.event_y
+                                    );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            other => {
+                                interaction.handle_other_button_release(other, ev.time);
+                                println!(
+                                    "[INPUT] ButtonRelease: button={} at ({}, {}) (ignored)",
+                                    other, ev.event_x, ev.event_y
+                                );
+                            }
+                        }
                     }
                     Event::ClientMessage(msg) if msg.window == probe_window.window => {
                         let data = msg.data.as_data32();
                         if data[0] == probe_window.wm_delete_window {
                             println!("  Received WM_DELETE_WINDOW. Exiting cleanly.");
+                            let _ = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
                             running = false;
                             break;
                         }
@@ -394,6 +501,7 @@ fn main() {
                             "[ERROR] Asynchronous X11 protocol error received: {:?}",
                             xerr
                         );
+                        let _ = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
                         let _ = renderer.destroy(&conn);
                         let _ = probe_window.destroy(&conn);
                         process::exit(1);
@@ -403,6 +511,7 @@ fn main() {
                 Ok(None) => break,
                 Err(e) => {
                     eprintln!("[ERROR] X11 connection poll error: {}", e);
+                    let _ = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
                     let _ = renderer.destroy(&conn);
                     let _ = probe_window.destroy(&conn);
                     process::exit(1);
@@ -417,6 +526,7 @@ fn main() {
         // Flush any pending requests before waiting
         if let Err(e) = conn.flush() {
             eprintln!("[ERROR] Failed to flush X11 connection: {}", e);
+            let _ = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
             let _ = renderer.destroy(&conn);
             let _ = probe_window.destroy(&conn);
             process::exit(1);
@@ -429,6 +539,7 @@ fn main() {
                 let elapsed = start_time.elapsed();
                 if elapsed >= duration {
                     println!("  Duration limit reached ({}s). Exiting cleanly.", sec);
+                    let _ = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
                     break;
                 }
                 let remaining = duration - elapsed;
@@ -448,6 +559,7 @@ fn main() {
             let err = std::io::Error::last_os_error();
             if err.kind() != std::io::ErrorKind::Interrupted {
                 eprintln!("[ERROR] Socket poll error: {}", err);
+                let _ = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME);
                 let _ = renderer.destroy(&conn);
                 let _ = probe_window.destroy(&conn);
                 process::exit(1);
@@ -458,6 +570,10 @@ fn main() {
     // 6. Cleanup after clean exit
     println!("\n[Cleanup]");
     let mut cleanup_failed = false;
+    if let Err(e) = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME) {
+        eprintln!("[ERROR] Failed to release pointer capture: {}", e);
+        cleanup_failed = true;
+    }
     if let Err(e) = renderer.destroy(&conn) {
         eprintln!("[ERROR] Failed to destroy renderer resources: {}", e);
         cleanup_failed = true;

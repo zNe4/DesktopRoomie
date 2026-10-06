@@ -24,13 +24,7 @@ pub fn apply_body_input_shape(
         let mut span_start = 0u16;
 
         for x in 0..width {
-            let dx = (x as f32) - 80.0;
-            let dy = (y as f32) - 80.0;
-            let dist = (dx * dx + dy * dy).sqrt();
-
-            let is_body = dist <= 45.0;
-            let is_patch = (15..=65).contains(&x) && (15..=65).contains(&y);
-            let is_hit = is_body || is_patch;
+            let is_hit = crate::geometry::is_in_interactive_silhouette(x as i16, y as i16);
 
             if is_hit && !in_span {
                 in_span = true;

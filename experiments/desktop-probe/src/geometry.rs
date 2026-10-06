@@ -309,6 +309,30 @@ pub fn calculate_target_origin(
     checked_target_origin(pointer, offset).ok_or(PlacementError::CoordinateOverflow)
 }
 
+pub const DRAG_THRESHOLD_SQUARED: i64 = 16;
+
+/// Returns true if the Euclidean distance between two points reaches or exceeds 4 pixels
+/// (squared distance dx*dx + dy*dy >= 16) using wide signed arithmetic.
+pub fn exceeds_drag_threshold(p1: Point, p2: Point) -> bool {
+    let dx = (p2.x as i64) - (p1.x as i64);
+    let dy = (p2.y as i64) - (p1.y as i64);
+    dx * dx + dy * dy >= DRAG_THRESHOLD_SQUARED
+}
+
+/// Returns true if the local coordinates (relative to window top-left 0..160)
+/// fall inside the interactive shape (circular body silhouette or translucent test patch).
+pub fn is_in_interactive_silhouette(x: i16, y: i16) -> bool {
+    if !(0..160).contains(&x) || !(0..160).contains(&y) {
+        return false;
+    }
+    let dx = (x as f32) - 80.0;
+    let dy = (y as f32) - 80.0;
+    let dist = (dx * dx + dy * dy).sqrt();
+    let is_body = dist <= 45.0;
+    let is_patch = (15..=65).contains(&x) && (15..=65).contains(&y);
+    is_body || is_patch
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,5 +605,65 @@ mod tests {
             calculate_target_origin(Point::new(i32::MAX, 0), GrabOffset::new(-10, 0)),
             Err(PlacementError::CoordinateOverflow)
         );
+    }
+
+    #[test]
+    fn test_drag_threshold() {
+        let p0 = Point::new(100, 100);
+
+        // Identical point: 0px -> false
+        assert!(!exceeds_drag_threshold(p0, p0));
+
+        // 1px, 2px, 3px movement: squared distance < 16 -> false
+        assert!(!exceeds_drag_threshold(p0, Point::new(101, 100)));
+        assert!(!exceeds_drag_threshold(p0, Point::new(102, 102))); // 4 + 4 = 8 < 16
+        assert!(!exceeds_drag_threshold(p0, Point::new(103, 102))); // 9 + 4 = 13 < 16
+        assert!(!exceeds_drag_threshold(p0, Point::new(100, 103))); // 0 + 9 = 9 < 16
+
+        // Exact threshold: 4px horizontal or vertical -> 16 >= 16 -> true
+        assert!(exceeds_drag_threshold(p0, Point::new(104, 100))); // 16 >= 16
+        assert!(exceeds_drag_threshold(p0, Point::new(96, 100))); // 16 >= 16
+        assert!(exceeds_drag_threshold(p0, Point::new(100, 104))); // 16 >= 16
+        assert!(exceeds_drag_threshold(p0, Point::new(100, 96))); // 16 >= 16
+
+        // Diagonal threshold: dx=3, dy=3 -> 9 + 9 = 18 >= 16 -> true
+        assert!(exceeds_drag_threshold(p0, Point::new(103, 103)));
+        assert!(exceeds_drag_threshold(p0, Point::new(97, 97)));
+
+        // Large distance
+        assert!(exceeds_drag_threshold(p0, Point::new(200, 300)));
+    }
+
+    #[test]
+    fn test_interactive_silhouette_hit_test() {
+        // Circle center (80, 80) -> true
+        assert!(is_in_interactive_silhouette(80, 80));
+
+        // Inside circular body (radius 45)
+        assert!(is_in_interactive_silhouette(80, 35)); // Top edge of circle
+        assert!(is_in_interactive_silhouette(80, 125)); // Bottom edge of circle
+        assert!(is_in_interactive_silhouette(35, 80)); // Left edge of circle
+        assert!(is_in_interactive_silhouette(125, 80)); // Right edge of circle
+
+        // Outside circular body (e.g. radius 50)
+        assert!(!is_in_interactive_silhouette(80, 29));
+        assert!(!is_in_interactive_silhouette(80, 131));
+
+        // Translucent test patch: x in 15..=65, y in 15..=65 -> true
+        assert!(is_in_interactive_silhouette(15, 15));
+        assert!(is_in_interactive_silhouette(65, 65));
+        assert!(is_in_interactive_silhouette(40, 40));
+
+        // Transparent padding outside both circle and patch
+        assert!(!is_in_interactive_silhouette(5, 5));
+        assert!(!is_in_interactive_silhouette(155, 155));
+        assert!(!is_in_interactive_silhouette(150, 10));
+        assert!(!is_in_interactive_silhouette(10, 150));
+
+        // Out of window bounds
+        assert!(!is_in_interactive_silhouette(-1, 80));
+        assert!(!is_in_interactive_silhouette(80, -1));
+        assert!(!is_in_interactive_silhouette(160, 80));
+        assert!(!is_in_interactive_silhouette(80, 160));
     }
 }
