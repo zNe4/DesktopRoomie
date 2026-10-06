@@ -22,6 +22,8 @@ pub enum ConfigureReconciliation {
         confirmed: Point,
         remaining_in_flight: usize,
     },
+    /// Stale historical notification for an older superseded movement request.
+    StaleHistorical { origin: Point },
     /// Genuine position mismatch: confirmed origin differs from all in-flight and requested positions.
     GenuineMismatch { requested: Point, confirmed: Point },
     /// Unexpected size change from window manager.
@@ -43,6 +45,9 @@ pub enum ConfigureEventAnalysis {
     UnexpectedSizeChange { expected: Size, actual: Size },
 }
 
+pub const MAX_IN_FLIGHT_MOVES: usize = 16;
+pub const MAX_SUPERSEDED_MOVES: usize = 32;
+
 pub struct ManagedProbeWindow {
     pub window: Window,
     pub colormap: Colormap,
@@ -50,6 +55,7 @@ pub struct ManagedProbeWindow {
     pub requested_origin: Point,
     pub confirmed_origin: Point,
     pub in_flight_moves: VecDeque<Point>,
+    pub superseded_moves: VecDeque<Point>,
     pub width: u16,
     pub height: u16,
 }
@@ -206,6 +212,7 @@ impl ManagedProbeWindow {
         let requested_origin = initial_origin;
         let confirmed_origin = initial_origin;
         let in_flight_moves = VecDeque::new();
+        let superseded_moves = VecDeque::new();
 
         Ok(Self {
             window,
@@ -214,6 +221,7 @@ impl ManagedProbeWindow {
             requested_origin,
             confirmed_origin,
             in_flight_moves,
+            superseded_moves,
             width,
             height,
         })
@@ -246,26 +254,45 @@ impl ManagedProbeWindow {
         let aux = ConfigureWindowAux::new().x(target.x).y(target.y);
         conn.configure_window(self.window, &aux)?;
         self.requested_origin = target;
+        if self.in_flight_moves.len() >= MAX_IN_FLIGHT_MOVES {
+            if let Some(old) = self.in_flight_moves.pop_front() {
+                self.record_superseded(old);
+            }
+        }
         self.in_flight_moves.push_back(target);
         Ok(())
     }
 
-    /// Reconciles an incoming confirmed root origin against in-flight requests and current requested origin.
-    pub fn reconcile_origin(
+    /// Records a superseded movement target in a bounded history buffer.
+    pub fn record_superseded(&mut self, pt: Point) {
+        if self.superseded_moves.len() >= MAX_SUPERSEDED_MOVES {
+            self.superseded_moves.pop_front();
+        }
+        self.superseded_moves.push_back(pt);
+    }
+
+    /// Reconciles an incoming historical ConfigureNotify event origin against in-flight requests.
+    pub fn reconcile_historical_notification(
         &mut self,
         confirmed_origin: Point,
         size: Size,
     ) -> ConfigureReconciliation {
-        self.confirmed_origin = confirmed_origin;
-
-        // Check if confirmed_origin matches any in-flight move
+        // 1. Check if confirmed_origin matches an in-flight move
         if let Some(pos) = self
             .in_flight_moves
             .iter()
             .position(|&p| p == confirmed_origin)
         {
-            // Drain all moves up to and including this one
-            self.in_flight_moves.drain(..=pos);
+            // Drain moves prior to this confirmed position as superseded
+            for _ in 0..pos {
+                if let Some(old) = self.in_flight_moves.pop_front() {
+                    self.record_superseded(old);
+                }
+            }
+            // Remove the confirmed move itself
+            let _ = self.in_flight_moves.pop_front();
+            self.confirmed_origin = confirmed_origin;
+
             if self.in_flight_moves.is_empty() {
                 ConfigureReconciliation::Confirmed {
                     origin: confirmed_origin,
@@ -278,11 +305,18 @@ impl ManagedProbeWindow {
                 }
             }
         } else if self.in_flight_moves.is_empty() && confirmed_origin == self.requested_origin {
+            self.confirmed_origin = confirmed_origin;
             ConfigureReconciliation::Confirmed {
                 origin: confirmed_origin,
                 size,
             }
+        } else if self.superseded_moves.contains(&confirmed_origin) {
+            // Stale historical notification for an older superseded movement request
+            ConfigureReconciliation::StaleHistorical {
+                origin: confirmed_origin,
+            }
         } else {
+            self.confirmed_origin = confirmed_origin;
             ConfigureReconciliation::GenuineMismatch {
                 requested: self.requested_origin,
                 confirmed: confirmed_origin,
@@ -290,9 +324,53 @@ impl ManagedProbeWindow {
         }
     }
 
+    /// Reconciles an incoming confirmed root origin against in-flight requests (historical event logic).
+    pub fn reconcile_origin(
+        &mut self,
+        confirmed_origin: Point,
+        size: Size,
+    ) -> ConfigureReconciliation {
+        self.reconcile_historical_notification(confirmed_origin, size)
+    }
+
+    /// Reconciles a live geometry observation against the current requested origin.
+    ///
+    /// Unlike historical event notifications, a live snapshot observes the current
+    /// server state at this instant. If it matches requested_origin, all pending
+    /// in-flight requests are immediately satisfied and cleared.
+    pub fn reconcile_live_snapshot(
+        &mut self,
+        actual_origin: Point,
+        size: Size,
+    ) -> ConfigureReconciliation {
+        if actual_origin == self.requested_origin {
+            // Target achieved: mark all remaining in-flight moves as superseded
+            while let Some(old) = self.in_flight_moves.pop_front() {
+                self.record_superseded(old);
+            }
+            self.confirmed_origin = actual_origin;
+            ConfigureReconciliation::Confirmed {
+                origin: actual_origin,
+                size,
+            }
+        } else {
+            // Discrepancy observed: target was not reached
+            while let Some(old) = self.in_flight_moves.pop_front() {
+                self.record_superseded(old);
+            }
+            self.confirmed_origin = actual_origin;
+            ConfigureReconciliation::GenuineMismatch {
+                requested: self.requested_origin,
+                confirmed: actual_origin,
+            }
+        }
+    }
+
     /// Resets in-flight move tracking and aligns requested origin with confirmed origin.
     pub fn cancel_in_flight_moves(&mut self) {
-        self.in_flight_moves.clear();
+        while let Some(old) = self.in_flight_moves.pop_front() {
+            self.record_superseded(old);
+        }
         self.requested_origin = self.confirmed_origin;
     }
 
@@ -540,6 +618,7 @@ mod tests {
             requested_origin: Point::new(80, 80),
             confirmed_origin: Point::new(80, 80),
             in_flight_moves: VecDeque::new(),
+            superseded_moves: VecDeque::new(),
             width: 160,
             height: 160,
         };
@@ -587,6 +666,7 @@ mod tests {
             requested_origin: Point::new(100, 100),
             confirmed_origin: Point::new(80, 80),
             in_flight_moves: VecDeque::new(),
+            superseded_moves: VecDeque::new(),
             width: 160,
             height: 160,
         };
@@ -615,6 +695,7 @@ mod tests {
             requested_origin: Point::new(100, 100),
             confirmed_origin: Point::new(100, 100),
             in_flight_moves: VecDeque::new(),
+            superseded_moves: VecDeque::new(),
             width: 160,
             height: 160,
         };
@@ -640,6 +721,7 @@ mod tests {
             requested_origin: Point::new(100, 100),
             confirmed_origin: Point::new(100, 100),
             in_flight_moves: VecDeque::new(),
+            superseded_moves: VecDeque::new(),
             width: 160,
             height: 160,
         };
@@ -684,6 +766,7 @@ mod tests {
             requested_origin: Point::new(120, 120),
             confirmed_origin: Point::new(100, 100),
             in_flight_moves: VecDeque::new(),
+            superseded_moves: VecDeque::new(),
             width: 160,
             height: 160,
         };
@@ -724,6 +807,7 @@ mod tests {
             requested_origin: Point::new(150, 150),
             confirmed_origin: Point::new(80, 80),
             in_flight_moves: VecDeque::new(),
+            superseded_moves: VecDeque::new(),
             width: 160,
             height: 160,
         };
@@ -745,5 +829,144 @@ mod tests {
         assert!(window.in_flight_moves.is_empty());
         assert_eq!(window.requested_origin, Point::new(80, 80));
         assert_eq!(window.confirmed_origin, Point::new(80, 80));
+    }
+
+    #[test]
+    fn test_a_b_a_requests_with_final_live_snapshot_at_a() {
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(50, 50),
+            confirmed_origin: Point::new(50, 50),
+            in_flight_moves: VecDeque::new(),
+            superseded_moves: VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+
+        let a = Point::new(100, 100);
+        let b = Point::new(120, 100);
+
+        // Queue requests A -> B -> A
+        window.in_flight_moves.push_back(a);
+        window.in_flight_moves.push_back(b);
+        window.in_flight_moves.push_back(a);
+        window.requested_origin = a;
+
+        // Live geometry query observes the final placement A
+        let res = window.reconcile_live_snapshot(a, Size::new(160, 160));
+        assert_eq!(
+            res,
+            ConfigureReconciliation::Confirmed {
+                origin: a,
+                size: Size::new(160, 160),
+            }
+        );
+        assert_eq!(window.confirmed_origin, a);
+        // All in-flight requests are cleared; B and A are NOT left pending
+        assert!(window.in_flight_moves.is_empty());
+        // Drained moves were recorded as superseded
+        assert!(window.superseded_moves.contains(&a));
+        assert!(window.superseded_moves.contains(&b));
+    }
+
+    #[test]
+    fn test_live_snapshot_c_followed_by_older_synthetic_notification_a() {
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(50, 50),
+            confirmed_origin: Point::new(50, 50),
+            in_flight_moves: VecDeque::new(),
+            superseded_moves: VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+
+        let a = Point::new(100, 100);
+        let b = Point::new(120, 100);
+        let c = Point::new(140, 100);
+
+        // Queue requests A -> B -> C
+        window.in_flight_moves.push_back(a);
+        window.in_flight_moves.push_back(b);
+        window.in_flight_moves.push_back(c);
+        window.requested_origin = c;
+
+        // Live geometry query observes C
+        let res_c = window.reconcile_live_snapshot(c, Size::new(160, 160));
+        assert_eq!(
+            res_c,
+            ConfigureReconciliation::Confirmed {
+                origin: c,
+                size: Size::new(160, 160),
+            }
+        );
+        assert_eq!(window.confirmed_origin, c);
+        assert!(window.in_flight_moves.is_empty());
+
+        // Subsequently, an older synthetic ConfigureNotify for A arrives
+        let ev = ConfigureNotifyEvent {
+            response_type: 22 | 0x80, // synthetic event
+            sequence: 1,
+            event: 100,
+            window: 100,
+            above_sibling: 0,
+            x: a.x as i16,
+            y: a.y as i16,
+            width: 160,
+            height: 160,
+            border_width: 0,
+            override_redirect: false,
+        };
+
+        let res_a = window.handle_configure_notify_with(&ev, || unreachable!());
+        assert_eq!(
+            res_a.unwrap(),
+            ConfigureReconciliation::StaleHistorical { origin: a }
+        );
+        // Crucial: confirmed_origin remains C and is NOT clobbered or cancelled
+        assert_eq!(window.confirmed_origin, c);
+    }
+
+    #[test]
+    fn test_final_movement_refused_at_earlier_requested_position() {
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(100, 100),
+            confirmed_origin: Point::new(100, 100),
+            in_flight_moves: VecDeque::new(),
+            superseded_moves: VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+
+        let a = Point::new(100, 100);
+        let b = Point::new(200, 200);
+
+        // Client moves from A to B
+        window.in_flight_moves.push_back(b);
+        window.requested_origin = b;
+
+        // WM refuses B and remains at A.
+        // On confirmation timeout, checked live geometry query runs and observes A
+        let res = window.reconcile_live_snapshot(a, Size::new(160, 160));
+        assert_eq!(
+            res,
+            ConfigureReconciliation::GenuineMismatch {
+                requested: b,
+                confirmed: a,
+            }
+        );
+        assert_eq!(window.confirmed_origin, a);
+        assert!(window.in_flight_moves.is_empty());
+
+        // Interaction cancellation resets requested_origin to confirmed_origin A
+        window.cancel_in_flight_moves();
+        assert_eq!(window.requested_origin, a);
     }
 }

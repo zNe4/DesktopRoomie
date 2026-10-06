@@ -36,6 +36,7 @@ struct PollFd {
 }
 
 const POLLIN: std::os::raw::c_short = 0x0001;
+const CONFIRMATION_TIMEOUT: Duration = Duration::from_millis(150);
 
 extern "C" {
     fn poll(fds: *mut PollFd, nfds: usize, timeout: std::os::raw::c_int) -> std::os::raw::c_int;
@@ -296,6 +297,7 @@ fn main() {
     let mut pending_move: Option<Point> = None;
     let mut buffered_event: Option<Event> = None;
     let mut awaiting_final_confirmation: Option<Point> = None;
+    let mut confirmation_deadline: Option<Instant> = None;
 
     const MAX_EVENT_BATCH: usize = 64;
 
@@ -361,6 +363,7 @@ fn main() {
                         &conn,
                         &mut pointer_tracker,
                         &renderer,
+                        &mut confirmation_deadline,
                     );
 
                     match other_event {
@@ -399,14 +402,52 @@ fn main() {
                         Event::ConfigureNotify(ev) if ev.window == probe_window.window => {
                             match probe_window.handle_configure_notify(&conn, screen.root, &ev) {
                                 Ok(ConfigureReconciliation::Confirmed { origin, .. }) => {
-                                    if awaiting_final_confirmation.take().is_some() {
-                                        println!(
-                                            "[INPUT] Final placement confirmed by WM at {}",
-                                            origin
-                                        );
+                                    if let Some(expected_final) = awaiting_final_confirmation {
+                                        if origin == expected_final {
+                                            awaiting_final_confirmation = None;
+                                            println!(
+                                                "[INPUT] Final placement confirmed by WM at {}",
+                                                origin
+                                            );
+                                        } else if probe_window.in_flight_moves.is_empty() {
+                                            eprintln!(
+                                                "[WARN] Final placement adjusted by WM to {} (expected {}); cancelling interaction.",
+                                                origin, expected_final
+                                            );
+                                            awaiting_final_confirmation = None;
+                                            if let HostAction::ReleaseGrab { time } = interaction
+                                                .cancel_on_wm_mismatch(x11rb::CURRENT_TIME)
+                                            {
+                                                if let Err(e) =
+                                                    pointer_tracker.release_if_held(&conn, time)
+                                                {
+                                                    fatal_host_error(
+                                                        &format!(
+                                                            "Failed to release pointer capture on mismatch cancellation: {}",
+                                                            e
+                                                        ),
+                                                        &conn,
+                                                        &mut pointer_tracker,
+                                                        &renderer,
+                                                        &probe_window,
+                                                    );
+                                                }
+                                            }
+                                            pending_move = None;
+                                            probe_window.cancel_in_flight_moves();
+                                        }
+                                    }
+                                    if probe_window.in_flight_moves.is_empty()
+                                        && awaiting_final_confirmation.is_none()
+                                    {
+                                        confirmation_deadline = None;
                                     }
                                 }
-                                Ok(ConfigureReconciliation::InFlightCatchUp { .. }) => {}
+                                Ok(ConfigureReconciliation::InFlightCatchUp { .. }) => {
+                                    confirmation_deadline =
+                                        Some(Instant::now() + CONFIRMATION_TIMEOUT);
+                                }
+                                Ok(ConfigureReconciliation::StaleHistorical { .. }) => {}
                                 Ok(ConfigureReconciliation::GenuineMismatch {
                                     requested,
                                     confirmed,
@@ -415,10 +456,11 @@ fn main() {
                                         "[WARN] Window manager refused or adjusted requested movement: requested {}, confirmed {}; cancelling interaction.",
                                         requested, confirmed
                                     );
-                                    if awaiting_final_confirmation.take().is_some() {
+                                    if let Some(expected_final) = awaiting_final_confirmation.take()
+                                    {
                                         eprintln!(
-                                            "[WARN] Final placement adjusted by WM to {}",
-                                            confirmed
+                                            "[WARN] Final placement adjusted by WM to {} (expected {})",
+                                            confirmed, expected_final
                                         );
                                     }
                                     if let HostAction::ReleaseGrab { time } =
@@ -440,6 +482,7 @@ fn main() {
                                     }
                                     pending_move = None;
                                     probe_window.cancel_in_flight_moves();
+                                    confirmation_deadline = None;
                                 }
                                 Ok(ConfigureReconciliation::UnexpectedSizeChange {
                                     expected,
@@ -577,6 +620,10 @@ fn main() {
                                                 &probe_window,
                                             );
                                         }
+                                        pending_move = None;
+                                        probe_window.cancel_in_flight_moves();
+                                        confirmation_deadline = None;
+                                        awaiting_final_confirmation = None;
                                         println!(
                                             "[INPUT] ButtonPress: button=3 (Right) -> cancelled active gesture and released capture"
                                         );
@@ -646,12 +693,16 @@ fn main() {
                                             if probe_window.in_flight_moves.is_empty()
                                                 && probe_window.confirmed_origin() == target
                                             {
+                                                awaiting_final_confirmation = None;
+                                                confirmation_deadline = None;
                                                 println!(
                                                     "[INPUT] Drag completed at root ({}, {}), target origin {} (already confirmed by WM)",
                                                     ev.root_x, ev.root_y, target
                                                 );
                                             } else {
                                                 awaiting_final_confirmation = Some(target);
+                                                confirmation_deadline =
+                                                    Some(Instant::now() + CONFIRMATION_TIMEOUT);
                                                 println!(
                                                     "[INPUT] Drag completed at root ({}, {}), requested origin {}; awaiting WM confirmation",
                                                     ev.root_x, ev.root_y, target
@@ -786,6 +837,7 @@ fn main() {
             &conn,
             &mut pointer_tracker,
             &renderer,
+            &mut confirmation_deadline,
         );
 
         if !running {
@@ -826,19 +878,126 @@ fn main() {
             }
         }
 
-        // Compute timeout until duration limit or wait indefinitely
-        let timeout_ms = match config.duration_secs {
-            Some(sec) => {
-                let duration = Duration::from_secs(sec);
-                let elapsed = start_time.elapsed();
-                if elapsed >= duration {
-                    continue; // Loop top will perform clean shutdown
+        // Check if movement confirmation deadline has expired
+        if let Some(dl) = confirmation_deadline {
+            if Instant::now() >= dl {
+                let live_origin = match probe_window.query_actual_root_origin(&conn, screen.root) {
+                    Ok(orig) => orig,
+                    Err(e) => {
+                        fatal_host_error(
+                            &format!("Failed to query root origin on confirmation timeout: {}", e),
+                            &conn,
+                            &mut pointer_tracker,
+                            &renderer,
+                            &probe_window,
+                        );
+                    }
+                };
+
+                let size = Size::new(probe_window.width as u32, probe_window.height as u32);
+                let rec = probe_window.reconcile_live_snapshot(live_origin, size);
+                confirmation_deadline = None;
+
+                match rec {
+                    ConfigureReconciliation::Confirmed { origin, .. } => {
+                        if let Some(final_target) = awaiting_final_confirmation.take() {
+                            if origin == final_target {
+                                println!("[INPUT] Final placement confirmed by WM at {}", origin);
+                            } else {
+                                eprintln!(
+                                    "[WARN] Final placement adjusted by WM to {} (expected {}); cancelling interaction.",
+                                    origin, final_target
+                                );
+                                if let HostAction::ReleaseGrab { time } =
+                                    interaction.cancel_on_wm_mismatch(x11rb::CURRENT_TIME)
+                                {
+                                    if let Err(e) = pointer_tracker.release_if_held(&conn, time) {
+                                        fatal_host_error(
+                                            &format!(
+                                                "Failed to release pointer capture on mismatch cancellation: {}",
+                                                e
+                                            ),
+                                            &conn,
+                                            &mut pointer_tracker,
+                                            &renderer,
+                                            &probe_window,
+                                        );
+                                    }
+                                }
+                                pending_move = None;
+                                probe_window.cancel_in_flight_moves();
+                            }
+                        }
+                    }
+                    ConfigureReconciliation::GenuineMismatch {
+                        requested,
+                        confirmed,
+                    } => {
+                        eprintln!(
+                            "[WARN] Movement confirmation timed out: requested {}, confirmed {}; cancelling interaction.",
+                            requested, confirmed
+                        );
+                        if let Some(final_target) = awaiting_final_confirmation.take() {
+                            eprintln!(
+                                "[WARN] Final placement adjusted by WM to {} (expected {})",
+                                confirmed, final_target
+                            );
+                        }
+                        if let HostAction::ReleaseGrab { time } =
+                            interaction.cancel_on_wm_mismatch(x11rb::CURRENT_TIME)
+                        {
+                            if let Err(e) = pointer_tracker.release_if_held(&conn, time) {
+                                fatal_host_error(
+                                    &format!(
+                                        "Failed to release pointer capture on mismatch cancellation: {}",
+                                        e
+                                    ),
+                                    &conn,
+                                    &mut pointer_tracker,
+                                    &renderer,
+                                    &probe_window,
+                                );
+                            }
+                        }
+                        pending_move = None;
+                        probe_window.cancel_in_flight_moves();
+                    }
+                    _ => {}
                 }
-                let remaining = duration - elapsed;
-                remaining.as_millis().min(i32::MAX as u128) as i32
             }
-            None => -1,
-        };
+        }
+
+        // Compute timeout until duration limit or confirmation deadline
+        let mut timeout_ms = -1;
+        let now = Instant::now();
+
+        if let Some(sec) = config.duration_secs {
+            let duration = Duration::from_secs(sec);
+            let elapsed = start_time.elapsed();
+            if elapsed >= duration {
+                continue; // Loop top will perform clean shutdown
+            }
+            let remaining = duration - elapsed;
+            let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            timeout_ms = if timeout_ms == -1 {
+                ms
+            } else {
+                timeout_ms.min(ms)
+            };
+        }
+
+        if let Some(dl) = confirmation_deadline {
+            if now >= dl {
+                continue; // Loop around to process expired confirmation deadline immediately
+            }
+            let remaining = dl - now;
+            let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            timeout_ms = if timeout_ms == -1 {
+                ms
+            } else {
+                timeout_ms.min(ms)
+            };
+        }
 
         let mut pfd = PollFd {
             fd: conn_fd,
@@ -914,6 +1073,7 @@ fn flush_pending_move(
     conn: &impl Connection,
     pointer_tracker: &mut PointerCaptureTracker,
     renderer: &Renderer,
+    confirmation_deadline: &mut Option<Instant>,
 ) {
     if let Some(target) = pending_move.take() {
         if target != probe_window.requested_origin() {
@@ -926,6 +1086,7 @@ fn flush_pending_move(
                     probe_window,
                 );
             }
+            *confirmation_deadline = Some(Instant::now() + CONFIRMATION_TIMEOUT);
         }
     }
 }
@@ -1175,5 +1336,88 @@ mod tests {
             }
             other => panic!("Expected ButtonRelease at end of stream, found {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_confirmation_timeout_with_no_further_events() {
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(150, 150),
+            confirmed_origin: Point::new(100, 100),
+            in_flight_moves: std::collections::VecDeque::new(),
+            superseded_moves: std::collections::VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+        window.in_flight_moves.push_back(Point::new(150, 150));
+
+        let mut awaiting_final_confirmation = Some(Point::new(150, 150));
+        let mut confirmation_deadline = Some(Instant::now() - Duration::from_millis(1));
+
+        // When deadline has expired and no events arrived, checked live query runs.
+        assert!(confirmation_deadline.unwrap() <= Instant::now());
+        // Discrepancy case: live query observes refused move remaining at (100, 100)
+        let live_origin = Point::new(100, 100);
+        let rec = window.reconcile_live_snapshot(live_origin, Size::new(160, 160));
+        assert_eq!(
+            rec,
+            ConfigureReconciliation::GenuineMismatch {
+                requested: Point::new(150, 150),
+                confirmed: Point::new(100, 100),
+            }
+        );
+        confirmation_deadline = None;
+        assert_eq!(confirmation_deadline, None);
+
+        // Success case: live query observes target reached at (150, 150)
+        window.in_flight_moves.push_back(Point::new(150, 150));
+        let rec_ok = window.reconcile_live_snapshot(Point::new(150, 150), Size::new(160, 160));
+        assert_eq!(
+            rec_ok,
+            ConfigureReconciliation::Confirmed {
+                origin: Point::new(150, 150),
+                size: Size::new(160, 160),
+            }
+        );
+        if let ConfigureReconciliation::Confirmed { origin, .. } = rec_ok {
+            if awaiting_final_confirmation == Some(origin) {
+                awaiting_final_confirmation = None;
+            }
+        }
+        assert_eq!(awaiting_final_confirmation, None);
+    }
+
+    #[test]
+    fn test_awaiting_final_confirmation_rejects_mismatched_target() {
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(200, 200),
+            confirmed_origin: Point::new(100, 100),
+            in_flight_moves: std::collections::VecDeque::new(),
+            superseded_moves: std::collections::VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+
+        let awaiting_final = Point::new(200, 200);
+
+        // Suppose WM confirms position (180, 200) instead of expected (200, 200)
+        let confirmed_event_origin = Point::new(180, 200);
+        let rec =
+            window.reconcile_historical_notification(confirmed_event_origin, Size::new(160, 160));
+
+        // It is not accepted as the awaited final target
+        assert_ne!(confirmed_event_origin, awaiting_final);
+        assert_eq!(
+            rec,
+            ConfigureReconciliation::GenuineMismatch {
+                requested: Point::new(200, 200),
+                confirmed: confirmed_event_origin,
+            }
+        );
     }
 }
