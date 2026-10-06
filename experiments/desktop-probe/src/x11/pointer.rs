@@ -10,7 +10,7 @@ use x11rb::protocol::xproto::{
 /// Parameters follow the M02 pointer ownership specification:
 /// - owner_events = false
 /// - pointer_mode = ASYNC, keyboard_mode = ASYNC
-/// - event_mask = BUTTON_RELEASE | BUTTON_MOTION | POINTER_MOTION
+/// - event_mask = BUTTON_PRESS | BUTTON_RELEASE | BUTTON_MOTION | POINTER_MOTION
 /// - no pointer confinement
 pub fn grab_pointer(
     conn: &impl Connection,

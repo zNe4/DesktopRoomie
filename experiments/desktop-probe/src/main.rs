@@ -741,8 +741,18 @@ fn fatal_host_error(
             e
         );
     }
-    let _ = renderer.destroy(conn);
-    let _ = probe_window.destroy(conn);
+    if let Err(e) = renderer.destroy(conn) {
+        eprintln!(
+            "[ERROR] Failed to destroy renderer during error exit: {}",
+            e
+        );
+    }
+    if let Err(e) = probe_window.destroy(conn) {
+        eprintln!(
+            "[ERROR] Failed to destroy probe window during error exit: {}",
+            e
+        );
+    }
     process::exit(1);
 }
 

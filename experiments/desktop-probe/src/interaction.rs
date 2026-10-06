@@ -609,20 +609,21 @@ mod tests {
     fn test_fast_drag_without_motion_events_completes_drag() {
         let mut mgr = InteractionManager::new();
         let bounds = sample_bounds();
-        let root_press = Point::new(100, 100);
+        let root_press = Point::new(160, 160);
         let origin = Point::new(80, 80);
 
-        // Press at center (local 80, 80) -> grab offset is (20, 20)
+        // Press at center (local 80, 80) -> grab offset is root - origin = (80, 80)
         mgr.handle_left_press(root_press, (80, 80), 1000, origin);
         mgr.on_grab_acquired();
         assert!(matches!(mgr.state(), InteractionState::LeftPressed { .. }));
 
         // Fast swipe release 20px away without intervening motion event.
-        // Release root is (120, 100) (dx=20 >= 4px threshold).
+        // Release root is (180, 160) (dx=20 >= 4px threshold).
         // Release local is (100, 80) which is still on the circular body (dist=20 <= 45).
+        // Target origin is root - offset = (180 - 80, 160 - 80) = (100, 80).
         // Must complete as a drag to clamped target (100, 80), NOT toggle color!
         let release_action =
-            mgr.handle_left_release(Point::new(120, 100), (100, 80), 1010, &bounds);
+            mgr.handle_left_release(Point::new(180, 160), (100, 80), 1010, &bounds);
         assert_eq!(
             release_action,
             HostAction::ReleaseGrabAndMoveWindow {
