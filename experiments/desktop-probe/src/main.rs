@@ -259,11 +259,8 @@ fn run_diagnostics(
     println!("\n[X11 Session & Display]");
     println!("  Root window:            0x{:x}", screen.root);
     println!(
-        "  Total screen spanning:  {}x{} px ({}x{} mm)",
-        screen.width_in_pixels,
-        screen.height_in_pixels,
-        screen.width_in_millimeters,
-        screen.height_in_millimeters
+        "  Total screen spanning:  {}x{} px",
+        screen.width_in_pixels, screen.height_in_pixels
     );
     println!("  Root visual ID:         0x{:x}", screen.root_visual);
     println!("  Root depth:             {} bpp", screen.root_depth);
