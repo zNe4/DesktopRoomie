@@ -27,7 +27,8 @@ impl ManagedProbeWindow {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // 1. Create a colormap for the 32-bit visual (required in X11 to prevent BadMatch)
         let colormap = conn.generate_id()?;
-        conn.create_colormap(ColormapAlloc::NONE, colormap, root, visual_id)?;
+        conn.create_colormap(ColormapAlloc::NONE, colormap, root, visual_id)?
+            .check()?;
 
         // 2. Position the window centered inside the usable area on the primary display
         let width = WINDOW_WIDTH;
@@ -55,7 +56,8 @@ impl ManagedProbeWindow {
             WindowClass::INPUT_OUTPUT,
             visual_id,
             &win_aux,
-        )?;
+        )?
+        .check()?;
 
         // Set WM_NORMAL_HINTS (UserSpecified position and size) to direct Openbox placement
         let mut size_hints = x11rb::properties::WmSizeHints::new();
@@ -71,7 +73,7 @@ impl ManagedProbeWindow {
         ));
         size_hints.min_size = Some((width as i32, height as i32));
         size_hints.max_size = Some((width as i32, height as i32));
-        let _ = size_hints.set_normal_hints(conn, window);
+        size_hints.set_normal_hints(conn, window)?.check()?;
 
         // 4. Motif hints: borderless (decorations = 0)
         let motif_atom = conn.intern_atom(false, b"_MOTIF_WM_HINTS")?.reply()?.atom;
@@ -83,7 +85,8 @@ impl ManagedProbeWindow {
             motif_atom,
             motif_atom,
             &motif_hints,
-        )?;
+        )?
+        .check()?;
 
         // 5. EWMH Window Type: UTILITY (non-disruptive desktop element)
         let net_wm_window_type = conn
@@ -100,7 +103,8 @@ impl ManagedProbeWindow {
             net_wm_window_type,
             AtomEnum::ATOM,
             &[net_wm_window_type_utility],
-        )?;
+        )?
+        .check()?;
 
         // 6. Set WM_PROTOCOLS: WM_DELETE_WINDOW (clean graceful close on WM request)
         let wm_protocols = conn.intern_atom(false, b"WM_PROTOCOLS")?.reply()?.atom;
@@ -111,7 +115,8 @@ impl ManagedProbeWindow {
             wm_protocols,
             AtomEnum::ATOM,
             &[wm_delete_window],
-        )?;
+        )?
+        .check()?;
 
         // 7. Set window title and class
         conn.change_property8(
@@ -120,17 +125,19 @@ impl ManagedProbeWindow {
             AtomEnum::WM_NAME,
             AtomEnum::STRING,
             b"DesktopRoomie-Probe",
-        )?;
+        )?
+        .check()?;
         conn.change_property8(
             PropMode::REPLACE,
             window,
             AtomEnum::WM_CLASS,
             AtomEnum::STRING,
             b"desktop-probe\0DesktopRoomie\0",
-        )?;
+        )?
+        .check()?;
 
         // 8. Map window to screen
-        conn.map_window(window)?;
+        conn.map_window(window)?.check()?;
         conn.flush()?;
 
         Ok(Self {

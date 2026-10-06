@@ -24,11 +24,12 @@ impl Renderer {
 
         // 1. Create depth-32 Pixmap for double buffering
         let pixmap = conn.generate_id()?;
-        conn.create_pixmap(32, pixmap, window, width, height)?;
+        conn.create_pixmap(32, pixmap, window, width, height)?
+            .check()?;
 
         // 2. Create GC
         let gc = conn.generate_id()?;
-        conn.create_gc(gc, pixmap, &CreateGCAux::new())?;
+        conn.create_gc(gc, pixmap, &CreateGCAux::new())?.check()?;
 
         // 3. Generate 32-bit ARGB image buffer
         let buffer = generate_test_body_pattern(width as usize, height as usize);
@@ -45,7 +46,8 @@ impl Renderer {
             0,
             32,
             &buffer,
-        )?;
+        )?
+        .check()?;
 
         Ok(Self {
             pixmap,
@@ -71,7 +73,8 @@ impl Renderer {
             0,
             self.width,
             self.height,
-        )?;
+        )?
+        .check()?;
         conn.flush()?;
         Ok(())
     }

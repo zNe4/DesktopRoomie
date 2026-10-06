@@ -145,6 +145,17 @@ fn main() {
         "  Discovered 32-bit ARGB visual: 0x{:x} (Render PictFormat: 0x{:x})",
         alpha_vis.visual_id, alpha_vis.pict_format
     );
+    println!(
+        "  Verified channel layout: ARGB (A: mask=0x{:x} shift={}, R: mask=0x{:x} shift={}, G: mask=0x{:x} shift={}, B: mask=0x{:x} shift={})",
+        alpha_vis.alpha_mask,
+        alpha_vis.alpha_shift,
+        alpha_vis.red_mask,
+        alpha_vis.red_shift,
+        alpha_vis.green_mask,
+        alpha_vis.green_shift,
+        alpha_vis.blue_mask,
+        alpha_vis.blue_shift,
+    );
 
     // 2. Report target placement
     if let Some(ref pm) = layout.primary_monitor {
@@ -196,9 +207,11 @@ fn main() {
         }
     };
 
-    // Perform initial paint
+    // Perform initial paint (fatal on failure)
     if let Err(e) = renderer.paint(&conn, probe_window.window) {
-        eprintln!("[WARN] Initial paint error: {}", e);
+        eprintln!("[ERROR] Initial paint failed: {}", e);
+        let _ = probe_window.destroy(&conn);
+        process::exit(1);
     }
 
     println!("\n[Running Probe]");
@@ -224,27 +237,47 @@ fn main() {
         }
 
         // Process incoming X11 events
-        while let Ok(Some(event)) = conn.poll_for_event() {
-            match event {
-                Event::Expose(exp) if exp.window == probe_window.window => {
-                    let _ = renderer.paint(&conn, probe_window.window);
-                }
-                Event::ClientMessage(msg) if msg.window == probe_window.window => {
-                    let data = msg.data.as_data32();
-                    if data[0] == probe_window.wm_delete_window {
-                        println!("  Received WM_DELETE_WINDOW. Exiting cleanly.");
-                        running = false;
-                        break;
+        loop {
+            match conn.poll_for_event() {
+                Ok(Some(event)) => match event {
+                    Event::Expose(exp) if exp.window == probe_window.window => {
+                        if let Err(e) = renderer.paint(&conn, probe_window.window) {
+                            eprintln!("[ERROR] Repaint on Expose failed: {}", e);
+                            let _ = probe_window.destroy(&conn);
+                            process::exit(1);
+                        }
                     }
+                    Event::ClientMessage(msg) if msg.window == probe_window.window => {
+                        let data = msg.data.as_data32();
+                        if data[0] == probe_window.wm_delete_window {
+                            println!("  Received WM_DELETE_WINDOW. Exiting cleanly.");
+                            running = false;
+                            break;
+                        }
+                    }
+                    Event::Error(xerr) => {
+                        eprintln!(
+                            "[ERROR] Asynchronous X11 protocol error received: {:?}",
+                            xerr
+                        );
+                        let _ = probe_window.destroy(&conn);
+                        process::exit(1);
+                    }
+                    _ => {}
+                },
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("[ERROR] X11 connection poll error: {}", e);
+                    let _ = probe_window.destroy(&conn);
+                    process::exit(1);
                 }
-                _ => {}
             }
         }
 
         thread::sleep(Duration::from_millis(15));
     }
 
-    // 6. Cleanup
+    // 6. Cleanup after clean exit
     println!("\n[Cleanup]");
     let _ = probe_window.destroy(&conn);
     println!("  Resources released cleanly.");
