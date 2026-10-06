@@ -1,40 +1,91 @@
-use std::cmp::{max, min};
+mod x11;
+
 use std::env;
 use std::process;
+use std::thread;
+use std::time::{Duration, Instant};
+
 use x11rb::connection::Connection;
-use x11rb::protocol::randr::ConnectionExt as RandrExt;
 use x11rb::protocol::render::ConnectionExt as RenderExt;
 use x11rb::protocol::shape::ConnectionExt as ShapeExt;
-use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as XprotoExt, VisualClass};
+use x11rb::protocol::xproto::VisualClass;
+use x11rb::protocol::Event;
 
-#[derive(Debug, Clone)]
-pub struct MonitorGeometry {
-    pub name: String,
-    pub is_primary: bool,
-    pub x: i16,
-    pub y: i16,
-    pub width: u16,
-    pub height: u16,
+use crate::x11::monitors::query_desktop_layout;
+use crate::x11::render::Renderer;
+use crate::x11::visual::find_alpha_visual;
+use crate::x11::window::ManagedProbeWindow;
+
+struct Config {
+    diagnose: bool,
+    duration_secs: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Rect {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
+fn parse_args() -> Result<Config, String> {
+    let mut diagnose = false;
+    let mut duration_secs = None;
+
+    let args: Vec<String> = env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                print_help();
+                process::exit(0);
+            }
+            "--diagnose" => {
+                diagnose = true;
+            }
+            "--duration" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing value for --duration <seconds>".to_string());
+                }
+                let val: u64 = args[i]
+                    .parse()
+                    .map_err(|_| format!("Invalid duration value: '{}'", args[i]))?;
+                duration_secs = Some(val);
+            }
+            unknown => {
+                return Err(format!(
+                    "Unknown option: '{}'. Use --help for usage.",
+                    unknown
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    Ok(Config {
+        diagnose,
+        duration_secs,
+    })
+}
+
+fn print_help() {
+    println!("DesktopRoomie - A00-M01: Desktop Probe");
+    println!();
+    println!("USAGE:");
+    println!("  desktop-probe [OPTIONS]");
+    println!();
+    println!("OPTIONS:");
+    println!("  -h, --help              Show this help message and exit");
+    println!("  --diagnose              Run pure X11 environment diagnostics and exit");
+    println!("  --duration <SECONDS>    Run for a specified duration in seconds, then exit");
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
-        print_help();
-        return;
-    }
+    let config = match parse_args() {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("[ERROR] {}", err);
+            process::exit(1);
+        }
+    };
 
     println!("=== DesktopRoomie A00-M01: Desktop Probe ===");
-    println!("Mission M01.1: Establishing X11 connection and diagnostics...");
 
+    // Connect to X11 display session
     let (conn, screen_num) = match x11rb::connect(None) {
         Ok(res) => res,
         Err(err) => {
@@ -62,8 +113,150 @@ fn main() {
         }
     };
 
+    let layout = query_desktop_layout(
+        &conn,
+        screen.root,
+        screen.width_in_pixels,
+        screen.height_in_pixels,
+    );
+
+    // If pure diagnosis requested, print diagnostics and exit cleanly (M01.1 mode)
+    if config.diagnose {
+        run_diagnostics(&conn, screen, &layout);
+        println!("\n[Result]");
+        println!("  M01.1: X11 connection established; diagnostics completed.");
+        return;
+    }
+
+    // M01.2: Render borderless transparent test body
+    println!("Mission M01.2: Rendering borderless transparent test body...");
+
+    // 1. Discover 32-bit alpha Render visual
+    let alpha_vis = match find_alpha_visual(&conn) {
+        Ok(vis) => vis,
+        Err(err) => {
+            eprintln!("\n[ERROR] Alpha visual discovery failed: {}", err);
+            process::exit(1);
+        }
+    };
+
+    println!("\n[Visual Selection]");
+    println!(
+        "  Discovered 32-bit ARGB visual: 0x{:x} (Render PictFormat: 0x{:x})",
+        alpha_vis.visual_id, alpha_vis.pict_format
+    );
+
+    // 2. Report target placement
+    if let Some(ref pm) = layout.primary_monitor {
+        println!(
+            "  Primary display: '{}' ({}x{} at +{}+{})",
+            pm.name, pm.width, pm.height, pm.x, pm.y
+        );
+    }
+    println!(
+        "  Usable area on main screen (desktop {}): x={}, y={}, w={}, h={}",
+        layout.current_desktop,
+        layout.usable_area.x,
+        layout.usable_area.y,
+        layout.usable_area.width,
+        layout.usable_area.height
+    );
+
+    // 3. Create managed borderless window
+    let probe_window = match ManagedProbeWindow::create(
+        &conn,
+        screen.root,
+        alpha_vis.visual_id,
+        layout.usable_area,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("[ERROR] Failed to create managed probe window: {}", e);
+            process::exit(1);
+        }
+    };
+
+    println!(
+        "  Window created: ID=0x{:x}, geometry={}x{} at +{}+{}",
+        probe_window.window,
+        probe_window.width,
+        probe_window.height,
+        probe_window.x,
+        probe_window.y
+    );
+    println!("  Window properties: borderless (_MOTIF_WM_HINTS), managed, type=UTILITY");
+
+    // 4. Initialize double-buffered renderer
+    let renderer = match Renderer::new(&conn, probe_window.window, probe_window.colormap) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ERROR] Failed to initialize renderer: {}", e);
+            let _ = probe_window.destroy(&conn);
+            process::exit(1);
+        }
+    };
+
+    // Perform initial paint
+    if let Err(e) = renderer.paint(&conn, probe_window.window) {
+        eprintln!("[WARN] Initial paint error: {}", e);
+    }
+
+    println!("\n[Running Probe]");
+    if let Some(sec) = config.duration_secs {
+        println!("  Probe running for {} seconds (or until closed)...", sec);
+    } else {
+        println!(
+            "  Probe is visible on desktop. Close window or press Ctrl+C in terminal to exit."
+        );
+    }
+
+    // 5. Event loop
+    let start_time = Instant::now();
+    let mut running = true;
+
+    while running {
+        // Check timeout if configured
+        if let Some(sec) = config.duration_secs {
+            if start_time.elapsed() >= Duration::from_secs(sec) {
+                println!("  Duration limit reached ({}s). Exiting cleanly.", sec);
+                break;
+            }
+        }
+
+        // Process incoming X11 events
+        while let Ok(Some(event)) = conn.poll_for_event() {
+            match event {
+                Event::Expose(exp) if exp.window == probe_window.window => {
+                    let _ = renderer.paint(&conn, probe_window.window);
+                }
+                Event::ClientMessage(msg) if msg.window == probe_window.window => {
+                    let data = msg.data.as_data32();
+                    if data[0] == probe_window.wm_delete_window {
+                        println!("  Received WM_DELETE_WINDOW. Exiting cleanly.");
+                        running = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        thread::sleep(Duration::from_millis(15));
+    }
+
+    // 6. Cleanup
+    println!("\n[Cleanup]");
+    let _ = probe_window.destroy(&conn);
+    println!("  Resources released cleanly.");
+    println!("  M01.2: Borderless transparent test body executed successfully.");
+}
+
+fn run_diagnostics(
+    conn: &impl Connection,
+    screen: &x11rb::protocol::xproto::Screen,
+    layout: &x11::monitors::DesktopLayout,
+) {
     println!("\n[X11 Session & Display]");
-    println!("  Screen index:           {}", screen_num);
     println!("  Root window:            0x{:x}", screen.root);
     println!(
         "  Total screen spanning:  {}x{} px ({}x{} mm)",
@@ -75,41 +268,14 @@ fn main() {
     println!("  Root visual ID:         0x{:x}", screen.root_visual);
     println!("  Root depth:             {} bpp", screen.root_depth);
 
-    // Query RandR monitors to isolate the primary/main screen (1920x1080)
-    let monitors = query_monitors(&conn, screen.root);
     println!("\n[RandR Monitors]");
-    let mut primary_monitor: Option<MonitorGeometry> = None;
-    if monitors.is_empty() {
-        println!("  No RandR monitor information available; using root screen geometry.");
-    } else {
-        for mon in &monitors {
-            let primary_tag = if mon.is_primary {
-                " (PRIMARY / MAIN)"
-            } else {
-                ""
-            };
-            println!(
-                "  Monitor '{}': {}x{} at +{}+{} ({} mm x {} mm){}",
-                mon.name, mon.width, mon.height, mon.x, mon.y, mon.width, mon.height, primary_tag
-            );
-            if mon.is_primary {
-                primary_monitor = Some(mon.clone());
-            }
-        }
-        if primary_monitor.is_none() && !monitors.is_empty() {
-            // Default to first monitor if none explicitly marked primary
-            primary_monitor = Some(monitors[0].clone());
-        }
-    }
-
-    if let Some(ref pm) = primary_monitor {
+    if let Some(ref pm) = layout.primary_monitor {
         println!(
-            "  -> Target main screen for DesktopRoomie: {}x{} at +{}+{}",
-            pm.width, pm.height, pm.x, pm.y
+            "  Primary monitor '{}':   {}x{} at +{}+{}",
+            pm.name, pm.width, pm.height, pm.x, pm.y
         );
     }
 
-    // Inspect available visuals and depth 32 candidates (softened claim)
     println!("\n[Visuals & Depths]");
     let mut depth_32_candidates = 0;
     for depth in &screen.allowed_depths {
@@ -134,181 +300,38 @@ fn main() {
         depth_32_candidates
     );
 
-    // Query RENDER extension
     println!("\n[Extensions]");
-    match conn.render_query_version(0, 11) {
-        Ok(cookie) => match cookie.reply() {
-            Ok(reply) => {
-                println!(
-                    "  RENDER extension:       supported (v{}.{})",
-                    reply.major_version, reply.minor_version
-                );
-            }
-            Err(e) => eprintln!("  RENDER extension:       query reply failed: {}", e),
-        },
-        Err(e) => eprintln!("  RENDER extension:       not available: {}", e),
+    if let Ok(cookie) = conn.render_query_version(0, 11) {
+        if let Ok(reply) = cookie.reply() {
+            println!(
+                "  RENDER extension:       supported (v{}.{})",
+                reply.major_version, reply.minor_version
+            );
+        }
+    }
+    if let Ok(cookie) = conn.shape_query_version() {
+        if let Ok(reply) = cookie.reply() {
+            println!(
+                "  SHAPE extension:        supported (v{}.{})",
+                reply.major_version, reply.minor_version
+            );
+        }
     }
 
-    // Query SHAPE extension
-    match conn.shape_query_version() {
-        Ok(cookie) => match cookie.reply() {
-            Ok(reply) => {
-                println!(
-                    "  SHAPE extension:        supported (v{}.{})",
-                    reply.major_version, reply.minor_version
-                );
-            }
-            Err(e) => eprintln!("  SHAPE extension:        query reply failed: {}", e),
-        },
-        Err(e) => eprintln!("  SHAPE extension:        not available: {}", e),
-    }
-
-    // Query EWMH hints: desktops and selected desktop's workarea
     println!("\n[Window Manager / EWMH]");
-    let current_desktop = query_current_desktop(&conn, screen.root);
-    let workarea_opt = query_desktop_workarea(&conn, screen.root, current_desktop);
-
-    if let Some(wa) = workarea_opt {
+    println!("  _NET_CURRENT_DESKTOP:    {}", layout.current_desktop);
+    if let Some(wa) = layout.desktop_workarea {
         println!(
             "  Current desktop workarea: x={}, y={}, w={}, h={}",
             wa.x, wa.y, wa.width, wa.height
         );
-
-        if let Some(ref pm) = primary_monitor {
-            // Compute intersection of current desktop workarea and primary monitor bounds
-            let eff_x = max(pm.x as i32, wa.x);
-            let eff_y = max(pm.y as i32, wa.y);
-            let eff_right = min((pm.x as i32) + (pm.width as i32), wa.x + (wa.width as i32));
-            let eff_bottom = min(
-                (pm.y as i32) + (pm.height as i32),
-                wa.y + (wa.height as i32),
-            );
-
-            if eff_right > eff_x && eff_bottom > eff_y {
-                let eff_w = (eff_right - eff_x) as u32;
-                let eff_h = (eff_bottom - eff_y) as u32;
-                println!(
-                    "  -> Usable area on main screen (desktop {}): x={}, y={}, w={}, h={}",
-                    current_desktop, eff_x, eff_y, eff_w, eff_h
-                );
-            }
-        }
     }
-
-    println!("\n[Result]");
-    println!("  M01.1: X11 connection established; diagnostics completed.");
-}
-
-fn print_help() {
-    println!("DesktopRoomie - A00-M01 Desktop Probe");
-    println!();
-    println!("USAGE:");
-    println!("  desktop-probe [OPTIONS]");
-    println!();
-    println!("OPTIONS:");
-    println!("  -h, --help       Show this help message");
-    println!("  --diagnose       Run full environment diagnostics and exit (default for M01.1)");
-}
-
-fn query_monitors(
-    conn: &impl Connection,
-    root: x11rb::protocol::xproto::Window,
-) -> Vec<MonitorGeometry> {
-    let mut monitors = Vec::new();
-    if let Ok(cookie) = conn.randr_get_monitors(root, true) {
-        if let Ok(reply) = cookie.reply() {
-            for mon in reply.monitors {
-                let name = if let Ok(atom_name) = conn.get_atom_name(mon.name) {
-                    if let Ok(name_reply) = atom_name.reply() {
-                        String::from_utf8_lossy(&name_reply.name).into_owned()
-                    } else {
-                        format!("0x{:x}", mon.name)
-                    }
-                } else {
-                    format!("0x{:x}", mon.name)
-                };
-
-                monitors.push(MonitorGeometry {
-                    name,
-                    is_primary: mon.primary,
-                    x: mon.x,
-                    y: mon.y,
-                    width: mon.width,
-                    height: mon.height,
-                });
-            }
-        }
-    }
-    monitors
-}
-
-fn query_current_desktop(conn: &impl Connection, root: x11rb::protocol::xproto::Window) -> u32 {
-    if let Ok(atom_desktops) = conn.intern_atom(false, b"_NET_NUMBER_OF_DESKTOPS") {
-        if let Ok(reply) = atom_desktops.reply() {
-            if let Ok(prop) = conn.get_property(false, root, reply.atom, AtomEnum::CARDINAL, 0, 1) {
-                if let Ok(prop_reply) = prop.reply() {
-                    if let Some(val) = prop_reply.value32().and_then(|mut iter| iter.next()) {
-                        println!("  _NET_NUMBER_OF_DESKTOPS:  {}", val);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut current_desktop = 0;
-    if let Ok(atom_current) = conn.intern_atom(false, b"_NET_CURRENT_DESKTOP") {
-        if let Ok(reply) = atom_current.reply() {
-            if let Ok(prop) = conn.get_property(false, root, reply.atom, AtomEnum::CARDINAL, 0, 1) {
-                if let Ok(prop_reply) = prop.reply() {
-                    if let Some(val) = prop_reply.value32().and_then(|mut iter| iter.next()) {
-                        println!("  _NET_CURRENT_DESKTOP:    {}", val);
-                        current_desktop = val;
-                    }
-                }
-            }
-        }
-    }
-    current_desktop
-}
-
-fn query_desktop_workarea(
-    conn: &impl Connection,
-    root: x11rb::protocol::xproto::Window,
-    current_desktop: u32,
-) -> Option<Rect> {
-    let atom_workarea = conn
-        .intern_atom(false, b"_NET_WORKAREA")
-        .ok()?
-        .reply()
-        .ok()?
-        .atom;
-    // EWMH defines _NET_WORKAREA as an array of 4 CARDINALs per desktop.
-    // Read up to 256 32-bit values (supporting up to 64 virtual desktops).
-    let prop = conn
-        .get_property(false, root, atom_workarea, AtomEnum::CARDINAL, 0, 256)
-        .ok()?
-        .reply()
-        .ok()?;
-    let values: Vec<u32> = prop.value32()?.collect();
-
-    let offset = (current_desktop as usize) * 4;
-    if offset + 3 < values.len() {
-        let x = values[offset] as i32;
-        let y = values[offset + 1] as i32;
-        let width = values[offset + 2];
-        let height = values[offset + 3];
-        Some(Rect {
-            x,
-            y,
-            width,
-            height,
-        })
-    } else {
-        eprintln!(
-            "  [WARN] _NET_WORKAREA contains {} values, insufficient for desktop index {}",
-            values.len(),
-            current_desktop
-        );
-        None
-    }
+    println!(
+        "  -> Usable area on main screen (desktop {}): x={}, y={}, w={}, h={}",
+        layout.current_desktop,
+        layout.usable_area.x,
+        layout.usable_area.y,
+        layout.usable_area.width,
+        layout.usable_area.height
+    );
 }

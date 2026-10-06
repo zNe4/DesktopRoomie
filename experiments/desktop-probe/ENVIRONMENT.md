@@ -32,6 +32,7 @@ Recorded: 2026-10-05.
 | Root Visual | `0x21` (depth 24 bpp) | Default 24-bit root visual |
 | Current Desktop Workarea | `x=10, y=48, w=2924, h=1222` | Spanning workarea for `_NET_CURRENT_DESKTOP` (desktop 0) |
 | Usable Area on Main Screen | `x=10, y=48, w=1910, h=1032` | Intersected bounds of main monitor (`eDP-2`) and desktop workarea |
+| Probe Initial Geometry | 160×160 at +885+484 | Centered on primary monitor within usable workarea |
 
 ---
 
@@ -46,15 +47,15 @@ Recorded: 2026-10-05.
 
 ---
 
-## 4. Host Capabilities Discovered
+## 4. Host Capabilities Discovered & Verified
 
-Running the M01.1 desktop-probe verifies:
 - **X11 Server Connection:** Successfully connects via Unix domain socket to `DISPLAY=:0`.
 - **Primary Display Discovery:** RandR extension isolates primary screen `eDP-2` (1920×1080 at +0+0).
-- **Candidate 32-bit Visuals:** 16 candidate 32-bit TrueColor visuals detected (alpha-capable Render format verification will be performed in M01.2).
-- **RENDER Extension:** Supported (v0.11), required for alpha composition and blending in M01.2.
-- **SHAPE Extension:** Supported (v1.1), required for bounding and input shaping in M01.3.
-- **Workarea Selection:** Properly indexes `_NET_WORKAREA` by `_NET_CURRENT_DESKTOP` and computes usable bounds on the primary display.
+- **Alpha-Capable Render Visual (M01.2):** Discovered TrueColor 32-bit visual `0x27f` with Render format `0x25` (`direct.alpha_mask == 0xff`).
+- **Managed Borderless Window (M01.2):** Created managed window (`override_redirect = false`) with `_MOTIF_WM_HINTS` (`decorations = 0`) and `_NET_WM_WINDOW_TYPE_UTILITY`. Openbox manages window without borders or titlebar.
+- **Alpha Blending & Compositing (M01.2):** Verified under Picom: empty region is genuinely transparent, translucent cyan patch blends with underlying desktop windows, and opaque body is crisp.
+- **RENDER Extension:** Supported (v0.11), required for alpha composition and blending.
+- **SHAPE Extension:** Supported (v1.1), ready for bounding and input shaping in M01.3.
 
 ---
 
@@ -62,18 +63,12 @@ Running the M01.1 desktop-probe verifies:
 
 From the repository root:
 ```bash
-# Build the probe
-cargo build --manifest-path experiments/desktop-probe/Cargo.toml
-
-# Run the probe diagnostics
+# Run the transparent body probe (indefinite until closed or Ctrl+C)
 cargo run --manifest-path experiments/desktop-probe/Cargo.toml
 
-# Negative test (simulated failure)
-DISPLAY=:99 cargo run --manifest-path experiments/desktop-probe/Cargo.toml
-```
+# Run probe with automatic duration timeout (e.g. 5 seconds)
+cargo run --manifest-path experiments/desktop-probe/Cargo.toml -- --duration 5
 
-Alternatively, from within the experiment directory:
-```bash
-cd experiments/desktop-probe
-cargo run
+# Run pure diagnostics without rendering (M01.1 mode)
+cargo run --manifest-path experiments/desktop-probe/Cargo.toml -- --diagnose
 ```
