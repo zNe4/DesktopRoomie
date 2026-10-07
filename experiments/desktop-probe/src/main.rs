@@ -858,6 +858,20 @@ fn main() {
             break;
         }
 
+        // Perform all X11 operations before the final empty-event check:
+        // Check if movement confirmation deadline has expired
+        check_confirmation_timeout(
+            &conn,
+            screen.root,
+            &mut confirmation_deadline,
+            &mut probe_window,
+            &mut awaiting_final_confirmation,
+            &mut interaction,
+            &mut pointer_tracker,
+            &renderer,
+            &mut pending_move,
+        );
+
         // Flush any pending requests before waiting
         if let Err(e) = conn.flush() {
             fatal_host_error(
@@ -891,19 +905,6 @@ fn main() {
                 );
             }
         }
-
-        // Check if movement confirmation deadline has expired before blocking
-        check_confirmation_timeout(
-            &conn,
-            screen.root,
-            &mut confirmation_deadline,
-            &mut probe_window,
-            &mut awaiting_final_confirmation,
-            &mut interaction,
-            &mut pointer_tracker,
-            &renderer,
-            &mut pending_move,
-        );
 
         // Compute timeout until duration limit or confirmation deadline
         let mut timeout_ms = -1;
@@ -1708,5 +1709,137 @@ mod tests {
         assert_eq!(awaiting_final_confirmation, None);
         assert_eq!(window.confirmed_origin(), b);
         assert!(window.in_flight_moves.is_empty());
+    }
+
+    #[test]
+    fn test_expired_deadline_query_buffers_release_processes_before_socket_wait() {
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(150, 150),
+            confirmed_origin: Point::new(100, 100),
+            in_flight_moves: std::collections::VecDeque::new(),
+            superseded_moves: std::collections::VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+        window.in_flight_moves.push_back(Point::new(150, 150));
+
+        let mut interaction = InteractionManager::new();
+        let bounds = crate::geometry::ValidOriginBounds::new(0, 1000, 0, 1000);
+        let _ = interaction.handle_left_press(
+            Point::new(100, 100),
+            (20, 20),
+            1000,
+            Point::new(100, 100),
+        );
+        interaction.on_grab_acquired();
+        let _ = interaction.handle_motion(Point::new(150, 150), 1010, &bounds);
+        assert!(interaction.is_dragging());
+
+        let mut awaiting_final_confirmation = None;
+        let mut confirmation_deadline = Some(Instant::now() - Duration::from_millis(10));
+        let mut pending_move = None;
+        let mut buffered_event: Option<Event> = None;
+
+        // Simulated x11rb internal event queue
+        let mut internal_event_queue = std::collections::VecDeque::new();
+        let mut socket_wait_invoked = false;
+        let mut release_processed = false;
+
+        // Loop iteration 1:
+        // Batch draining finds no events in queue initially
+        let batch: Vec<Event> = drain_events_bounded(&mut buffered_event, 64, || {
+            Ok::<_, ()>(internal_event_queue.pop_front())
+        })
+        .unwrap();
+        assert!(batch.is_empty());
+
+        // Now post-batch handling in loop runs:
+        // 1. All X11 operations executed BEFORE final empty-event check:
+        // Check confirmation timeout: query runs and buffers an incoming ButtonRelease
+        let query_buffers_release = || {
+            // When query executes synchronous round-trip (.reply()), server event arrives on socket
+            internal_event_queue.push_back(Event::ButtonRelease(ButtonReleaseEvent {
+                response_type: 5,
+                detail: 1,
+                sequence: 10,
+                time: 1050,
+                root: 1,
+                event: 100,
+                child: 0,
+                root_x: 150,
+                root_y: 150,
+                event_x: 20,
+                event_y: 20,
+                state: KeyButMask::BUTTON1,
+                same_screen: true,
+            }));
+            Ok(Point::new(100, 100)) // Live query observes discrepancy
+        };
+
+        check_confirmation_timeout_with(
+            &mut confirmation_deadline,
+            &mut window,
+            &mut awaiting_final_confirmation,
+            &mut interaction,
+            &mut pending_move,
+            query_buffers_release,
+            |_time| Ok(()),
+        )
+        .unwrap();
+
+        // 2. Final empty-event check BEFORE waiting on socket:
+        let should_continue = if buffered_event.is_some() {
+            true
+        } else {
+            match internal_event_queue.pop_front() {
+                Some(ev) => {
+                    buffered_event = Some(ev);
+                    true
+                }
+                None => false,
+            }
+        };
+
+        if !should_continue {
+            socket_wait_invoked = true;
+        }
+
+        // Crucial: socket wait was NOT invoked because the buffered release was detected!
+        assert!(
+            !socket_wait_invoked,
+            "Socket wait must not be invoked when release was buffered"
+        );
+        assert!(should_continue);
+        assert!(buffered_event.is_some());
+
+        // Loop iteration 2:
+        // Drain batch picks up the buffered ButtonRelease event immediately
+        let batch2: Vec<Event> = drain_events_bounded(&mut buffered_event, 64, || {
+            Ok::<_, ()>(internal_event_queue.pop_front())
+        })
+        .unwrap();
+        assert_eq!(batch2.len(), 1);
+
+        for ev in batch2 {
+            if let Event::ButtonRelease(rel) = ev {
+                assert_eq!(rel.detail, 1);
+                let _ = interaction.handle_left_release(
+                    Point::new(rel.root_x as i32, rel.root_y as i32),
+                    (rel.event_x, rel.event_y),
+                    rel.time,
+                    &bounds,
+                );
+                release_processed = true;
+            }
+        }
+
+        assert!(
+            release_processed,
+            "Buffered release must be processed before any socket wait"
+        );
+        assert!(interaction.is_idle());
     }
 }
