@@ -2,7 +2,7 @@
 
 use crate::geometry::{
     calculate_grab_offset, calculate_target_origin, exceeds_drag_threshold,
-    is_in_interactive_silhouette, GrabOffset, Point, ValidOriginBounds,
+    is_in_interactive_silhouette, GrabOffset, MenuHit, Point, ValidOriginBounds,
 };
 
 /// States of pointer interaction on the probe window.
@@ -26,6 +26,12 @@ pub enum InteractionState {
         grab_offset: GrabOffset,
         current_target: Point,
     },
+    /// The server's automatic right-button grab is pending completion.
+    RightPressed { press_time: u32, chorded: bool },
+    MenuOpen {
+        hover: Option<MenuItem>,
+        gesture: MenuGesture,
+    },
     /// A gesture was cancelled or exceeded threshold while a mouse button remains physically depressed.
     /// Suppresses stale release events until the button is released.
     SuppressedUntilRelease { button: u8 },
@@ -37,17 +43,82 @@ pub enum HostAction {
     /// No host action required.
     None,
     /// Acquire short-lived pointer capture via GrabPointer.
-    AcquireGrab { time: u32 },
+    AcquireGrab {
+        time: u32,
+    },
     /// Release pointer capture via UngrabPointer.
-    ReleaseGrab { time: u32 },
+    ReleaseGrab {
+        time: u32,
+    },
     /// Release pointer capture and toggle body color (valid stationary click completed).
-    ReleaseGrabAndToggleColor { time: u32 },
+    ReleaseGrabAndToggleColor {
+        time: u32,
+    },
     /// Move the window to the clamped target position.
-    MoveWindow { target: Point },
+    MoveWindow {
+        target: Point,
+    },
     /// Apply final window placement and release pointer capture (drag completed).
-    ReleaseGrabAndMoveWindow { time: u32, target: Point },
-    /// Clean shutdown requested (e.g. idle right-click).
-    ExitCleanly,
+    ReleaseGrabAndMoveWindow {
+        time: u32,
+        target: Point,
+    },
+    TrackOpening,
+    /// All buttons are up: automatic ownership ends without an explicit ungrab.
+    OpeningFinished {
+        time: u32,
+        anchor: Option<Point>,
+    },
+    CloseMenu {
+        time: u32,
+        quit: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuItem {
+    Dismiss,
+    Quit,
+}
+impl MenuItem {
+    pub fn from_hit(hit: MenuHit) -> Option<Self> {
+        match hit {
+            MenuHit::Row(0) => Some(Self::Dismiss),
+            MenuHit::Row(1) => Some(Self::Quit),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MenuGesture {
+    #[default]
+    None,
+    ItemPressed {
+        item: MenuItem,
+        press_time: u32,
+    },
+    OutsidePressed {
+        press_time: u32,
+    },
+    RightDismissPressed {
+        press_time: u32,
+    },
+    /// A chord can only return to neutral when all buttons are up.
+    Suppressed {
+        press_time: u32,
+    },
+}
+impl MenuGesture {
+    fn press_time(self) -> Option<u32> {
+        match self {
+            Self::None => None,
+            Self::ItemPressed { press_time, .. }
+            | Self::OutsidePressed { press_time }
+            | Self::RightDismissPressed { press_time }
+            | Self::Suppressed { press_time } => Some(press_time),
+        }
+    }
 }
 
 /// The interaction manager coordinating pointer gesture transitions.
@@ -273,18 +344,193 @@ impl InteractionManager {
         }
     }
 
-    /// Handles a right mouse button press.
+    /// Host validates the body hit and an unchorded genuine press first.
     pub fn handle_right_press(&mut self, time: u32) -> HostAction {
         match self.state {
             InteractionState::LeftPressed { .. } | InteractionState::Dragging { .. } => {
-                // Right press during an active left gesture cancels the gesture
                 self.cancel(time)
             }
             InteractionState::Idle | InteractionState::SuppressedUntilRelease { .. } => {
-                // While idle or recovering from missed release, right press triggers clean exit
-                self.state = InteractionState::Idle;
-                HostAction::ExitCleanly
+                self.freshness_pending = true;
+                self.state = InteractionState::RightPressed {
+                    press_time: time,
+                    chorded: false,
+                };
+                HostAction::TrackOpening
             }
+            _ => HostAction::None,
+        }
+    }
+
+    pub fn opening_chord(&mut self, time: u32) {
+        if self.accepts_gesture_time(time) {
+            if let InteractionState::RightPressed {
+                ref mut chorded, ..
+            } = self.state
+            {
+                *chorded = true;
+            }
+        }
+    }
+
+    /// remaining_buttons describes the post-release logical button state.
+    pub fn handle_opening_release(
+        &mut self,
+        button: u8,
+        time: u32,
+        remaining_buttons: u16,
+        anchor: Point,
+        on_body: bool,
+    ) -> HostAction {
+        if !self.accepts_gesture_time(time) {
+            return HostAction::None;
+        }
+        let InteractionState::RightPressed {
+            press_time,
+            chorded,
+        } = self.state
+        else {
+            return HostAction::None;
+        };
+        if button != 3 && !chorded {
+            return HostAction::None;
+        }
+        if remaining_buttons != 0 {
+            self.state = InteractionState::RightPressed {
+                press_time,
+                chorded: true,
+            };
+            return HostAction::None;
+        }
+        self.state = InteractionState::Idle;
+        self.freshness_pending = false;
+        HostAction::OpeningFinished {
+            time,
+            anchor: (button == 3 && !chorded && on_body).then_some(anchor),
+        }
+    }
+
+    pub fn menu_acquired(&mut self, hit: MenuHit) {
+        self.pending_press = None;
+        self.freshness_pending = false;
+        self.state = InteractionState::MenuOpen {
+            hover: MenuItem::from_hit(hit),
+            gesture: MenuGesture::None,
+        };
+    }
+
+    pub fn menu_motion(&mut self, hit: MenuHit, time: u32) {
+        if !self.accepts_gesture_time(time) {
+            return;
+        }
+        if let InteractionState::MenuOpen { ref mut hover, .. } = self.state {
+            *hover = MenuItem::from_hit(hit);
+        }
+    }
+
+    pub fn menu_press(&mut self, button: u8, hit: MenuHit, time: u32, held_buttons: u16) {
+        if !self.accepts_gesture_time(time) {
+            return;
+        }
+        let InteractionState::MenuOpen { hover, gesture } = self.state else {
+            return;
+        };
+        let gesture = if gesture != MenuGesture::None || held_buttons != 0 {
+            MenuGesture::Suppressed {
+                press_time: gesture.press_time().unwrap_or(time),
+            }
+        } else {
+            match (button, hit) {
+                (1, MenuHit::Outside) => MenuGesture::OutsidePressed { press_time: time },
+                (1, _) => MenuItem::from_hit(hit).map_or(MenuGesture::None, |item| {
+                    MenuGesture::ItemPressed {
+                        item,
+                        press_time: time,
+                    }
+                }),
+                (3, _) => MenuGesture::RightDismissPressed { press_time: time },
+                _ => MenuGesture::None,
+            }
+        };
+        if gesture != MenuGesture::None && self.active_button().is_none() {
+            self.freshness_pending = true;
+        }
+        self.state = InteractionState::MenuOpen { hover, gesture };
+    }
+
+    pub fn menu_release(
+        &mut self,
+        button: u8,
+        hit: MenuHit,
+        time: u32,
+        remaining_buttons: u16,
+    ) -> HostAction {
+        if !self.accepts_gesture_time(time) {
+            return HostAction::None;
+        }
+        let InteractionState::MenuOpen { hover, gesture } = self.state else {
+            return HostAction::None;
+        };
+        if gesture == MenuGesture::None {
+            return HostAction::None;
+        }
+        if remaining_buttons != 0 {
+            self.state = InteractionState::MenuOpen {
+                hover,
+                gesture: MenuGesture::Suppressed {
+                    press_time: gesture.press_time().unwrap(),
+                },
+            };
+            return HostAction::None;
+        }
+        // All buttons are up. A suppressed or mismatched gesture never activates.
+        self.state = InteractionState::MenuOpen {
+            hover,
+            gesture: MenuGesture::None,
+        };
+        self.freshness_pending = false;
+        let quit = match gesture {
+            MenuGesture::ItemPressed { item, .. }
+                if button == 1 && MenuItem::from_hit(hit) == Some(item) =>
+            {
+                item == MenuItem::Quit
+            }
+            MenuGesture::OutsidePressed { .. } if button == 1 => false,
+            MenuGesture::RightDismissPressed { .. } if button == 3 => false,
+            _ => return HostAction::None,
+        };
+        HostAction::CloseMenu { time, quit }
+    }
+
+    /// None means no safety timer; zero means observe any held button of a chord.
+    pub fn active_button(&self) -> Option<u8> {
+        match self.state {
+            InteractionState::LeftPressed { .. } | InteractionState::Dragging { .. } => Some(1),
+            InteractionState::RightPressed { chorded, .. } => Some(if chorded { 0 } else { 3 }),
+            InteractionState::MenuOpen { gesture, .. } => match gesture {
+                MenuGesture::None => None,
+                MenuGesture::ItemPressed { .. } | MenuGesture::OutsidePressed { .. } => Some(1),
+                MenuGesture::RightDismissPressed { .. } => Some(3),
+                MenuGesture::Suppressed { .. } => Some(0),
+            },
+            _ => None,
+        }
+    }
+
+    /// An ordered QueryPointer observation can reveal a missed secondary press.
+    pub fn suppress_observed_chord(&mut self) {
+        match self.state {
+            InteractionState::RightPressed {
+                ref mut chorded, ..
+            } => *chorded = true,
+            InteractionState::MenuOpen {
+                ref mut gesture, ..
+            } => {
+                if let Some(press_time) = gesture.press_time() {
+                    *gesture = MenuGesture::Suppressed { press_time };
+                }
+            }
+            _ => {}
         }
     }
 
@@ -303,8 +549,20 @@ impl InteractionManager {
     /// Cancels without completing a click; a fresh press can recover after a missed release.
     pub fn cancel(&mut self, time: u32) -> HostAction {
         self.pending_press = None;
-        if self.has_left_gesture() {
-            self.state = InteractionState::SuppressedUntilRelease { button: 1 };
+        let button = match self.state {
+            InteractionState::LeftPressed { .. } | InteractionState::Dragging { .. } => Some(1),
+            InteractionState::RightPressed { .. } => Some(3),
+            InteractionState::MenuOpen { .. } => {
+                self.state = InteractionState::Idle;
+                Some(0)
+            }
+            _ => None,
+        };
+        self.freshness_pending = false;
+        if let Some(button) = button {
+            if button != 0 {
+                self.state = InteractionState::SuppressedUntilRelease { button };
+            }
             HostAction::ReleaseGrab { time }
         } else {
             HostAction::None
@@ -312,13 +570,14 @@ impl InteractionManager {
     }
 
     pub fn accepts_gesture_time(&self, time: u32) -> bool {
-        match self.state {
+        let press_time = match self.state {
             InteractionState::LeftPressed { press_time, .. }
-            | InteractionState::Dragging { press_time, .. } => {
-                !self.freshness_pending || timestamp_at_or_after(time, press_time)
-            }
-            _ => true,
-        }
+            | InteractionState::Dragging { press_time, .. }
+            | InteractionState::RightPressed { press_time, .. } => Some(press_time),
+            InteractionState::MenuOpen { gesture, .. } => gesture.press_time(),
+            _ => None,
+        };
+        !self.freshness_pending || press_time.is_none_or(|press| timestamp_at_or_after(time, press))
     }
 
     /// A held-button observation has passed the queued-event boundary. Old events
@@ -613,10 +872,10 @@ mod tests {
     }
 
     #[test]
-    fn test_idle_right_press_exits_cleanly() {
+    fn test_idle_right_press_starts_pending_opening() {
         let mut mgr = InteractionManager::new();
         assert_eq!(mgr.state(), InteractionState::Idle);
-        assert_eq!(mgr.handle_right_press(1000), HostAction::ExitCleanly);
+        assert_eq!(mgr.handle_right_press(1000), HostAction::TrackOpening);
     }
 
     #[test]
@@ -757,10 +1016,10 @@ mod tests {
             InteractionState::SuppressedUntilRelease { button: 1 }
         );
 
-        // Fresh right press exits cleanly
+        // A fresh right press starts pending opening
         let right_action = mgr.handle_right_press(1050);
-        assert_eq!(right_action, HostAction::ExitCleanly);
-        assert_eq!(mgr.state(), InteractionState::Idle);
+        assert_eq!(right_action, HostAction::TrackOpening);
+        assert!(matches!(mgr.state(), InteractionState::RightPressed { .. }));
     }
 
     #[test]
@@ -939,5 +1198,354 @@ mod tests {
             manager.handle_left_release(point, (80, 80), late, &sample_bounds()),
             HostAction::ReleaseGrabAndToggleColor { time: late }
         );
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+    const ANCHOR: Point = Point::new(100, 100);
+    fn open() -> InteractionManager {
+        let mut manager = InteractionManager::new();
+        manager.menu_acquired(MenuHit::Outside);
+        manager
+    }
+
+    #[test]
+    fn right_press_waits_for_matched_body_release_and_opens_once() {
+        let mut manager = InteractionManager::new();
+        assert_eq!(manager.handle_right_press(10), HostAction::TrackOpening);
+        assert_eq!(
+            manager.handle_opening_release(1, 11, 4, ANCHOR, true),
+            HostAction::None
+        );
+        assert!(matches!(
+            manager.state(),
+            InteractionState::RightPressed { .. }
+        ));
+        assert_eq!(
+            manager.handle_opening_release(3, 12, 0, ANCHOR, true),
+            HostAction::OpeningFinished {
+                time: 12,
+                anchor: Some(ANCHOR)
+            }
+        );
+        assert_eq!(
+            manager.handle_opening_release(3, 13, 0, ANCHOR, true),
+            HostAction::None
+        );
+        assert!(manager.is_idle());
+    }
+
+    #[test]
+    fn outside_cancelled_and_stale_opening_releases_cannot_open() {
+        let mut manager = InteractionManager::new();
+        manager.handle_right_press(100);
+        assert_eq!(
+            manager.handle_opening_release(3, 101, 0, ANCHOR, false),
+            HostAction::OpeningFinished {
+                time: 101,
+                anchor: None
+            }
+        );
+        manager.handle_right_press(200);
+        assert_eq!(
+            manager.handle_opening_release(3, 199, 0, ANCHOR, true),
+            HostAction::None
+        );
+        assert_eq!(manager.cancel(201), HostAction::ReleaseGrab { time: 201 });
+        assert_eq!(
+            manager.handle_opening_release(3, 202, 0, ANCHOR, true),
+            HostAction::None
+        );
+        manager.handle_right_press(300);
+        assert_eq!(
+            manager.handle_opening_release(3, 202, 0, ANCHOR, true),
+            HostAction::None
+        );
+    }
+
+    #[test]
+    fn opening_wrap_and_confirmed_long_hold_are_valid() {
+        let mut manager = InteractionManager::new();
+        manager.handle_right_press(u32::MAX - 10);
+        assert_eq!(
+            manager.handle_opening_release(3, u32::MAX - 11, 0, ANCHOR, true),
+            HostAction::None
+        );
+        assert!(matches!(
+            manager.handle_opening_release(3, 5, 0, ANCHOR, true),
+            HostAction::OpeningFinished {
+                anchor: Some(_),
+                ..
+            }
+        ));
+        manager.handle_right_press(100);
+        manager.confirm_button_held();
+        assert!(matches!(
+            manager.handle_opening_release(3, 0x80000100, 0, ANCHOR, true),
+            HostAction::OpeningFinished {
+                anchor: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn opening_chord_never_opens_and_waits_for_every_release() {
+        for last_button in [1, 2, 4, 5] {
+            let mut manager = InteractionManager::new();
+            manager.handle_right_press(100);
+            manager.opening_chord(101);
+            assert_eq!(manager.active_button(), Some(0));
+            assert_eq!(
+                manager.handle_opening_release(3, 102, 1 << (last_button - 1), ANCHOR, true),
+                HostAction::None
+            );
+            assert!(matches!(
+                manager.state(),
+                InteractionState::RightPressed { chorded: true, .. }
+            ));
+            assert_eq!(
+                manager.handle_opening_release(last_button, 103, 0, ANCHOR, true),
+                HostAction::OpeningFinished {
+                    time: 103,
+                    anchor: None
+                }
+            );
+            assert!(manager.is_idle());
+        }
+        // A secondary press+release before Button 3 release also cancels opening.
+        let mut manager = InteractionManager::new();
+        manager.handle_right_press(100);
+        manager.opening_chord(101);
+        manager.handle_opening_release(2, 102, 4, ANCHOR, true);
+        assert_eq!(
+            manager.handle_opening_release(3, 103, 0, ANCHOR, true),
+            HostAction::OpeningFinished {
+                time: 103,
+                anchor: None
+            }
+        );
+    }
+
+    #[test]
+    fn same_row_activates_dismiss_and_quit_only_on_release() {
+        for (row, quit) in [(0, false), (1, true)] {
+            let mut manager = open();
+            assert_eq!(
+                manager.menu_release(1, MenuHit::Row(row), 99, 0),
+                HostAction::None
+            );
+            manager.menu_press(1, MenuHit::Row(row), 100, 0);
+            assert!(matches!(
+                manager.state(),
+                InteractionState::MenuOpen {
+                    gesture: MenuGesture::ItemPressed { .. },
+                    ..
+                }
+            ));
+            assert_eq!(
+                manager.menu_release(1, MenuHit::Row(row), 101, 0),
+                HostAction::CloseMenu { time: 101, quit }
+            );
+            assert_eq!(
+                manager.menu_release(1, MenuHit::Row(row), 102, 0),
+                HostAction::None
+            );
+        }
+    }
+
+    #[test]
+    fn release_away_and_inert_background_leave_menu_open() {
+        for hit in [MenuHit::Row(1), MenuHit::Outside, MenuHit::Background] {
+            let mut manager = open();
+            manager.menu_press(1, MenuHit::Row(0), 100, 0);
+            assert_eq!(manager.menu_release(1, hit, 101, 0), HostAction::None);
+            assert_eq!(manager.active_button(), None);
+            assert!(matches!(
+                manager.state(),
+                InteractionState::MenuOpen {
+                    gesture: MenuGesture::None,
+                    ..
+                }
+            ));
+        }
+        let mut manager = open();
+        manager.menu_press(1, MenuHit::Background, 100, 0);
+        assert_eq!(
+            manager.menu_release(1, MenuHit::Row(1), 101, 0),
+            HostAction::None
+        );
+    }
+
+    #[test]
+    fn outside_dismiss_consumes_press_motion_and_matching_release() {
+        let mut manager = open();
+        manager.menu_press(1, MenuHit::Outside, 100, 0);
+        assert_eq!(manager.active_button(), Some(1));
+        manager.menu_motion(MenuHit::Row(1), 101);
+        assert!(matches!(
+            manager.state(),
+            InteractionState::MenuOpen {
+                gesture: MenuGesture::OutsidePressed { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            manager.menu_release(1, MenuHit::Row(1), 102, 0),
+            HostAction::CloseMenu {
+                time: 102,
+                quit: false
+            }
+        );
+    }
+
+    #[test]
+    fn right_dismiss_requires_fresh_press_and_consumes_release() {
+        let mut manager = open();
+        assert_eq!(
+            manager.menu_release(3, MenuHit::Outside, 100, 0),
+            HostAction::None
+        );
+        manager.menu_press(3, MenuHit::Row(1), 110, 0);
+        assert_eq!(
+            manager.menu_release(3, MenuHit::Outside, 109, 0),
+            HostAction::None
+        );
+        assert_eq!(
+            manager.menu_release(3, MenuHit::Outside, 111, 0),
+            HostAction::CloseMenu {
+                time: 111,
+                quit: false
+            }
+        );
+    }
+
+    #[test]
+    fn middle_and_wheel_are_ignored_inside_and_outside_without_timer() {
+        for button in [2, 4, 5] {
+            for hit in [MenuHit::Outside, MenuHit::Row(0), MenuHit::Row(1)] {
+                let mut manager = open();
+                manager.menu_press(button, hit, 100, 0);
+                assert_eq!(manager.active_button(), None);
+                assert_eq!(manager.menu_release(button, hit, 101, 0), HostAction::None);
+                assert!(matches!(
+                    manager.state(),
+                    InteractionState::MenuOpen {
+                        gesture: MenuGesture::None,
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn menu_chords_cancel_actions_and_keep_capture_semantics_until_all_up() {
+        for (button, hit) in [
+            (1, MenuHit::Row(1)),
+            (1, MenuHit::Outside),
+            (3, MenuHit::Row(0)),
+        ] {
+            for other in [1, 2, 3, 4, 5] {
+                if other == button {
+                    continue;
+                }
+                let mut manager = open();
+                manager.menu_press(button, hit, 100, 0);
+                manager.menu_press(other, hit, 101, 1 << (button - 1));
+                assert_eq!(manager.active_button(), Some(0));
+                assert_eq!(
+                    manager.menu_release(button, hit, 102, 1 << (other - 1)),
+                    HostAction::None
+                );
+                assert_eq!(manager.menu_release(other, hit, 103, 0), HostAction::None);
+                assert!(matches!(
+                    manager.state(),
+                    InteractionState::MenuOpen {
+                        gesture: MenuGesture::None,
+                        ..
+                    }
+                ));
+                manager.menu_press(1, MenuHit::Row(0), 104, 0);
+                assert_eq!(
+                    manager.menu_release(1, MenuHit::Row(0), 105, 0),
+                    HostAction::CloseMenu {
+                        time: 105,
+                        quit: false
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chord_detected_from_completion_mask_cannot_activate_or_release() {
+        let mut manager = open();
+        manager.menu_press(1, MenuHit::Row(1), 100, 0);
+        assert_eq!(
+            manager.menu_release(1, MenuHit::Row(1), 101, 2),
+            HostAction::None
+        );
+        assert_eq!(manager.active_button(), Some(0));
+        assert_eq!(
+            manager.menu_release(2, MenuHit::Row(1), 102, 0),
+            HostAction::None
+        );
+        manager.menu_press(3, MenuHit::Outside, 103, 2);
+        assert_eq!(
+            manager.menu_release(3, MenuHit::Outside, 104, 2),
+            HostAction::None
+        );
+    }
+
+    #[test]
+    fn menu_freshness_wrap_long_hold_and_cancellation() {
+        let mut manager = open();
+        manager.menu_press(1, MenuHit::Row(1), u32::MAX - 10, 0);
+        assert_eq!(
+            manager.menu_release(1, MenuHit::Row(1), u32::MAX - 11, 0),
+            HostAction::None
+        );
+        assert_eq!(
+            manager.menu_release(1, MenuHit::Row(1), 5, 0),
+            HostAction::CloseMenu {
+                time: 5,
+                quit: true
+            }
+        );
+        manager.menu_press(1, MenuHit::Row(1), 100, 0);
+        manager.confirm_button_held();
+        assert!(matches!(
+            manager.menu_release(1, MenuHit::Row(1), 0x80000100, 0),
+            HostAction::CloseMenu { quit: true, .. }
+        ));
+        manager.menu_press(1, MenuHit::Row(1), 100, 0);
+        manager.cancel(101);
+        assert_eq!(
+            manager.menu_release(1, MenuHit::Row(1), 102, 0),
+            HostAction::None
+        );
+        assert!(manager.is_idle());
+    }
+
+    #[test]
+    fn popup_state_cannot_emit_body_drag_or_click_actions() {
+        let mut manager = open();
+        let bounds = ValidOriginBounds::new(0, 500, 0, 500);
+        assert_eq!(
+            manager.handle_left_press(ANCHOR, (80, 80), 100, ANCHOR),
+            HostAction::None
+        );
+        assert_eq!(
+            manager.handle_motion(Point::new(300, 300), 101, &bounds),
+            HostAction::None
+        );
+        assert_eq!(
+            manager.handle_left_release(ANCHOR, (80, 80), 102, &bounds),
+            HostAction::None
+        );
+        assert_eq!(manager.handle_right_press(103), HostAction::None);
     }
 }

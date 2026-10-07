@@ -1,3 +1,4 @@
+pub mod menu;
 pub mod monitors;
 pub mod pointer;
 pub mod render;

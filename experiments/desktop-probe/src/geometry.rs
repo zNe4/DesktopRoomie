@@ -217,6 +217,184 @@ impl fmt::Display for PlacementError {
 
 impl std::error::Error for PlacementError {}
 
+/// Menu placement is independent of the body's fixed canvas bounds.
+pub fn place_menu(area: Rect, size: Size, anchor: Point, gap: u32) -> Result<Rect, PlacementError> {
+    if size.width == 0 || size.height == 0 {
+        return Err(PlacementError::EmptyUsableArea);
+    }
+    let bounds = compute_valid_origin_bounds(area, size)?;
+    let axis = |anchor: i32, length: u32, min: i32, max: i32| {
+        let preferred = i64::from(anchor) + i64::from(gap);
+        let flipped = i64::from(anchor) - i64::from(gap) - i64::from(length);
+        if (i64::from(min)..=i64::from(max)).contains(&preferred) {
+            preferred
+        } else if (i64::from(min)..=i64::from(max)).contains(&flipped) {
+            flipped
+        } else {
+            preferred.clamp(i64::from(min), i64::from(max))
+        }
+    };
+    let x = axis(anchor.x, size.width, bounds.min_x, bounds.max_x);
+    let y = axis(anchor.y, size.height, bounds.min_y, bounds.max_y);
+    // Validate wire dimensions and origins here so unsupported placement is recoverable.
+    i16::try_from(x).map_err(|_| PlacementError::CoordinateOverflow)?;
+    i16::try_from(y).map_err(|_| PlacementError::CoordinateOverflow)?;
+    u16::try_from(size.width).map_err(|_| PlacementError::CoordinateOverflow)?;
+    u16::try_from(size.height).map_err(|_| PlacementError::CoordinateOverflow)?;
+    Ok(Rect::new(x as i32, y as i32, size.width, size.height))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuHit {
+    Row(usize),
+    Background,
+    Outside,
+}
+
+/// The single-pixel outer border and separator are intentionally inert.
+#[derive(Debug, Clone, Copy)]
+pub struct MenuLayout {
+    pub size: Size,
+    pub rows: [Rect; 2],
+}
+
+impl MenuLayout {
+    pub fn new(width: u32, row_height: u32) -> Result<Self, PlacementError> {
+        if width < 3 || row_height < 3 {
+            return Err(PlacementError::EmptyUsableArea);
+        }
+        let height = row_height
+            .checked_mul(2)
+            .and_then(|h| h.checked_add(3))
+            .ok_or(PlacementError::CoordinateOverflow)?;
+        // Drawing coordinates as well as window dimensions must be representable.
+        i16::try_from(width).map_err(|_| PlacementError::CoordinateOverflow)?;
+        i16::try_from(height).map_err(|_| PlacementError::CoordinateOverflow)?;
+        Ok(Self {
+            size: Size::new(width, height),
+            rows: [
+                Rect::new(1, 1, width - 2, row_height),
+                Rect::new(1, (row_height + 2) as i32, width - 2, row_height),
+            ],
+        })
+    }
+
+    pub fn hit(&self, local: Point) -> MenuHit {
+        let contains = |rect: Rect| {
+            i64::from(local.x) >= i64::from(rect.x)
+                && i64::from(local.y) >= i64::from(rect.y)
+                && i64::from(local.x) < i64::from(rect.x) + i64::from(rect.width)
+                && i64::from(local.y) < i64::from(rect.y) + i64::from(rect.height)
+        };
+        if !contains(Rect::new(0, 0, self.size.width, self.size.height)) {
+            return MenuHit::Outside;
+        }
+        self.rows
+            .iter()
+            .position(|row| contains(*row))
+            .map_or(MenuHit::Background, MenuHit::Row)
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+
+    #[test]
+    fn center_edges_and_four_corners_flip_independently() {
+        let area = Rect::new(10, 48, 400, 300);
+        let size = Size::new(120, 60);
+        for (anchor, expected) in [
+            ((200, 150), (204, 154)),
+            ((10, 150), (14, 154)),
+            ((409, 150), (285, 154)),
+            ((200, 48), (204, 52)),
+            ((200, 347), (204, 283)),
+            ((10, 48), (14, 52)),
+            ((409, 48), (285, 52)),
+            ((10, 347), (14, 283)),
+            ((409, 347), (285, 283)),
+        ] {
+            let rect = place_menu(area, size, Point::new(anchor.0, anchor.1), 4).unwrap();
+            assert_eq!(rect.origin(), Point::new(expected.0, expected.1));
+            assert!(rect.x >= area.x && rect.y >= area.y);
+            assert!(rect.right().unwrap() <= area.right().unwrap());
+            assert!(rect.bottom().unwrap() <= area.bottom().unwrap());
+        }
+    }
+
+    #[test]
+    fn negative_origin_exact_fit_and_final_clamp() {
+        let area = Rect::new(-400, -300, 400, 300);
+        let size = Size::new(120, 60);
+        assert_eq!(
+            place_menu(area, size, Point::new(-1, -1), 4)
+                .unwrap()
+                .origin(),
+            Point::new(-125, -65)
+        );
+        assert_eq!(
+            place_menu(area, area.size(), Point::new(-200, -150), 4).unwrap(),
+            area
+        );
+        assert_eq!(
+            place_menu(area, size, Point::new(i32::MAX, i32::MIN), 4)
+                .unwrap()
+                .origin(),
+            Point::new(-120, -300)
+        );
+    }
+
+    #[test]
+    fn invalid_popup_area_overflow_and_wire_coordinates_are_rejected() {
+        let size = Size::new(120, 60);
+        for area in [
+            Rect::new(0, 0, 119, 60),
+            Rect::new(0, 0, 120, 59),
+            Rect::new(0, 0, 0, 60),
+            Rect::new(i32::MAX, 0, 120, 60),
+            Rect::new(40000, 0, 120, 60),
+        ] {
+            assert!(place_menu(area, size, Point::new(0, 0), 4).is_err());
+        }
+        assert!(place_menu(
+            Rect::new(0, 0, 100000, 100000),
+            Size::new(70000, 60),
+            Point::new(0, 0),
+            4
+        )
+        .is_err());
+        assert!(place_menu(
+            Rect::new(0, 0, 120, 60),
+            Size::new(0, 60),
+            Point::new(0, 0),
+            4
+        )
+        .is_err());
+        assert!(MenuLayout::new(120, u32::MAX).is_err());
+    }
+
+    #[test]
+    fn rows_border_separator_and_exclusive_outer_edges() {
+        let layout = MenuLayout::new(120, 28).unwrap();
+        for (point, hit) in [
+            ((1, 1), MenuHit::Row(0)),
+            ((118, 28), MenuHit::Row(0)),
+            ((1, 30), MenuHit::Row(1)),
+            ((118, 57), MenuHit::Row(1)),
+            ((0, 10), MenuHit::Background),
+            ((119, 10), MenuHit::Background),
+            ((12, 29), MenuHit::Background),
+            ((12, 58), MenuHit::Background),
+            ((-1, 10), MenuHit::Outside),
+            ((120, 10), MenuHit::Outside),
+            ((12, 59), MenuHit::Outside),
+        ] {
+            assert_eq!(layout.hit(Point::new(point.0, point.1)), hit);
+        }
+    }
+}
+
 /// Computes the valid window origin range such that the entire body fits inside `usable`.
 /// Uses wider intermediate arithmetic (i64) and checked conversions to prevent wrapping/overflow.
 pub fn compute_valid_origin_bounds(
