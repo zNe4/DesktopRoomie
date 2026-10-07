@@ -1,0 +1,2338 @@
+PROJECT VANILLA
+ALL IDEAS / DESIGN INVENTORY
+Version 0.1
+Date: 2026-10-04
+
+STATUS
+======
+
+This is NOT a roadmap, priority list, commitment, or final architecture.
+
+It is an idea inventory: a consolidated record of the concepts, design directions,
+experiments, possible systems, workflows, constraints, and examples that have come up
+throughout the Project Vanilla discussions so far.
+
+Some ideas overlap. Some are alternatives. Some may later be rejected. Some have already
+been partially implemented. The purpose here is to preserve the design space before
+turning it into a serious roadmap.
+
+The central rule for reading this document is:
+
+    "An idea being listed here does not mean the project has decided to build it."
+
+======================================================================
+1. CORE VISION
+======================================================================
+
+Project Vanilla is not intended to be "a chatbot with a Vanilla skin."
+
+The larger idea is a persistent character simulation in which Vanilla gradually feels
+like a character who exists continuously across devices and contexts.
+
+Ideas discussed for that experience include:
+
+- Vanilla continues to have state when the user is not actively talking to her.
+- She has physiological needs, mood, activities, habits, memories, routines and a
+  relationship history.
+- She can be observed doing things rather than always waiting for a prompt.
+- She can refuse, delay, ignore, sleep, get distracted, become annoyed, approach,
+  retreat, or otherwise behave without needing to speak.
+- Her state should explain behavior: a response should feel like a consequence of what
+  happened before rather than an isolated generated message.
+- The long-term illusion is continuity, not merely intelligence.
+- A useful north star is:
+      "Vanilla has been here long enough that what she is doing now makes sense because
+       of things that happened before."
+
+The project has also been imagined as having two layers:
+
+1. A private Project Vanilla implementation using the copyrighted NEKOPARA character,
+   assets and corpus owned by the user.
+2. A later public/general engine that is character-agnostic, with the simulation,
+   renderer, services and schemas separated from private character packs/assets.
+
+======================================================================
+2. "ONE VANILLA, MANY BODIES"
+======================================================================
+
+A repeated architectural idea is that there should never be independent copies such as:
+
+- "desktop Vanilla"
+- "phone Vanilla"
+- "chat Vanilla"
+
+Instead, there is one persistent Vanilla identity/state with multiple bodies/interfaces.
+
+Possible bodies/interfaces discussed:
+
+- Linux desktop companion
+- Android room/body
+- Android messages
+- Android notifications
+- voice-message interface
+- future debug/web panel
+- future external integrations
+- possibly other device frontends later
+
+Long-term conceptual model:
+
+    VANILLA CORE
+        |
+        +-- Linux desktop body
+        +-- Android body / room
+        +-- messages / notifications
+        +-- TTS service
+        +-- LLM service
+        +-- image service
+        +-- future integrations
+
+One long-term idea is for a phone to become the authoritative always-available Vanilla
+Core, with the desktop becoming a connected body rather than the source of identity.
+
+A different near-term reality is that the Arch Linux machine remains the main
+development host. The question of which physical device ultimately owns authoritative
+state is intentionally open until battery, Android background execution, storage,
+reliability and synchronization behavior are tested.
+
+======================================================================
+3. HIGH-LEVEL MODULE SEPARATION
+======================================================================
+
+The project has repeatedly moved toward modular separation rather than one giant AI
+process.
+
+Conceptual modules include:
+
+VANILLA CORE / BRAIN
+- personality
+- cognitive state
+- attention
+- decisions
+- needs
+- emotions
+- relationship variables
+- memories
+- activities
+- routines
+- beliefs
+- behavior history
+- event history
+- cooldowns
+- permissions/capabilities
+
+WORLD / SHARED SIMULATION
+- room state
+- time
+- available items
+- other characters
+- environmental events
+- user presence
+- device availability
+- weather abstractions
+- place familiarity
+- shared authoritative facts
+
+NERVOUS SYSTEM / SPINE
+- typed signals
+- routing
+- fast reflexes
+- escalation to conscious processing
+- body reactions that can occur without the Brain handling every event
+
+SENSES
+- eyes
+- ears
+- proprioception/body state
+- location/environment adapters
+- clock/time perception
+- device/world sensors
+
+EFFECTORS
+- muscles / movement
+- hands
+- mouth
+- voice
+- facial expression / ears / tail
+- animations
+
+SERVICES
+- LLM
+- TTS
+- image generation
+- batch-generation jobs
+- storage/synchronization adapters
+
+PLATFORM HOSTS
+- Linux desktop
+- Android
+- possible cloud worker
+- possible debug tools
+
+The general idea is that these pieces communicate through explicit structured
+interfaces/events rather than reaching directly into one another's state.
+
+======================================================================
+4. THE LLM SHOULD NOT OWN VANILLA
+======================================================================
+
+A foundational design idea is to make the LLM a cognitive/language tool, not the
+persistent character database.
+
+The simulation should own durable truth such as:
+
+- needs
+- current mood state
+- relationship state
+- routines
+- activities
+- event history
+- memory records
+- world state
+- known places
+- cooldowns
+- permissions
+- recent behavior
+- persistent summaries
+
+Possible LLM jobs:
+
+- interpret user language
+- propose semantic meanings/events
+- create novel dialogue
+- summarize memories
+- reason over structured state
+- generate offline dialogue candidates
+- help produce character-consistent content
+
+The LLM should not be able to arbitrarily rewrite persistent emotional state or memory
+simply because a generated answer says something happened.
+
+An important distinction is:
+
+    simulation decides what is true
+    senses decide what Vanilla observed
+    Brain decides what Vanilla believes
+    memory decides what remains available later
+    LLM helps reason/speak about the structured result
+
+======================================================================
+5. GROUND TRUTH != OBSERVATION != BELIEF != MEMORY
+======================================================================
+
+A more detailed cognitive architecture idea was developed around epistemic separation.
+
+The computer can know something that Vanilla does not know.
+
+Suggested layers:
+
+GROUND TRUTH
+- actual simulation/world state
+- exact time
+- exact device state
+- exact location category
+- actual event occurrence
+
+OBSERVATION
+- what a sensor reported
+- may be incomplete
+- may be uncertain
+- may be noisy
+- may be stale
+- has source and timestamp
+
+BELIEF
+- Brain's current interpretation of observations
+- has confidence
+- may be wrong
+- may be revised when better observations arrive
+
+MEMORY
+- retained representation of earlier experiences/beliefs/events
+- can be summarized or consolidated
+- does not necessarily equal current truth
+
+METACOGNITION
+- Vanilla may have different certainty levels about what she knows
+- "I think..."
+- "I'm not sure..."
+- surprise when a reliable observation contradicts an earlier belief
+
+Example idea:
+
+Vanilla sleeps.
+
+Her internal/subjective sense of time suggests she slept about an hour.
+
+A reliable clock observation after waking says time went from 07:21 to 14:37.
+
+The Brain revises its belief and may react:
+
+    "I slept seven hours?!"
+
+The important part is not the line itself; it is that the surprise comes from a belief
+update rather than a scripted time check.
+
+======================================================================
+6. UNCERTAIN / PROBABILISTIC SENSES
+======================================================================
+
+Senses were imagined as producing perceptions with uncertainty rather than omniscient
+facts.
+
+Possible observation fields:
+
+- value
+- confidence
+- source
+- timestamp
+- freshness
+- uncertainty
+- optional competing interpretation
+
+Examples:
+
+- sound direction is probably to the left
+- user appears to be near
+- unfamiliar place scent has low familiarity
+- internal estimate says "a while has passed"
+- a sensor has not updated because Vanilla was asleep
+
+This opens the possibility of believable mistakes, stale beliefs, uncertainty and
+revision.
+
+It also preserves the principle:
+
+    computer-available information != Vanilla-known information
+
+======================================================================
+7. NERVOUS SYSTEM / SPINE / REFLEX ARCHITECTURE
+======================================================================
+
+A major idea was to add a nervous "highway" between senses, body and Brain.
+
+Concept:
+
+    sensors
+       |
+       v
+      SPINE
+       | \
+       |  \-- fast body/reflex response
+       |
+       +---- escalation to Brain when appropriate
+
+The Spine can:
+
+- route typed sensory signals
+- perform reflexes
+- control immediate body reactions
+- decide whether/when to wake or escalate to conscious processing
+- allow the body to respond without forcing an LLM/Brain cycle
+
+Example: lifting Vanilla while she sleeps
+
+    body/proprioception detects movement
+        ->
+    Spine/body curls, shifts, twitches, clings or mumbles
+        ->
+    Brain may remain asleep
+        ->
+    event may never enter conscious memory
+
+Example: thunder while sleeping
+
+    ears detect sudden loud sound
+        ->
+    Spine produces immediate startle / ear movement / body contraction
+        ->
+    a slower escalation signal may wake the Brain
+        ->
+    conscious interpretation happens after the reflex
+
+This architecture is meant to make the body feel alive even when conscious cognition is
+inactive.
+
+It also suggests future autonomic systems such as:
+
+- startle
+- balance
+- posture
+- protective movement
+- sleep reflexes
+- arousal/wake thresholds
+- instinctive reactions
+
+======================================================================
+8. SLEEP AS AN ACTUAL SYSTEM STATE
+======================================================================
+
+Sleep was discussed as more than an animation.
+
+Possible consequences of sleep:
+
+- eyes may stop producing observations
+- some senses may become reduced rather than fully disabled
+- beliefs about the world can become stale
+- body/spine reflexes can still function
+- loud/important signals can cross a wake threshold
+- normal events may be ignored
+- events processed only by reflexes may never be encoded as conscious memory
+- waking may trigger requests for fresh observations
+- subjective time and actual time can diverge
+
+Future environmental systems such as thunder/weather could interact with this layered
+sleep model.
+
+======================================================================
+9. MEMORY IDEAS
+======================================================================
+
+Several compatible memory taxonomies have been discussed; they are not yet reconciled
+into one final design.
+
+One proposed brain-oriented hierarchy:
+
+- instant memory
+- short-term memory
+- mid-term memory
+- long-term memory
+
+Another proposed functional hierarchy:
+
+IMMEDIATE MEMORY
+- minutes/hours
+- current conversation/activity context
+
+EPISODIC MEMORY
+- specific noteworthy events
+
+SEMANTIC MEMORY
+- stable learned facts/preferences
+
+EMOTIONAL ASSOCIATIONS
+- patterns that influence responses without necessarily becoming explicit prose memories
+
+Other memory ideas:
+
+- summaries rather than storing/reinjecting entire conversation logs
+- memory importance
+- memory consolidation
+- forgetting/decay
+- retrieval by current context
+- source/confidence metadata
+- events that affect behavior even when not explicitly recalled
+- memory should remain simulation-owned rather than living only in LLM context
+
+======================================================================
+10. RELATIONSHIP MODEL
+======================================================================
+
+Relationship state was imagined as slow-moving and separate from momentary mood.
+
+Possible slow variables:
+
+- familiarity
+- trust
+- attachment
+- comfort
+- conflict residue
+
+Possible design rule:
+
+    mood changes over minutes/hours
+    relationship changes over weeks/months
+
+This prevents a single annoyed moment from rewriting a long-established relationship.
+
+The long-term idea is that a six-month relationship should feel different from week one
+even if the current mood happens to be similar.
+
+======================================================================
+11. NEEDS / PHYSIOLOGY
+======================================================================
+
+Possible physiological state variables:
+
+- hunger
+- thirst
+- tiredness
+- cleanliness
+- boredom
+- energy
+
+Possible Tamagotchi-like activities:
+
+- food
+- drink
+- bath
+- sleep
+- toys
+- play
+- rest
+- attention
+- refusal
+
+Items should ideally have data/properties rather than bespoke hardcoded behavior.
+
+Example concept:
+
+    strawberry:
+        hunger effect
+        happiness effect
+        tags: sweet, fruit
+        preference-learning enabled
+
+This enables items to interact with generic systems such as needs and learned
+preferences.
+
+======================================================================
+12. EMOTIONS / MOOD
+======================================================================
+
+Possible continuous state variables discussed:
+
+- valence / happiness
+- irritation
+- affection
+- anxiety
+- playfulness
+- sociability
+- concern
+- curiosity
+
+Possible transient named states:
+
+- sleepy
+- excited
+- sulking
+- embarrassed
+- lonely
+- annoyed
+- worried
+
+Emotional dynamics ideas:
+
+- inertia
+- bounded stochastic drift
+- event impulses
+- recovery
+- hysteresis
+- cross-variable interaction
+- personality-dependent responses
+
+The goal is to avoid mechanical logic such as:
+
+    hunger >= 75 -> play complaint #12
+
+Instead, the same event can have different effects based on current state and history.
+
+Mood should also not directly map to one TTS emotion label. It can be a prior that helps
+select the desired delivery.
+
+Example:
+
+    state:
+        irritation high
+        affection high
+        energy low
+
+    event:
+        user apologizes
+
+    possible delivery:
+        still sulking
+        quiet
+        restrained
+        slightly softened
+
+======================================================================
+13. BEHAVIOR SELECTION / AGENCY
+======================================================================
+
+Utility AI was proposed as a candidate behavior-selection architecture.
+
+Potential inputs:
+
+- needs
+- mood
+- personality
+- current activity
+- environment
+- time
+- relationship
+- recent actions
+- cooldowns
+- user presence
+- randomness
+
+Output:
+
+- selected behavior/activity
+
+A developer-only explanation/debug view was proposed so strange behavior can be traced.
+
+Example:
+
+    Behavior: refuse_play
+    tiredness > 80       +0.41
+    irritation > 55      +0.19
+    played recently      +0.12
+    affection            -0.08
+    final score           0.64
+
+The desired result is behavior with understandable causes that is still not fully
+predictable.
+
+======================================================================
+14. SILENCE IS BEHAVIOR
+======================================================================
+
+A repeated principle:
+
+    Vanilla does not have to talk whenever something happens.
+
+Nonverbal possibilities include:
+
+- look at cursor
+- ears move
+- tail reacts
+- approach
+- turn away
+- sit nearby
+- leave
+- sniff
+- sleep
+- change idle
+- ignore
+- delay response
+- refuse
+- show concern physically
+- react reflexively
+
+This is intended to prevent the character from feeling like a notification/chat engine.
+
+======================================================================
+15. DESKTOP BODY / SHIMEJI-TAMAGOTCHI IDEAS
+======================================================================
+
+The first visible body is intended for the current Arch Linux / bspwm environment.
+
+Possible basic desktop features:
+
+- transparent window
+- always-on-top behavior
+- sprite rendering
+- screen boundaries
+- basic movement
+- click detection
+- dragging
+- falling/dropping
+- simple state machine
+
+The body should be entertaining even with all AI services disabled.
+
+Possible everyday actions:
+
+- idle
+- walk
+- sit
+- sleep
+- approach
+- leave
+- eat
+- play
+- rest
+- react to touch
+
+======================================================================
+16. ANIMATION ENGINE
+======================================================================
+
+Behavior code should use semantic animation names rather than frame filenames.
+
+Example API:
+
+    play("walk")
+    play("sleep")
+    play("pet_reaction")
+    play("annoyed_idle")
+    play("eat_strawberry")
+
+Possible animation metadata:
+
+- frame timing
+- looping
+- interruptibility
+- direction
+- anchor points
+- collision box
+- transition rules
+
+Longer-term idea: simulation/behavior chooses meaning; renderer chooses frames.
+
+======================================================================
+17. PHYSICAL CURSOR INTERACTION
+======================================================================
+
+The desktop cursor can be treated as a fictional hand.
+
+Possible interactions:
+
+- hover
+- pet
+- poke
+- grab
+- hold
+- drag
+- drop
+- offer an item
+- cursor-following gaze
+
+Repeated actions can escalate rather than repeating one animation.
+
+Example:
+
+    poke 1 -> glance
+    poke 2 -> confusion
+    poke 3 -> annoyance
+    poke 4 -> pushes cursor
+    poke 5 -> walks away
+
+That escalation can depend on current mood/relationship rather than only click count.
+
+======================================================================
+18. VISUAL TARGET / CHARACTER BODY
+======================================================================
+
+The preferred visual target discussed for Vanilla is:
+
+- true chibi Vanilla rather than merely scaling down normal full-body art
+- classic maid outfit design from earlier NEKOPARA volumes
+- preference for the pre-Vol.4 visual feel rather than the newer glossy style
+
+Long-term visual design should eventually be captured in an authoritative Character
+Bible rather than inferred ad hoc.
+
+Character Bible ideas include:
+
+- canonical appearance
+- colors
+- outfit
+- personality
+- speech style
+- mannerisms
+- playfulness
+- patience
+- affection style
+- annoyance/conflict style
+- curiosity
+- independence
+- likes/dislikes
+- things the system must not invent
+
+======================================================================
+19. OFFLINE/PRE-GENERATED DIALOGUE FIRST
+======================================================================
+
+A major design direction is to avoid generating every ambient line live.
+
+Most ordinary ambient dialogue could come from a large local pre-generated library.
+
+Advantages considered:
+
+- zero network latency
+- predictable characterization
+- no cloud/API dependency
+- immediate playback
+- quality can be reviewed before use
+- reused dialogue costs nothing
+- known lines can have prerecorded/generated voice ready
+
+Live LLM + TTS can be reserved for:
+
+- direct conversations
+- genuinely novel circumstances
+- unique messages
+- rare combinations of context
+- lines that can later be reviewed and promoted into the permanent library
+
+======================================================================
+20. DIALOGUE LIBRARY METADATA
+======================================================================
+
+Possible dialogue-record fields:
+
+- text
+- prerecorded/generated audio
+- intent
+- emotion
+- intensity
+- tone
+- conditions
+- exclusions
+- cooldown
+- semantic family
+- animation
+- weight
+
+Example conceptual condition dimensions:
+
+- time of day
+- session length
+- mood
+- energy
+- recent wins/losses
+- ignored interactions
+- repeated clicks
+- long idle periods
+- music
+- weather
+- place return
+- routine anomaly
+
+Goal:
+
+- thousands of character-consistent local reactions without obvious repetition.
+
+======================================================================
+21. OFFLINE DIALOGUE FACTORY
+======================================================================
+
+A batch-generation workflow was proposed:
+
+    scenario matrix
+        ->
+    LLM candidate generation
+        ->
+    character filters
+        ->
+    semantic duplicate detection
+        ->
+    human review
+        ->
+    TTS batch generation
+        ->
+    permanent local dialogue library
+
+The idea is to use cloud/LLMs as content-production tools rather than as the permanent
+runtime for every ambient sentence.
+
+======================================================================
+22. LIVE CONVERSATION
+======================================================================
+
+Possible live pipeline:
+
+    user message
+        ->
+    structured context construction
+        ->
+    LLM
+        ->
+    Japanese response
+        ->
+    TTS
+        ->
+    voice + animation
+
+Potential future streaming:
+
+    generate sentence 1
+        ->
+    TTS sentence 1 starts
+        ->
+    LLM continues sentence 2
+        ->
+    TTS queue follows
+
+Live conversation should not be able to arbitrarily overwrite simulation state.
+
+======================================================================
+23. SEMANTIC EVENT INTERPRETER
+======================================================================
+
+A possible role for the LLM is to translate free language into structured semantic
+events.
+
+Example:
+
+    {
+      rejection: 0.78,
+      insult: 0.31,
+      playful_tone: 0.42,
+      user_affect: irritated
+    }
+
+Vanilla Core, not the LLM, then determines the emotional/relationship consequences.
+
+This could let identical words cause different reactions depending on history/state.
+
+======================================================================
+24. ROUTINES / TIME / HABITS
+======================================================================
+
+Routine learning ideas:
+
+- learn simple temporal patterns first
+- use statistics before machine learning
+- distinguish ordinary time from personally unusual time
+
+Example:
+
+    weekday morning -> usually away
+    evening -> often active
+    01:00+ -> unusual
+
+Potential behavior:
+
+- "late" based on personal history rather than a generic clock threshold
+- react to unusually long absence
+- notice unusually long desktop session
+- recognize a changed routine
+
+======================================================================
+25. RARE EVENTS
+======================================================================
+
+A large library of low-probability events/behaviors was proposed.
+
+Properties:
+
+- rare
+- long cooldowns
+- some depend on unusual combinations of state
+- exact triggers should not be exposed to normal users
+- meant to preserve discovery over months
+
+The creative challenge may be harder than the engineering.
+
+======================================================================
+26. ANDROID / SECOND HOME
+======================================================================
+
+Possible Android Core requirements:
+
+- low idle CPU
+- persistent storage
+- crash-safe state writes
+- background lifecycle resilience
+- battery-aware scheduling
+- event queue
+- service/frontend separation
+
+Possible Android room/front-end scenes:
+
+- room
+- bed
+- food area
+- toys
+- abstract bath area
+- Vanilla's fictional phone
+
+One long-term objective is for Vanilla state to continue advancing even when the desktop
+is completely off.
+
+======================================================================
+27. PHONE <-> DESKTOP SYNCHRONIZATION
+======================================================================
+
+If the phone becomes authoritative, synchronization has to handle:
+
+- temporary disconnection
+- reconnect
+- conflicting inputs
+- event ordering
+- version compatibility
+- schema/state migrations
+- no duplication
+- no rewind
+- no state corruption
+
+The synchronization system should preserve one identity rather than merging two
+independent simulations.
+
+======================================================================
+28. MESSAGES / NOTIFICATIONS
+======================================================================
+
+Possible behaviors:
+
+- send text messages
+- send voice messages
+- send occasional pictures
+- respond after a delay
+- intentionally not respond immediately
+- ask for attention
+- ask for food or interaction
+- reference something that happened earlier
+
+Important design idea:
+
+    anti-annoyance is mandatory
+
+Notifications should feel like character behavior, not an engagement/retention system.
+
+======================================================================
+29. PRIVACY LAYER / SENSOR ABSTRACTION
+======================================================================
+
+Raw private sensor data should stay local when possible.
+
+Possible sensor adapter contract:
+
+- explicit permission
+- local raw processing
+- retention policy
+- fictional abstraction
+- external-sharing policy
+
+Possible real signals:
+
+- time
+- GPS/geofence
+- Wi-Fi
+- motion/device state
+- charging
+- device presence
+- coarse desktop activity
+- current music metadata
+- weather
+
+Possible conversion:
+
+    raw GPS / Wi-Fi
+        ->
+    local place classifier
+        ->
+    place_0041
+    familiarity = 0.08
+    away_duration = medium
+        ->
+    Vanilla perception:
+    "an unfamiliar scent"
+
+The external LLM would receive the fictional perception, not the raw coordinate.
+
+======================================================================
+30. PLACE FAMILIARITY / "SCENT"
+======================================================================
+
+Known places could have explicit labels:
+
+- home
+- work
+- user-defined places
+
+Unknown places could receive anonymous local IDs:
+
+    place_0041
+    visits = 2
+    familiarity = 0.08
+
+Vanilla can perceive this as a scent/familiarity concept.
+
+The user may later teach semantics voluntarily:
+
+    place_0041 -> friend's house
+
+This preserves character-level location awareness without requiring raw coordinates to
+leave the device.
+
+======================================================================
+31. WEATHER / WORLD AWARENESS
+======================================================================
+
+Possible bounded environmental events:
+
+- rain
+- heat
+- cold
+- thunder
+- late night
+- unusually long session
+- user returns
+- device charging
+- desktop available/unavailable
+
+The point is for the world to subtly influence behavior, not for Vanilla to become a
+weather app.
+
+Thunder is especially interesting because it also connects with the Spine/reflex/sleep
+architecture.
+
+======================================================================
+32. FICTIONAL PHONE
+======================================================================
+
+Vanilla could eventually have her own controlled fictional phone.
+
+Possible apps:
+
+- Messages
+- Camera
+- Gallery
+- Weather
+- News
+- "Nekogram"
+- Notes
+- Games
+
+Capabilities should be explicit and auditable.
+
+LLM proposes action intent; application decides whether the capability is authorized and
+executes it.
+
+No unrestricted arbitrary internet control was intended.
+
+======================================================================
+33. CAMERA / GENERATED PICTURES / GALLERY
+======================================================================
+
+Possible image-request architecture:
+
+Vanilla requests semantic intent:
+
+    subject = self
+    location = room
+    activity = eating cake
+    mood = happy
+
+Visual subsystem constructs the actual prompt using:
+
+- canonical character reference
+- outfit
+- room
+- current state
+- pose/expression
+- camera framing
+
+Generated images can enter a persistent gallery with metadata.
+
+Possible uses:
+
+- Vanilla sends pictures
+- pictures become memory hooks
+- gallery can be revisited later
+- visual continuity across generated content
+
+======================================================================
+34. FAKE SOCIAL WORLD / "NEKOGRAM"
+======================================================================
+
+A fictional social environment was proposed to create events that do not originate with
+the user.
+
+Possible contents:
+
+- simulated posts
+- accounts for other characters
+- reactions
+- small events
+- persistent threads
+- things Vanilla later mentions
+
+Purpose:
+
+    Vanilla's world should sometimes produce causes for her mood and behavior that the
+    user did not trigger directly.
+
+======================================================================
+35. CONTROLLED REAL-WORLD INFORMATION
+======================================================================
+
+Possible selected sources:
+
+- weather
+- holidays
+- major local information
+- opt-in topics
+- curated news
+
+The information should ideally become structured world events before Vanilla uses it.
+
+The design explicitly avoids turning Vanilla into an unrestricted autonomous web agent.
+
+======================================================================
+36. DREAMS / AUTONOMOUS NARRATIVE
+======================================================================
+
+Sleep could occasionally synthesize a dream/event record from:
+
+- recent episodic memories
+- current emotional state
+- fictional social events
+- random abstract material
+
+The generation mechanism does not need to be explained to Vanilla.
+
+Dreams can become later conversational hooks rather than sleep only restoring energy.
+
+======================================================================
+37. SHARED WORLD WITH MULTIPLE CHARACTERS
+======================================================================
+
+The eventual general engine was imagined as supporting multiple characters in one
+authoritative simulation.
+
+Concept:
+
+    shared simulation / room
+        +-- Vanilla
+        +-- Chocola
+        +-- Maple
+        +-- other characters
+
+Important rule:
+
+- characters should not be independent chatbots each hallucinating their own version of
+  the room/world
+- they should observe and react to the same authoritative state
+- character identity and interaction context must therefore be preserved in corpus/data
+  work even when the immediate target is Vanilla
+
+This idea also motivates preserving all six main catgirls' data rather than building the
+canonical corpus around Vanilla alone.
+
+======================================================================
+38. PUBLIC CHARACTER-AGNOSTIC ENGINE
+======================================================================
+
+Long-term public architecture idea:
+
+ENGINE
+- simulation
+- state
+- event bus
+- behavior selection
+- memory
+- platform interfaces
+- service interfaces
+- schemas
+
+CHARACTER PACK
+- personality
+- animation assets
+- voice model
+- dialogue library
+- character-specific rules/data
+- private/copyrighted source data when applicable
+
+This would allow Project Vanilla itself to remain private while the reusable system is
+generic.
+
+======================================================================
+39. RUST AS A MEANINGFUL CORE LANGUAGE
+======================================================================
+
+The user wanted Rust to be used meaningfully rather than merely added for novelty.
+
+Possible Rust responsibilities discussed:
+
+- portable core state
+- typed events
+- simulation
+- memory/state structures
+- capabilities
+- provider interfaces
+- async work
+- channels
+- persistence
+- IPC
+- platform-neutral logic
+
+Concept-to-Rust mappings that were discussed:
+
+- Emotion -> enums
+- Observation -> enum variants with associated data
+- BrainState -> structs
+- senses -> traits
+- uncertain value -> Option or custom confidence type
+- failures -> Result
+- memories -> Vec / HashMap / indexed stores
+- nervous signals -> channels
+- organs/subsystems -> modules
+- persistence -> serialization
+- platform bridges -> FFI / IPC
+- asynchronous providers -> async/await
+
+No requirement was established that every subsystem must be Rust. A modular multi-
+language architecture remains possible.
+
+======================================================================
+40. RUST QUEST AS A SEPARATE LEARNING TOOL
+======================================================================
+
+A separate development/learning idea emerged because the user wants to learn Rust while
+building toward Project Vanilla.
+
+Rust Quest is envisioned as:
+
+- offline
+- terminal-based
+- used on real Arch Linux + Neovim + terminal
+- no internet during normal play
+- no LLM/API/browser during normal play
+- missions/exercises written in Rust
+- game shell can initially be implemented in another language if needed
+- tracks failures/strengths
+- XP/progression
+- mastery/telemetry
+- future adaptive quest packs generated after bringing reports back to ChatGPT
+- Vanilla-themed examples can teach architecture concepts without secretly becoming
+  production Vanilla code
+
+Possible teaching mappings:
+
+- Brain/senses -> modules and traits
+- emotions -> enums
+- observations -> associated data
+- memory -> collections
+- errors -> Result
+- uncertainty -> Option/custom types
+- nervous-system signaling -> channels
+- persistence -> serde
+- async providers -> async
+- later rewrite parts of Rust Quest itself in Rust
+
+This is a companion learning project, not the actual Vanilla runtime.
+
+======================================================================
+41. CORPUS AS A FOUNDATIONAL ASSET
+======================================================================
+
+One of the highest-value early ideas was to recover exact script-to-voice relationships
+from NEKOPARA data rather than transcribing voices with STT.
+
+General pipeline:
+
+    extracted scenario/script data
+        +
+    voice/audio assets
+        ->
+    engine-specific parsers
+        ->
+    exact speaker + Japanese text + voice reference
+        ->
+    canonical corpus
+
+This became a major implemented direction, but its design ideas remain important:
+
+- source text is authoritative when recoverable
+- no Whisper/STT as primary mapper
+- raw source fields are preserved
+- normalized fields are separate
+- full dialogue sequence/context is preserved before character filtering
+- paths are portable/root-relative
+- audio identity is resolved conservatively
+- ambiguous/missing assets stay explicit
+- no silent substitution
+- adult provenance is explicit
+- multi-speaker/multi-voice material stays canonical even when unusable for clean TTS
+
+Engine adapters:
+
+- CatSystem2 for Vol.3
+- KiriKiri/FreeMote-derived data for the other games
+
+The general architectural lesson is:
+
+    engine-specific import adapters
+        ->
+    one shared canonical schema
+
+======================================================================
+42. CANONICAL CORPUS RICHNESS
+======================================================================
+
+Possible long-term canonical utterance information includes:
+
+- stable ID
+- game
+- engine
+- scene
+- source entry index
+- character identity
+- raw speaker
+- displayed speaker
+- localized speaker
+- raw Japanese
+- normalized display Japanese
+- normalized spoken Japanese
+- localization text
+- voice IDs
+- voice paths
+- duration
+- adult provenance
+- multi-voice status
+- audio class
+- previous line
+- next line
+- source script/localization/archive
+- potential characters present
+- expression
+- pose
+- BGM/SFX context
+- quality/audit metadata
+- emotional annotations later
+
+The rich corpus is intended to support more than TTS:
+
+- style study
+- Character Bible construction
+- emotion analysis
+- contextual dialogue examples
+- relationship analysis
+- multi-character interaction research
+- reference retrieval
+- future animation/expression alignment
+
+======================================================================
+43. SOURCE IMMUTABILITY / PROVENANCE
+======================================================================
+
+A persistent data-engineering principle:
+
+- extracted originals stay immutable/read-only
+- repairs happen on explicit copies
+- raw fields stay preserved
+- normalized interpretations are separate
+- known anomalies remain auditable
+- source paths/provenance are retained
+- no guessed speaker/audio substitutions
+- no destructive cleanup merely to make reports look clean
+
+This matters because future models may need information that an early exporter considered
+irrelevant.
+
+======================================================================
+44. TTS DATA SHOULD HAVE MULTIPLE USES
+======================================================================
+
+The curated Vanilla audio work introduced explicit use categories rather than one binary
+"training/not training" decision.
+
+Possible/implemented uses:
+
+SPEECH
+- material allowed into speech TTS fine-tuning
+
+REFERENCE
+- material suitable as a voice/style reference
+
+REACTION
+- nonverbal/onomatopoeic/useful companion sound that may be directly played
+
+One clip can potentially have multiple uses.
+
+Derivatives can have different uses from the original source.
+
+Concrete design example:
+
+- one source contains spoken material plus sniffing/onomatopoeia
+- split into separate derivatives
+- speech portion can serve speech/reference
+- nonverbal portion becomes reaction-only
+- neither useful portion needs to be thrown away
+
+This is intended to preserve valuable character performance rather than optimizing only
+for conventional TTS.
+
+======================================================================
+45. EXPRESSIVE AUDIO SHOULD NOT BE AUTOMATICALLY DISCARDED
+======================================================================
+
+Potentially valuable categories include:
+
+- sleepy speech
+- happy speech
+- annoyed speech
+- excited speech
+- soft speech
+- whispered/quiet delivery
+- dramatic pauses
+- laughter embedded in spoken lines
+- nonverbal reactions
+- onomatopoeia
+
+The project wants expressive range, so a "perfect neutral studio voice only" filter could
+destroy exactly the material later needed for emotional TTS.
+
+======================================================================
+46. LONG PAUSES / SILENCE POLICY IDEA
+======================================================================
+
+Silence has different meanings.
+
+Leading silence:
+- generally safe to trim later
+- should not automatically reject a clip
+
+Trailing silence:
+- generally safe to trim later
+- should not automatically reject a clip
+
+Internal silence:
+- may be real prosody
+- may be dramatic delivery
+- may be engine/runtime gap
+- may represent two utterances
+- should not be removed blindly
+
+Possible audit measurements:
+
+- duration
+- leading silence
+- trailing silence
+- longest internal silence
+- internal silence count
+- total silence
+- silence ratio
+- RMS
+- peak
+- clipping
+- non-silent region count
+
+The philosophy is distribution-first:
+
+    measure first
+    inspect outliers
+    choose thresholds from real data
+    do not impose arbitrary universal TTS thresholds
+
+======================================================================
+47. HUMAN REVIEW TOOLING
+======================================================================
+
+The corpus workflow also inspired the idea of a local review GUI/reporting system.
+
+Useful review features:
+
+- play audio
+- loop/replay
+- Japanese text
+- localization/context
+- previous/next lines
+- pause metrics
+- excerpt/split decisions
+- explicit uses: speech/reference/reaction
+- tags
+- revision history
+- manual overrides
+- per-excerpt decisions
+- sortable suspiciousness
+- export/review reports
+
+A core policy discussed:
+
+    unflagged material is provisionally usable
+    explicit/manual decisions override automatic policy
+
+======================================================================
+48. TTS MODEL OPTIONS THAT WERE CONSIDERED
+======================================================================
+
+Several Japanese voice-cloning/TTS approaches were discussed as candidates rather than
+all being committed choices:
+
+GPT-SoVITS
+- strong fit for Japanese
+- zero-shot voice cloning
+- fine-tuning
+- reference-conditioned delivery
+- multiple model generations considered
+
+GPT-SoVITS v5
+- considered especially for strong zero-shot speaker similarity
+- not the main fine-tune path discussed
+
+GPT-SoVITS v2Pro / v2ProPlus
+- attractive for fine-tuning
+- considered more forgiving of game/compressed audio
+- v2ProPlus became the first concrete experiment candidate
+
+GPT-SoVITS v4
+- considered as a possible higher-quality experiment if source audio quality supports it
+
+Fish Audio S2
+- discussed as a strong zero-shot challenger
+
+CosyVoice
+- discussed as another modern multilingual/Japanese option
+
+XTTS-v2
+- discussed as a mature baseline/control rather than necessarily the final choice
+
+General model-selection idea:
+
+    zero-shot bake-off first
+    fine-tune only if fine-tuning improves actual results
+
+======================================================================
+49. TTS SHOULD BE REFERENCE-CONDITIONED / STYLE-AWARE
+======================================================================
+
+Rather than baking one average emotional voice into one model, an important design idea
+is to maintain a reference bank.
+
+Possible references:
+
+- neutral
+- soft
+- sleepy
+- happy
+- annoyed
+- excited
+- embarrassed
+- whisper/quiet
+- other discovered Vanilla-specific deliveries
+
+At runtime:
+
+    text
+    + desired delivery
+    + current state
+        ->
+    reference retrieval
+        ->
+    TTS
+
+The companion can select a reference that matches current delivery.
+
+This can preserve performance diversity even after speaker fine-tuning.
+
+======================================================================
+50. EXPRESSION ATLAS
+======================================================================
+
+A possible future annotation layer:
+
+- neutral
+- deadpan
+- soft
+- content
+- playful
+- teasing
+- embarrassed
+- flustered
+- sulking
+- mildly annoyed
+- angry
+- concerned
+- sleepy
+- excited
+- surprised
+- sad
+- affectionate
+
+Possible continuous/technical fields:
+
+- valence
+- arousal
+- intensity
+- pace
+- voice quality
+- usable as reference
+
+Important: early technical reference ranking should not automatically guess emotions.
+Emotion annotation can be a later human-assisted task.
+
+======================================================================
+51. TTS SERVICE ABSTRACTION
+======================================================================
+
+Possible stable API:
+
+    speak(
+        text,
+        emotion,
+        intensity,
+        energy,
+        optional_reference_constraints
+    )
+
+The rest of Project Vanilla should not care whether the backend is:
+
+- local RTX 3050
+- cloud GPU
+- Google Colab
+- Android/remote service
+- a later different TTS model
+
+This keeps the simulation independent from one specific TTS implementation.
+
+======================================================================
+52. CURRENT FIRST TRAINING EXPERIMENT IDEA
+======================================================================
+
+One concrete first-training design was developed around GPT-SoVITS v2ProPlus.
+
+Model-specific package ideas:
+
+- portable audio directory
+- train list
+- holdout list
+- reference manifest
+- reaction manifest
+- checksums
+- package verifier
+- helper to turn relative paths into machine-specific absolute lists
+- original Japanese model transcripts
+- no ASR
+
+Current first package context:
+
+- approximately 1,400 model-usable speech clips
+- deterministic 60-clip holdout
+- approximately 1,340 training clips
+- roughly 5,963 seconds of train audio
+- 12 fixed references
+- reaction material kept separate
+
+These numbers are implementation state, not a universal design requirement.
+
+======================================================================
+53. TRAINING AS CONTROLLED EXPERIMENT
+======================================================================
+
+Training was framed as an experiment rather than "train until latest epoch and accept it."
+
+Ideas:
+
+- zero-shot baseline first
+- short smoke training
+- periodic checkpoints
+- fixed Japanese test sentences
+- fixed reference clips
+- same inference settings across comparisons
+- compare speaker similarity, pronunciation, stability, artifacts, pacing and expressive
+  range
+- latest checkpoint is not automatically best
+
+First discussed v2ProPlus schedule:
+
+SMOKE
+- SoVITS 2 epochs
+- GPT 3 epochs
+
+MAIN
+- SoVITS 8 epochs
+- save at roughly 4/8
+- GPT 15 epochs
+- save at roughly 5/10/15
+
+Comparison grid idea:
+
+- S4 + G5
+- S4 + G10
+- S4 + G15
+- S8 + G5
+- S8 + G10
+- S8 + G15
+
+Possible outcomes:
+
+- fine-tune clearly improves Vanilla -> keep it
+- zero-shot is already better -> keep references, skip needless training
+- identity improves but expression collapses -> earlier checkpoint / less training
+- identity remains insufficient -> compare another model rather than blindly sweeping
+  hyperparameters
+
+======================================================================
+54. BURST CLOUD TRAINING
+======================================================================
+
+Cloud compute was imagined as burst capacity rather than a permanent dependency.
+
+AWS training idea:
+
+- private S3 staging bucket
+- encrypted storage
+- GPU EC2 rented only for the experiment
+- g5.xlarge / A10G class machine as first candidate
+- private SSH access
+- no public Gradio ports
+- pinned GPT-SoVITS commit
+- train
+- upload checkpoints/results
+- download/verify locally
+- terminate instance
+
+General principle:
+
+    cloud can accelerate training
+    cloud should not become the authoritative source of Vanilla's identity/state
+
+======================================================================
+55. GOOGLE COLAB / DRIVE GENERATION IDEA
+======================================================================
+
+After training, a separate generation workflow was proposed around Google Colab and
+Google Drive.
+
+Possible persistent Drive layout:
+
+    ProjectVanilla/
+      tts/
+        vanilla/
+          version/
+            weights/
+            references/
+            requests/
+            outputs/
+
+Colab session idea:
+
+    mount Drive
+        ->
+    clone/install pinned GPT-SoVITS
+        ->
+    copy model weights/reference WAVs into /content
+        ->
+    generate audio
+        ->
+    write result locally
+        ->
+    copy output + metadata back to Drive
+
+Drive is persistent; the Colab VM is disposable.
+
+======================================================================
+56. COLAB REQUEST QUEUE
+======================================================================
+
+Possible request file:
+
+    {
+      request_id: ...,
+      text: Japanese text,
+      reference: sleepy,
+      language: ja
+    }
+
+Possible workflow:
+
+    Arch writes request
+        ->
+    upload/sync to Drive
+        ->
+    running Colab notebook processes pending requests
+        ->
+    generate WAV
+        ->
+    write WAV + metadata to Drive
+        ->
+    Arch syncs output down
+
+A notebook helper such as:
+
+    process_pending_requests()
+
+could process batches.
+
+======================================================================
+57. RCLONE / DRIVE ARCHIVE
+======================================================================
+
+Google Drive was also imagined as both:
+
+- transport between Arch and Colab
+- archive of generated audio/models/references
+
+Arch can use rclone to:
+
+- upload requests
+- pull generated outputs
+- sync archives
+
+This avoids opening inbound network access to the home machine.
+
+======================================================================
+58. COLAB IS NOT AN ALWAYS-ON SERVER
+======================================================================
+
+A specific architectural caution:
+
+Colab can be useful for:
+
+- batch generation
+- occasional on-demand generation
+- checkpoint testing
+- cloud inference experiments
+- building speech libraries
+
+But the final live companion should not depend on Colab responding with low latency 24/7.
+
+Possible long-term hierarchy:
+
+FAST PATH
+- local inference on RTX 3050 if practical
+
+CLOUD/BATCH PATH
+- Colab or another temporary GPU for expensive/batch jobs
+
+The local-inference capability should be measured after training because inference is
+much cheaper than training.
+
+======================================================================
+59. LOCAL RTX 3050 AS POSSIBLE LIVE VOICE BACKEND
+======================================================================
+
+The current laptop GPU is only 6 GB VRAM, but one design idea is to test whether the
+final fine-tuned TTS model can still run one-at-a-time locally.
+
+Measurements to collect:
+
+- load time
+- VRAM
+- RAM
+- first-audio latency
+- real-time factor
+- model startup cost
+- quality
+- failure modes
+
+If usable, local speech is preferable for the live companion because it removes cloud
+latency and availability dependence.
+
+======================================================================
+60. REACTION AUDIO LIBRARY
+======================================================================
+
+The curation work suggested keeping nonverbal character audio as a first-class resource.
+
+Possible direct-play reaction classes:
+
+- sniff
+- laugh
+- breath
+- sleepy sound
+- surprise
+- small cry
+- exertion
+- hesitation
+- onomatopoeia
+
+Instead of synthesizing every tiny sound, Project Vanilla could directly play authentic
+reaction clips when appropriate.
+
+This library can be separate from speech TTS training.
+
+======================================================================
+61. AUDIO GENERATION ARCHIVE / REUSABLE LIBRARY
+======================================================================
+
+A generated line does not necessarily have to be ephemeral.
+
+Possible workflow:
+
+    novel line generated live
+        ->
+    save audio + text + state/context metadata
+        ->
+    later review
+        ->
+    promote high-quality result into local permanent dialogue library
+
+Over time, expensive live generation can create more offline assets.
+
+======================================================================
+62. VOICE + ANIMATION COORDINATION
+======================================================================
+
+Longer-term voice output should interact with behavior rather than merely play a WAV.
+
+Possible coordinated fields:
+
+- semantic intent
+- voice reference/delivery
+- animation
+- facial expression
+- interruptibility
+- speaking state
+- post-speech transition
+
+This links dialogue, TTS and the body.
+
+======================================================================
+63. WORLD EVENT BUS
+======================================================================
+
+A shared event bus has been repeatedly implied in the architecture.
+
+Possible event categories:
+
+- user_interaction
+- body_signal
+- sensor_observation
+- world_change
+- need_change
+- emotion_impulse
+- relationship_event
+- memory_event
+- behavior_selected
+- speech_requested
+- speech_finished
+- animation_finished
+- device_connected/disconnected
+- message_received
+- place_changed
+- weather_changed
+
+Typed events are especially attractive for a Rust core.
+
+======================================================================
+64. SIMULATION CLOCK / SUBJECTIVE TIME
+======================================================================
+
+The core needs a simulation clock independent of LLM calls.
+
+Ideas:
+
+- update needs over real elapsed time
+- model sleep/wake
+- schedule routines
+- cooldowns
+- delayed messages
+- rare events
+- relationship changes over long periods
+- subjective time estimates can differ from exact clock
+
+This also helps the simulation advance while no frontend is visible.
+
+======================================================================
+65. DEBUGGING / OBSERVABILITY
+======================================================================
+
+Developer visibility was considered important because emergent systems can otherwise be
+impossible to tune.
+
+Possible debug panels:
+
+- needs
+- mood
+- relationship variables
+- current activity
+- selected utility behavior
+- candidate behavior scores
+- recent events
+- beliefs/confidence
+- sensor freshness
+- memory retrievals
+- TTS/reference choice
+- cooldowns
+- current world state
+- sync status
+
+Normal user experience should hide these meters eventually.
+
+======================================================================
+66. FINAL POLISH / MAKING THE MACHINERY DISAPPEAR
+======================================================================
+
+Long-term polish tasks imagined:
+
+- hide normal meters
+- communicate needs/state through behavior and animation
+- reduce repetitive dialogue
+- tune emotional constants
+- tune utility curves
+- tune delays
+- tune interruption rules
+- improve emotional reference selection
+- reduce LLM verbosity
+- improve memory relevance
+- improve long-term pacing
+- add many tiny physical interactions
+- make silence useful
+- make refusal natural
+- make rare events actually rare
+
+The final illusion depends on many small details rather than one breakthrough model.
+
+======================================================================
+67. FIRST PLAYABLE VERSION IDEA
+======================================================================
+
+A deliberately small first playable Vanilla was proposed.
+
+Possible contents:
+
+- transparent Linux desktop body
+- a few animations
+- drag/drop
+- pet/poke
+- idle/walk/sit/sleep
+- a handful of simple needs
+- persistent local state
+- roughly 50-200 prerecorded/generated lines
+- experimental local TTS command
+- debug panel
+
+Explicitly not required for this first playable version:
+
+- Android
+- location
+- fake social media
+- long-term memory
+- autonomous Internet
+
+The idea is that every major milestone should leave a usable/fun Vanilla rather than
+building infrastructure for years before anything is playable.
+
+======================================================================
+68. REPOSITORY / CODE ORGANIZATION IDEAS
+======================================================================
+
+Possible generic repository split:
+
+    project-vanilla/
+      docs/
+      tools/
+        asset-inventory/
+        script-parser/
+        voice-matcher/
+        dataset-builder/
+      core/
+        vanilla-core/
+      desktop/
+        linux-companion/
+      mobile/
+        android/
+      services/
+        tts/
+        llm/
+        images/
+      data-schemas/
+
+Private copyrighted assets live outside the public/general codebase.
+
+Potential private/local areas:
+
+- extracted NEKOPARA files
+- canonical copyrighted dialogue corpus
+- curated audio
+- trained private character models
+- private generated assets if desired
+
+======================================================================
+69. PRIVACY / COPYRIGHT IDEAS
+======================================================================
+
+Repeated constraints:
+
+- legally owned game assets can be processed privately
+- do not publish extracted copyrighted game audio/dialogue
+- do not put those assets in a public Git repository
+- tooling/code can be public or private separately
+- canonical corpus is also copyrighted content and should be treated as private
+- model-specific cloud packages should be temporary/private
+- cloud state is not authoritative
+- private raw sensor data should not automatically be sent to external models
+- explicit permissions should govern future sensor/integration capabilities
+
+======================================================================
+70. MODEL / PROVIDER ABSTRACTION
+======================================================================
+
+The project should avoid tying core logic directly to one:
+
+- LLM provider
+- TTS model
+- image generator
+- cloud service
+- device
+
+Possible interface mindset:
+
+    simulation asks for capability
+        ->
+    provider/service adapter performs it
+        ->
+    structured result returns
+
+This makes it easier to replace NanoGPT/other LLM routers, GPT-SoVITS, local inference,
+cloud inference, etc. without rewriting the character simulation.
+
+======================================================================
+71. "SYSTEM KNOWS MORE THAN VANILLA" AS A GENERAL PRINCIPLE
+======================================================================
+
+This principle applies beyond sensors.
+
+Examples:
+
+- system knows exact clock; Vanilla has subjective time
+- system knows precise coordinate; Vanilla knows a scent/familiarity abstraction
+- system knows internal utility scores; Vanilla experiences an urge/refusal
+- system knows why an event was generated; Vanilla experiences it as part of her world
+- system knows hidden rare-event triggers; Vanilla does not
+- system knows image-generation implementation; Vanilla experiences a photo/gallery
+- system knows a message queue exists; Vanilla experiences sending/receiving messages
+
+This supports immersion without requiring the character to be modeled as omniscient.
+
+======================================================================
+72. POSSIBILITY OF AUTONOMOUS LIFE WITHOUT CONSTANT AI CALLS
+======================================================================
+
+The most important systems should continue to work with:
+
+- no LLM
+- no cloud
+- no network
+- no user message
+
+That includes:
+
+- needs
+- sleep
+- activities
+- moods
+- routines
+- idle animations
+- simple decisions
+- reflexes
+- direct reaction audio
+- prerecorded dialogue
+- cooldowns
+- rare events
+- memory/state persistence
+
+LLMs/cloud services are accelerators for richness, not the heartbeat of Vanilla.
+
+======================================================================
+73. OPEN DESIGN QUESTIONS PRESERVED FOR THE FUTURE ROADMAP
+======================================================================
+
+The conversations deliberately left many choices open.
+
+Examples:
+
+- Which device ultimately owns authoritative state?
+- How much of the core should be Rust versus another language?
+- Which TTS model eventually wins after listening tests?
+- How should memory taxonomies be reconciled?
+- How complex should the Spine/reflex simulation become?
+- How much uncertainty should sensors model?
+- Which needs are fun rather than annoying?
+- Which mood variables are actually necessary?
+- Utility AI versus other behavior-selection approaches?
+- How much live LLM generation is desirable?
+- How aggressively should generated dialogue be promoted into the offline library?
+- Which emotion/reference taxonomy is useful in practice?
+- Can the RTX 3050 run the chosen TTS model comfortably?
+- Should cloud generation be Colab, another GPU service, or both?
+- Which phone should eventually host the Core?
+- How should cross-device conflict resolution work?
+- Which sensors are worth adding?
+- How should place familiarity decay/evolve?
+- How should dreams affect memory/state?
+- How much fictional social-world activity is enough to feel alive without becoming
+  noise?
+- How should multiple characters share one room/world?
+- How much of the private Vanilla implementation should be generalized into the public
+  engine?
+
+These questions belong in the later roadmap/design phase rather than being prematurely
+settled by this inventory.
+
+======================================================================
+74. OVERALL IDEA GRAPH
+======================================================================
+
+A compact way to see the whole design space:
+
+                            REAL WORLD / DEVICE WORLD
+                          time, weather, user, devices
+                                      |
+                                      v
+                         LOCAL PRIVACY / SENSOR LAYER
+                                      |
+                                      v
+                         OBSERVATIONS WITH UNCERTAINTY
+                                      |
+                     +----------------+----------------+
+                     |                                 |
+                     v                                 v
+                  SPINE                           VANILLA BRAIN
+          reflex / body routing             beliefs / memory / state
+                     |                                 |
+                     v                                 v
+              BODY / ANIMATION <------ BEHAVIOR / DECISION ENGINE
+                     |                                 |
+                     +----------------+----------------+
+                                      |
+                          semantic speech / action
+                                      |
+                      +---------------+---------------+
+                      |               |               |
+                      v               v               v
+                 DIALOGUE LIB       LIVE LLM      OTHER SERVICES
+                      |               |               |
+                      +-------+-------+-------+-------+
+                              |
+                              v
+                        VOICE SERVICE
+                 reference-conditioned TTS
+                              |
+                              v
+                     SPEECH / REACTION AUDIO
+
+Persistent systems around all of this:
+
+- simulation clock
+- world state
+- relationship
+- needs
+- emotion
+- routines
+- memory
+- event history
+- item system
+- permissions
+- capability layer
+- persistence
+- device sync
+- debug/observability
+
+Possible physical frontends:
+
+- Linux desktop
+- Android room
+- messages/notifications
+- future generic frontends
+
+Possible compute backends:
+
+- local laptop
+- Android device
+- temporary AWS GPU
+- temporary Colab GPU
+- other replaceable cloud workers
+
+======================================================================
+75. FINAL NOTE
+======================================================================
+
+The recurring idea behind Project Vanilla is not maximum AI complexity.
+
+It is coherent continuity.
+
+The project repeatedly favors:
+
+- persistent deterministic state over hidden LLM state
+- exact source data over guessed data
+- typed modules over one monolithic agent
+- local/offline behavior over constant cloud dependency
+- privacy abstraction over raw sensor exposure
+- reusable libraries over regenerating everything
+- genuine uncertainty over fake omniscience
+- reflex/body behavior over forcing every event through conscious cognition
+- character behavior over notification spam
+- slow relationship change over instant emotional rewriting
+- source provenance over destructive cleanup
+- voice diversity over one flattened neutral model
+- milestone-by-milestone playability over years of invisible infrastructure
+
+This document intentionally stops before turning those ideas into priorities,
+dependencies, milestones, or final technical decisions.
