@@ -73,6 +73,10 @@ impl InteractionManager {
         matches!(self.state, InteractionState::Dragging { .. })
     }
 
+    pub fn is_idle(&self) -> bool {
+        matches!(self.state, InteractionState::Idle)
+    }
+
     /// Handles a left mouse button press on the window.
     pub fn handle_left_press(
         &mut self,

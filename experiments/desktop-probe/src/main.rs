@@ -321,6 +321,19 @@ fn main() {
             }
         }
 
+        // Check expired confirmation deadlines alongside duration deadline, before processing another batch
+        check_confirmation_timeout(
+            &conn,
+            screen.root,
+            &mut confirmation_deadline,
+            &mut probe_window,
+            &mut awaiting_final_confirmation,
+            &mut interaction,
+            &mut pointer_tracker,
+            &renderer,
+            &mut pending_move,
+        );
+
         // 1. Drain a bounded batch of available X11 events
         let event_batch = match drain_events_bounded(&mut buffered_event, MAX_EVENT_BATCH, || {
             conn.poll_for_event()
@@ -571,6 +584,7 @@ fn main() {
                                                 Ok(GrabStatus::SUCCESS) => {
                                                     pointer_tracker.set_grabbed(true);
                                                     interaction.on_grab_acquired();
+                                                    awaiting_final_confirmation = None;
                                                     println!(
                                                         "[INPUT] ButtonPress: button=1 (Left) at ({}, {}) -> pointer capture acquired",
                                                         ev.event_x, ev.event_y
@@ -878,94 +892,18 @@ fn main() {
             }
         }
 
-        // Check if movement confirmation deadline has expired
-        if let Some(dl) = confirmation_deadline {
-            if Instant::now() >= dl {
-                let live_origin = match probe_window.query_actual_root_origin(&conn, screen.root) {
-                    Ok(orig) => orig,
-                    Err(e) => {
-                        fatal_host_error(
-                            &format!("Failed to query root origin on confirmation timeout: {}", e),
-                            &conn,
-                            &mut pointer_tracker,
-                            &renderer,
-                            &probe_window,
-                        );
-                    }
-                };
-
-                let size = Size::new(probe_window.width as u32, probe_window.height as u32);
-                let rec = probe_window.reconcile_live_snapshot(live_origin, size);
-                confirmation_deadline = None;
-
-                match rec {
-                    ConfigureReconciliation::Confirmed { origin, .. } => {
-                        if let Some(final_target) = awaiting_final_confirmation.take() {
-                            if origin == final_target {
-                                println!("[INPUT] Final placement confirmed by WM at {}", origin);
-                            } else {
-                                eprintln!(
-                                    "[WARN] Final placement adjusted by WM to {} (expected {}); cancelling interaction.",
-                                    origin, final_target
-                                );
-                                if let HostAction::ReleaseGrab { time } =
-                                    interaction.cancel_on_wm_mismatch(x11rb::CURRENT_TIME)
-                                {
-                                    if let Err(e) = pointer_tracker.release_if_held(&conn, time) {
-                                        fatal_host_error(
-                                            &format!(
-                                                "Failed to release pointer capture on mismatch cancellation: {}",
-                                                e
-                                            ),
-                                            &conn,
-                                            &mut pointer_tracker,
-                                            &renderer,
-                                            &probe_window,
-                                        );
-                                    }
-                                }
-                                pending_move = None;
-                                probe_window.cancel_in_flight_moves();
-                            }
-                        }
-                    }
-                    ConfigureReconciliation::GenuineMismatch {
-                        requested,
-                        confirmed,
-                    } => {
-                        eprintln!(
-                            "[WARN] Movement confirmation timed out: requested {}, confirmed {}; cancelling interaction.",
-                            requested, confirmed
-                        );
-                        if let Some(final_target) = awaiting_final_confirmation.take() {
-                            eprintln!(
-                                "[WARN] Final placement adjusted by WM to {} (expected {})",
-                                confirmed, final_target
-                            );
-                        }
-                        if let HostAction::ReleaseGrab { time } =
-                            interaction.cancel_on_wm_mismatch(x11rb::CURRENT_TIME)
-                        {
-                            if let Err(e) = pointer_tracker.release_if_held(&conn, time) {
-                                fatal_host_error(
-                                    &format!(
-                                        "Failed to release pointer capture on mismatch cancellation: {}",
-                                        e
-                                    ),
-                                    &conn,
-                                    &mut pointer_tracker,
-                                    &renderer,
-                                    &probe_window,
-                                );
-                            }
-                        }
-                        pending_move = None;
-                        probe_window.cancel_in_flight_moves();
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // Check if movement confirmation deadline has expired before blocking
+        check_confirmation_timeout(
+            &conn,
+            screen.root,
+            &mut confirmation_deadline,
+            &mut probe_window,
+            &mut awaiting_final_confirmation,
+            &mut interaction,
+            &mut pointer_tracker,
+            &renderer,
+            &mut pending_move,
+        );
 
         // Compute timeout until duration limit or confirmation deadline
         let mut timeout_ms = -1;
@@ -1065,6 +1003,108 @@ where
         }
     }
     Ok(batch)
+}
+#[allow(clippy::too_many_arguments)]
+fn check_confirmation_timeout_with<F, R>(
+    confirmation_deadline: &mut Option<Instant>,
+    probe_window: &mut ManagedProbeWindow,
+    awaiting_final_confirmation: &mut Option<Point>,
+    interaction: &mut InteractionManager,
+    pending_move: &mut Option<Point>,
+    mut query_fn: F,
+    mut release_grab_fn: R,
+) -> Result<bool, Box<dyn std::error::Error>>
+where
+    F: FnMut() -> Result<Point, Box<dyn std::error::Error>>,
+    R: FnMut(u32) -> Result<(), Box<dyn std::error::Error>>,
+{
+    if let Some(dl) = *confirmation_deadline {
+        if Instant::now() >= dl {
+            let live_origin = query_fn()?;
+            let size = Size::new(probe_window.width as u32, probe_window.height as u32);
+            let rec = probe_window.reconcile_live_snapshot(live_origin, size);
+            *confirmation_deadline = None;
+
+            match rec {
+                ConfigureReconciliation::Confirmed { origin, .. } => {
+                    if let Some(final_target) = awaiting_final_confirmation.take() {
+                        if origin == final_target {
+                            println!("[INPUT] Final placement confirmed by WM at {}", origin);
+                        } else {
+                            eprintln!(
+                                "[WARN] Final placement adjusted by WM to {} (expected {}); cancelling interaction.",
+                                origin, final_target
+                            );
+                            if let HostAction::ReleaseGrab { time } =
+                                interaction.cancel_on_wm_mismatch(x11rb::CURRENT_TIME)
+                            {
+                                release_grab_fn(time)?;
+                            }
+                            *pending_move = None;
+                            probe_window.cancel_in_flight_moves();
+                        }
+                    }
+                }
+                ConfigureReconciliation::GenuineMismatch {
+                    requested,
+                    confirmed,
+                } => {
+                    eprintln!(
+                        "[WARN] Movement confirmation timed out: requested {}, confirmed {}; cancelling interaction.",
+                        requested, confirmed
+                    );
+                    if let Some(final_target) = awaiting_final_confirmation.take() {
+                        eprintln!(
+                            "[WARN] Final placement adjusted by WM to {} (expected {})",
+                            confirmed, final_target
+                        );
+                    }
+                    if let HostAction::ReleaseGrab { time } =
+                        interaction.cancel_on_wm_mismatch(x11rb::CURRENT_TIME)
+                    {
+                        release_grab_fn(time)?;
+                    }
+                    *pending_move = None;
+                    probe_window.cancel_in_flight_moves();
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_confirmation_timeout(
+    conn: &impl Connection,
+    screen_root: x11rb::protocol::xproto::Window,
+    confirmation_deadline: &mut Option<Instant>,
+    probe_window: &mut ManagedProbeWindow,
+    awaiting_final_confirmation: &mut Option<Point>,
+    interaction: &mut InteractionManager,
+    pointer_tracker: &mut PointerCaptureTracker,
+    renderer: &Renderer,
+    pending_move: &mut Option<Point>,
+) {
+    let window_id = probe_window.window;
+    if let Err(e) = check_confirmation_timeout_with(
+        confirmation_deadline,
+        probe_window,
+        awaiting_final_confirmation,
+        interaction,
+        pending_move,
+        || ManagedProbeWindow::query_window_actual_root_origin(conn, window_id, screen_root),
+        |time| pointer_tracker.release_if_held(conn, time).map(|_| ()),
+    ) {
+        fatal_host_error(
+            &format!("Failed during confirmation timeout handling: {}", e),
+            conn,
+            pointer_tracker,
+            renderer,
+            probe_window,
+        );
+    }
 }
 
 fn flush_pending_move(
@@ -1205,7 +1245,9 @@ fn run_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use x11rb::protocol::xproto::{ButtonReleaseEvent, KeyButMask, Motion, MotionNotifyEvent};
+    use x11rb::protocol::xproto::{
+        ButtonReleaseEvent, ConfigureNotifyEvent, KeyButMask, Motion, MotionNotifyEvent,
+    };
 
     #[test]
     fn test_drain_events_bounded_preserves_buffered_event() {
@@ -1419,5 +1461,252 @@ mod tests {
                 confirmed: confirmed_event_origin,
             }
         );
+    }
+
+    #[test]
+    fn test_expired_deadline_with_more_than_64_buffered_unrelated_events() {
+        // Create 70 unrelated events (e.g. motion events on an unrelated window)
+        let mut queue = std::collections::VecDeque::new();
+        for i in 0..70 {
+            queue.push_back(Event::MotionNotify(MotionNotifyEvent {
+                response_type: 6,
+                detail: Motion::NORMAL,
+                sequence: i as u16,
+                time: 1000 + i,
+                root: 1,
+                event: 999, // unrelated window
+                child: 0,
+                root_x: 50,
+                root_y: 50,
+                event_x: 50,
+                event_y: 50,
+                state: KeyButMask::from(0u16),
+                same_screen: true,
+            }));
+        }
+
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(150, 150),
+            confirmed_origin: Point::new(100, 100),
+            in_flight_moves: std::collections::VecDeque::new(),
+            superseded_moves: std::collections::VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+        window.in_flight_moves.push_back(Point::new(150, 150));
+
+        let mut awaiting_final_confirmation = Some(Point::new(150, 150));
+        let mut confirmation_deadline = Some(Instant::now() - Duration::from_millis(10));
+        let mut pending_move = None;
+        let mut interaction = InteractionManager::new();
+        // Simulate dragging state
+        let bounds = crate::geometry::ValidOriginBounds::new(0, 1000, 0, 1000);
+        let _ = interaction.handle_left_press(
+            Point::new(100, 100),
+            (20, 20),
+            1000,
+            Point::new(100, 100),
+        );
+        interaction.on_grab_acquired();
+        let _ = interaction.handle_motion(Point::new(150, 150), 1010, &bounds);
+        assert!(interaction.is_dragging());
+
+        let mut grab_released = false;
+        let mut buffered_event = None;
+        let mut loops = 0;
+
+        // Simulate production event loop structure
+        while loops < 10 && (!queue.is_empty() || buffered_event.is_some()) {
+            loops += 1;
+
+            // Check confirmation deadline at top of loop alongside duration deadline,
+            // BEFORE draining/processing another batch
+            let _ = check_confirmation_timeout_with(
+                &mut confirmation_deadline,
+                &mut window,
+                &mut awaiting_final_confirmation,
+                &mut interaction,
+                &mut pending_move,
+                || Ok(Point::new(100, 100)), // Live query observes window remained at 100,100 (refusal)
+                |_time| {
+                    grab_released = true;
+                    Ok(())
+                },
+            );
+
+            // 1. Drain batch (64 events)
+            let batch =
+                drain_events_bounded(&mut buffered_event, 64, || Ok::<_, ()>(queue.pop_front()))
+                    .unwrap();
+            assert!(!batch.is_empty());
+
+            // 2. Before blocking on socket, verify no events remain buffered
+            if buffered_event.is_none() {
+                if let Some(next_ev) = queue.pop_front() {
+                    buffered_event = Some(next_ev);
+                    continue;
+                }
+            }
+        }
+
+        // Crucial assertions:
+        // 1. Confirmation deadline was processed on loop 1 BEFORE batch 2 drained, not bypassed by continue
+        assert_eq!(confirmation_deadline, None);
+        assert!(grab_released);
+        assert!(
+            !interaction.is_dragging(),
+            "Interaction must be cancelled on timeout discrepancy"
+        );
+        assert!(awaiting_final_confirmation.is_none());
+        assert!(window.in_flight_moves.is_empty());
+        assert_eq!(loops, 2, "Drained 70 events in exactly 2 batches");
+    }
+
+    #[test]
+    fn test_two_consecutive_drags_with_delayed_confirmation_of_first() {
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(80, 80),
+            confirmed_origin: Point::new(80, 80),
+            in_flight_moves: std::collections::VecDeque::new(),
+            superseded_moves: std::collections::VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+
+        let mut interaction = InteractionManager::new();
+        let bounds = crate::geometry::ValidOriginBounds::new(0, 1000, 0, 1000);
+        let mut awaiting_final_confirmation: Option<Point> = None;
+        assert_eq!(awaiting_final_confirmation, None);
+
+        let a = Point::new(100, 80);
+        let b = Point::new(120, 80);
+
+        // --- Drag 1 ---
+        // Press on body at (100, 100)
+        let action1 =
+            interaction.handle_left_press(Point::new(100, 100), (20, 20), 1000, Point::new(80, 80));
+        assert!(matches!(action1, HostAction::AcquireGrab { .. }));
+        interaction.on_grab_acquired();
+        awaiting_final_confirmation = None;
+        assert_eq!(awaiting_final_confirmation, None);
+
+        // Move to A
+        let action_m1 = interaction.handle_motion(Point::new(120, 100), 1010, &bounds);
+        assert_eq!(action_m1, HostAction::MoveWindow { target: a });
+        window.in_flight_moves.push_back(a);
+        window.requested_origin = a;
+
+        // Release Drag 1 at root (120, 100)
+        let action_r1 =
+            interaction.handle_left_release(Point::new(120, 100), (20, 20), 1020, &bounds);
+        assert_eq!(
+            action_r1,
+            HostAction::ReleaseGrabAndMoveWindow {
+                time: 1020,
+                target: a
+            }
+        );
+        awaiting_final_confirmation = Some(a);
+        assert_eq!(awaiting_final_confirmation, Some(a));
+
+        // --- Drag 2 (starts before A is confirmed) ---
+        // Fresh left press begins gesture 2
+        let action2 = interaction.handle_left_press(Point::new(120, 100), (20, 20), 1050, a);
+        assert!(matches!(action2, HostAction::AcquireGrab { .. }));
+        interaction.on_grab_acquired();
+        // Production logic: fresh gesture supersedes awaiting_final_confirmation
+        awaiting_final_confirmation = None;
+        assert_eq!(awaiting_final_confirmation, None);
+        // Tracking of previous in-flight move A is preserved!
+        assert_eq!(window.in_flight_moves.len(), 1);
+        assert_eq!(window.in_flight_moves[0], a);
+
+        // Drag 2 moves to B
+        let action_m2 = interaction.handle_motion(Point::new(140, 100), 1060, &bounds);
+        assert_eq!(action_m2, HostAction::MoveWindow { target: b });
+        window.in_flight_moves.push_back(b);
+        window.requested_origin = b;
+        assert_eq!(window.in_flight_moves.len(), 2);
+
+        // Release Drag 2 at root (140, 100)
+        let action_r2 =
+            interaction.handle_left_release(Point::new(140, 100), (20, 20), 1070, &bounds);
+        assert_eq!(
+            action_r2,
+            HostAction::ReleaseGrabAndMoveWindow {
+                time: 1070,
+                target: b
+            }
+        );
+        awaiting_final_confirmation = Some(b);
+        assert_eq!(awaiting_final_confirmation, Some(b));
+
+        // --- Delayed confirmation for Drag 1 (A) arrives ---
+        let ev_a = ConfigureNotifyEvent {
+            response_type: 22 | 0x80, // synthetic event
+            sequence: 1,
+            event: 100,
+            window: 100,
+            above_sibling: 0,
+            x: a.x as i16,
+            y: a.y as i16,
+            width: 160,
+            height: 160,
+            border_width: 0,
+            override_redirect: false,
+        };
+        let rec_a = window
+            .handle_configure_notify_with(&ev_a, || unreachable!())
+            .unwrap();
+        // Should be in-flight catch-up, NOT Confirmed and NOT GenuineMismatch
+        assert_eq!(
+            rec_a,
+            ConfigureReconciliation::InFlightCatchUp {
+                confirmed: a,
+                remaining_in_flight: 1,
+            }
+        );
+        // Crucial: awaiting_final_confirmation remains Some(b) and Drag 2 is NOT cancelled
+        assert_eq!(awaiting_final_confirmation, Some(b));
+        assert!(interaction.is_idle()); // Gesture 2 released cleanly into idle
+
+        // --- Confirmation for Drag 2 (B) arrives ---
+        let ev_b = ConfigureNotifyEvent {
+            response_type: 22 | 0x80,
+            sequence: 2,
+            event: 100,
+            window: 100,
+            above_sibling: 0,
+            x: b.x as i16,
+            y: b.y as i16,
+            width: 160,
+            height: 160,
+            border_width: 0,
+            override_redirect: false,
+        };
+        let rec_b = window
+            .handle_configure_notify_with(&ev_b, || unreachable!())
+            .unwrap();
+        assert_eq!(
+            rec_b,
+            ConfigureReconciliation::Confirmed {
+                origin: b,
+                size: Size::new(160, 160),
+            }
+        );
+        if let ConfigureReconciliation::Confirmed { origin, .. } = rec_b {
+            if awaiting_final_confirmation == Some(origin) {
+                awaiting_final_confirmation = None;
+            }
+        }
+        assert_eq!(awaiting_final_confirmation, None);
+        assert_eq!(window.confirmed_origin(), b);
+        assert!(window.in_flight_moves.is_empty());
     }
 }

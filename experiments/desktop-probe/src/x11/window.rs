@@ -325,6 +325,7 @@ impl ManagedProbeWindow {
     }
 
     /// Reconciles an incoming confirmed root origin against in-flight requests (historical event logic).
+    #[cfg(test)]
     pub fn reconcile_origin(
         &mut self,
         confirmed_origin: Point,
@@ -403,6 +404,88 @@ impl ManagedProbeWindow {
         }
     }
 
+    /// Reconciles a live geometry observation against requested origin and in-flight requests.
+    ///
+    /// Unlike historical event notifications (which reflect past states and might be stale),
+    /// a live observation represents the actual current placement of the window.
+    ///
+    /// Preserves the grace period while movement remains pending: temporary WM lag
+    /// (e.g. window still at confirmed or superseded origin while requests are in flight)
+    /// is treated as in-flight catch-up rather than immediate refusal.
+    pub fn reconcile_live_observation(
+        &mut self,
+        actual_origin: Point,
+        size: Size,
+    ) -> ConfigureReconciliation {
+        if actual_origin == self.requested_origin {
+            // Target achieved: mark all in-flight requests as superseded
+            while let Some(old) = self.in_flight_moves.pop_front() {
+                self.record_superseded(old);
+            }
+            self.confirmed_origin = actual_origin;
+            ConfigureReconciliation::Confirmed {
+                origin: actual_origin,
+                size,
+            }
+        } else if !self.in_flight_moves.is_empty() {
+            // Movement is pending: preserve grace period while requests are in flight
+            if let Some(pos) = self
+                .in_flight_moves
+                .iter()
+                .position(|&p| p == actual_origin)
+            {
+                // Intermediate in-flight target reached
+                for _ in 0..pos {
+                    if let Some(old) = self.in_flight_moves.pop_front() {
+                        self.record_superseded(old);
+                    }
+                }
+                let _ = self.in_flight_moves.pop_front();
+                self.confirmed_origin = actual_origin;
+                if self.in_flight_moves.is_empty() {
+                    ConfigureReconciliation::Confirmed {
+                        origin: actual_origin,
+                        size,
+                    }
+                } else {
+                    ConfigureReconciliation::InFlightCatchUp {
+                        confirmed: actual_origin,
+                        remaining_in_flight: self.in_flight_moves.len(),
+                    }
+                }
+            } else if actual_origin == self.confirmed_origin
+                || self.superseded_moves.contains(&actual_origin)
+            {
+                // Temporary WM lag: window has not moved yet or is still at an older position.
+                // Accurately update confirmed_origin to observed position and preserve grace period.
+                self.confirmed_origin = actual_origin;
+                ConfigureReconciliation::InFlightCatchUp {
+                    confirmed: actual_origin,
+                    remaining_in_flight: self.in_flight_moves.len(),
+                }
+            } else {
+                // Window placed at an unrequested, foreign position by the WM
+                while let Some(old) = self.in_flight_moves.pop_front() {
+                    self.record_superseded(old);
+                }
+                self.confirmed_origin = actual_origin;
+                ConfigureReconciliation::GenuineMismatch {
+                    requested: self.requested_origin,
+                    confirmed: actual_origin,
+                }
+            }
+        } else {
+            // No movement is pending, but live query observes window not at requested origin.
+            // Even if actual_origin is present in superseded history, this is a live snapshot,
+            // so it is a genuine mismatch and updates confirmed_origin.
+            self.confirmed_origin = actual_origin;
+            ConfigureReconciliation::GenuineMismatch {
+                requested: self.requested_origin,
+                confirmed: actual_origin,
+            }
+        }
+    }
+
     /// Evaluates and reconciles a ConfigureNotify event, using a custom root-translation closure if needed.
     pub fn handle_configure_notify_with<F>(
         &mut self,
@@ -420,11 +503,11 @@ impl ManagedProbeWindow {
                 Ok(ConfigureReconciliation::UnexpectedSizeChange { expected, actual })
             }
             ConfigureEventAnalysis::SyntheticRootOrigin { origin, size } => {
-                Ok(self.reconcile_origin(origin, size))
+                Ok(self.reconcile_historical_notification(origin, size))
             }
             ConfigureEventAnalysis::RequiresRootTranslation { size, .. } => {
                 let origin = translate_fn()?;
-                Ok(self.reconcile_origin(origin, size))
+                Ok(self.reconcile_live_observation(origin, size))
             }
         }
     }
@@ -968,5 +1051,90 @@ mod tests {
         // Interaction cancellation resets requested_origin to confirmed_origin A
         window.cancel_in_flight_moves();
         assert_eq!(window.requested_origin, a);
+    }
+
+    #[test]
+    fn test_live_query_returning_position_in_superseded_history() {
+        let mut window = ManagedProbeWindow {
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(100, 100),
+            confirmed_origin: Point::new(100, 100),
+            in_flight_moves: VecDeque::new(),
+            superseded_moves: VecDeque::new(),
+            width: 160,
+            height: 160,
+        };
+
+        let a = Point::new(100, 100);
+        let b = Point::new(120, 120);
+        let c = Point::new(140, 140);
+
+        // Window moved A -> B -> C and settled at C
+        window.in_flight_moves.push_back(a);
+        window.in_flight_moves.push_back(b);
+        window.in_flight_moves.push_back(c);
+        window.requested_origin = c;
+
+        // Target C confirmed, so A and B enter superseded history
+        let res_c = window.reconcile_live_snapshot(c, Size::new(160, 160));
+        assert_eq!(
+            res_c,
+            ConfigureReconciliation::Confirmed {
+                origin: c,
+                size: Size::new(160, 160),
+            }
+        );
+        assert_eq!(window.confirmed_origin, c);
+        assert!(window.superseded_moves.contains(&a));
+        assert!(window.in_flight_moves.is_empty());
+
+        // A server structure event arrives (requires root translation via live query)
+        let ev = ConfigureNotifyEvent {
+            response_type: 22, // non-synthetic server structure event
+            sequence: 1,
+            event: 100,
+            window: 100,
+            above_sibling: 0,
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 160,
+            border_width: 0,
+            override_redirect: false,
+        };
+
+        // Case 1: Settled state (in_flight is empty).
+        // A live query showing the window currently at A (which is in superseded history)
+        // must NOT return StaleHistorical or leave confirmed_origin at C;
+        // it must evaluate as GenuineMismatch and update confirmed_origin to A.
+        let res_a = window.handle_configure_notify_with(&ev, || Ok(a)).unwrap();
+        assert_eq!(
+            res_a,
+            ConfigureReconciliation::GenuineMismatch {
+                requested: c,
+                confirmed: a,
+            }
+        );
+        assert_eq!(window.confirmed_origin, a);
+
+        // Case 2: Movement pending (grace period active).
+        // Client issues move to D = (160, 160).
+        let d = Point::new(160, 160);
+        window.in_flight_moves.push_back(d);
+        window.requested_origin = d;
+
+        // Temporary WM lag: live query observes window is still at A while D is in flight.
+        // It must NOT count as immediate refusal; it preserves the grace period as InFlightCatchUp.
+        let res_lag = window.handle_configure_notify_with(&ev, || Ok(a)).unwrap();
+        assert_eq!(
+            res_lag,
+            ConfigureReconciliation::InFlightCatchUp {
+                confirmed: a,
+                remaining_in_flight: 1,
+            }
+        );
+        assert_eq!(window.confirmed_origin, a);
     }
 }
