@@ -310,7 +310,7 @@ fn main() {
         println!("  Probe running for {} seconds (or until closed)...", sec);
     } else {
         println!(
-            "  Probe is visible on desktop. Left-click to toggle color, right-click for Dismiss/Quit, or press Ctrl+C."
+            "  Left-click toggles body color; right-click opens Dismiss/Quit. Launch with --duration <SECONDS> for automatic termination."
         );
     }
 
