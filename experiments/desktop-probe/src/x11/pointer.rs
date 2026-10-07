@@ -2,7 +2,7 @@
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    ConnectionExt as XprotoExt, EventMask, GrabMode, GrabStatus, Window,
+    ConnectionExt as XprotoExt, EventMask, GrabMode, GrabStatus, KeyButMask, Window,
 };
 
 /// Issues an explicit GrabPointer request for the window.
@@ -37,8 +37,9 @@ pub fn grab_pointer(
 
 /// Issues a checked UngrabPointer request.
 pub fn ungrab_pointer(conn: &impl Connection, time: u32) -> Result<(), Box<dyn std::error::Error>> {
+    // check() flushes and receives the acknowledgement. A later flush failure must
+    // not turn an already confirmed release into an outstanding obligation.
     conn.ungrab_pointer(time)?.check()?;
-    conn.flush()?;
     Ok(())
 }
 
@@ -68,12 +69,47 @@ impl PointerCaptureTracker {
         conn: &impl Connection,
         time: u32,
     ) -> Result<bool, Box<dyn std::error::Error>> {
+        self.release_with(|| ungrab_pointer(conn, time))
+    }
+
+    pub fn release_with(
+        &mut self,
+        release: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         if self.has_grab {
-            ungrab_pointer(conn, time)?;
+            release()?;
             self.has_grab = false;
             Ok(true)
         } else {
             Ok(false)
         }
+    }
+}
+
+/// Root QueryPointer observes the initiating button even outside the selected monitor.
+pub fn left_button_pressed(
+    conn: &impl Connection,
+    root: Window,
+) -> Result<(u64, bool), Box<dyn std::error::Error>> {
+    let cookie = conn.query_pointer(root)?;
+    let sequence = cookie.sequence_number();
+    let reply = cookie.reply()?;
+    Ok((sequence, reply.mask.contains(KeyButMask::BUTTON1)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn failed_release_retains_obligation_and_confirmed_retry_is_idempotent() {
+        let mut tracker = PointerCaptureTracker::new();
+        tracker.set_grabbed(true);
+        assert!(tracker
+            .release_with(|| Err("connection failure".into()))
+            .is_err());
+        assert!(tracker.is_grabbed());
+        assert!(tracker.release_with(|| Ok(())).unwrap());
+        assert!(!tracker.is_grabbed());
+        assert!(!tracker.release_with(|| panic!("already released")).unwrap());
     }
 }

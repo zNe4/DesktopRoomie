@@ -1,3 +1,4 @@
+use super::resource::{cleanup_all, OwnedResource};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     Colormap, ConnectionExt as XprotoExt, CreateGCAux, Gcontext, ImageFormat, Pixmap, Window,
@@ -22,6 +23,9 @@ impl ColorTheme {
 }
 
 pub struct Renderer {
+    pub gc_resource: OwnedResource,
+    pub pixmap_resource: OwnedResource,
+
     pub pixmap: Pixmap,
     pub gc: Gcontext,
     pub width: u16,
@@ -44,35 +48,64 @@ impl Renderer {
         conn.create_pixmap(32, pixmap, window, width, height)?
             .check()?;
 
-        // 2. Create GC
-        let gc = conn.generate_id()?;
-        conn.create_gc(gc, pixmap, &CreateGCAux::new())?.check()?;
-
-        // 3. Generate 32-bit ARGB image buffer
-        let buffer = generate_test_body_pattern(width as usize, height as usize, theme);
-
-        // 4. Upload buffer into Pixmap
-        conn.put_image(
-            ImageFormat::Z_PIXMAP,
-            pixmap,
-            gc,
-            width,
-            height,
-            0,
-            0,
-            0,
-            32,
-            &buffer,
-        )?
-        .check()?;
-
-        Ok(Self {
+        // Keep the successfully allocated pixmap owned during all later initialization.
+        let pixmap_resource = OwnedResource::default();
+        let gc_result = (|| -> Result<_, Box<dyn std::error::Error>> {
+            let gc = conn.generate_id()?;
+            conn.create_gc(gc, pixmap, &CreateGCAux::new())?.check()?;
+            Ok(gc)
+        })();
+        let gc = match gc_result {
+            Ok(gc) => gc,
+            Err(error) => {
+                eprintln!("[ERROR] Renderer GC creation failed: {error}");
+                let _ = cleanup_all([Box::new(|| {
+                    pixmap_resource.release_with(|| {
+                        conn.free_pixmap(pixmap)?.check()?;
+                        Ok(())
+                    })
+                })]);
+                return Err(error);
+            }
+        };
+        let renderer = Self {
+            pixmap_resource,
+            gc_resource: OwnedResource::default(),
             pixmap,
             gc,
             width,
             height,
             theme,
-        })
+        };
+        let upload: Result<(), Box<dyn std::error::Error>> = (|| {
+            // 3. Generate 32-bit ARGB image buffer
+            let buffer = generate_test_body_pattern(width as usize, height as usize, theme);
+
+            // 4. Upload buffer into Pixmap
+            conn.put_image(
+                ImageFormat::Z_PIXMAP,
+                pixmap,
+                gc,
+                width,
+                height,
+                0,
+                0,
+                0,
+                32,
+                &buffer,
+            )?
+            .check()?;
+
+            Ok(())
+        })();
+        if let Err(error) = upload {
+            eprintln!("[ERROR] Renderer upload failed: {error}");
+            if let Err(cleanup) = renderer.destroy(conn) {
+                eprintln!("[ERROR] Partial renderer cleanup: {cleanup}");
+            }
+            return Err(error);
+        }
+        Ok(renderer)
     }
 
     /// Blit from the double-buffered Pixmap to the window on Expose
@@ -131,45 +164,24 @@ impl Renderer {
 
     /// Releases server-side GC and Pixmap resources, checking requests and reporting failures
     pub fn destroy(&self, conn: &impl Connection) -> Result<(), Box<dyn std::error::Error>> {
-        let mut first_error = None;
-
-        match conn.free_gc(self.gc) {
-            Ok(cookie) => {
-                if let Err(e) = cookie.check() {
-                    first_error = Some(Box::new(e) as Box<dyn std::error::Error>);
-                }
-            }
-            Err(e) => {
-                first_error = Some(Box::new(e) as Box<dyn std::error::Error>);
-            }
-        }
-
-        match conn.free_pixmap(self.pixmap) {
-            Ok(cookie) => {
-                if let Err(e) = cookie.check() {
-                    if first_error.is_none() {
-                        first_error = Some(Box::new(e) as Box<dyn std::error::Error>);
-                    }
-                }
-            }
-            Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(Box::new(e) as Box<dyn std::error::Error>);
-                }
-            }
-        }
-
-        if let Err(e) = conn.flush() {
-            if first_error.is_none() {
-                first_error = Some(Box::new(e) as Box<dyn std::error::Error>);
-            }
-        }
-
-        if let Some(err) = first_error {
-            Err(err)
-        } else {
-            Ok(())
-        }
+        cleanup_all([
+            Box::new(|| {
+                self.gc_resource.release_with(|| {
+                    conn.free_gc(self.gc)?.check()?;
+                    Ok(())
+                })
+            }),
+            Box::new(|| {
+                self.pixmap_resource.release_with(|| {
+                    conn.free_pixmap(self.pixmap)?.check()?;
+                    Ok(())
+                })
+            }),
+            Box::new(|| {
+                conn.flush()?;
+                Ok(())
+            }),
+        ])
     }
 }
 

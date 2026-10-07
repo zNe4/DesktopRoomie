@@ -55,6 +55,7 @@ pub enum HostAction {
 pub struct InteractionManager {
     state: InteractionState,
     pending_press: Option<(Point, Point, u32, GrabOffset)>,
+    freshness_pending: bool,
 }
 
 impl InteractionManager {
@@ -62,6 +63,7 @@ impl InteractionManager {
         Self {
             state: InteractionState::Idle,
             pending_press: None,
+            freshness_pending: false,
         }
     }
 
@@ -111,6 +113,7 @@ impl InteractionManager {
     pub fn on_grab_acquired(&mut self) {
         if let Some((press_root, press_origin, press_time, grab_offset)) = self.pending_press.take()
         {
+            self.freshness_pending = true;
             self.state = InteractionState::LeftPressed {
                 press_root,
                 press_origin,
@@ -130,9 +133,16 @@ impl InteractionManager {
     pub fn handle_motion(
         &mut self,
         pointer_root: Point,
-        _time: u32,
+        time: u32,
         bounds: &ValidOriginBounds,
     ) -> HostAction {
+        if let InteractionState::LeftPressed { press_time, .. }
+        | InteractionState::Dragging { press_time, .. } = self.state
+        {
+            if self.freshness_pending && !timestamp_at_or_after(time, press_time) {
+                return HostAction::None;
+            }
+        }
         match self.state {
             InteractionState::LeftPressed {
                 press_root,
@@ -210,6 +220,13 @@ impl InteractionManager {
         time: u32,
         bounds: &ValidOriginBounds,
     ) -> HostAction {
+        if let InteractionState::LeftPressed { press_time, .. }
+        | InteractionState::Dragging { press_time, .. } = self.state
+        {
+            if self.freshness_pending && !timestamp_at_or_after(time, press_time) {
+                return HostAction::None;
+            }
+        }
         match self.state {
             InteractionState::LeftPressed {
                 press_root,
@@ -261,8 +278,7 @@ impl InteractionManager {
         match self.state {
             InteractionState::LeftPressed { .. } | InteractionState::Dragging { .. } => {
                 // Right press during an active left gesture cancels the gesture
-                self.state = InteractionState::SuppressedUntilRelease { button: 1 };
-                HostAction::ReleaseGrab { time }
+                self.cancel(time)
             }
             InteractionState::Idle | InteractionState::SuppressedUntilRelease { .. } => {
                 // While idle or recovering from missed release, right press triggers clean exit
@@ -284,35 +300,50 @@ impl InteractionManager {
         HostAction::None
     }
 
-    /// Cancels any active gesture and resets to Idle (e.g. on timeout or window destroy).
+    /// Cancels without completing a click; a fresh press can recover after a missed release.
     pub fn cancel(&mut self, time: u32) -> HostAction {
         self.pending_press = None;
-        match self.state {
-            InteractionState::LeftPressed { .. } | InteractionState::Dragging { .. } => {
-                self.state = InteractionState::Idle;
-                HostAction::ReleaseGrab { time }
-            }
-            _ => {
-                self.state = InteractionState::Idle;
-                HostAction::None
-            }
+        if self.has_left_gesture() {
+            self.state = InteractionState::SuppressedUntilRelease { button: 1 };
+            HostAction::ReleaseGrab { time }
+        } else {
+            HostAction::None
         }
     }
 
-    /// Cancels an active gesture due to window manager refusal/mismatch.
-    ///
-    /// Transitions active gestures to SuppressedUntilRelease so that the eventual
-    /// button release is safely ignored rather than triggering a click toggle.
-    pub fn cancel_on_wm_mismatch(&mut self, time: u32) -> HostAction {
-        self.pending_press = None;
+    pub fn accepts_gesture_time(&self, time: u32) -> bool {
         match self.state {
-            InteractionState::LeftPressed { .. } | InteractionState::Dragging { .. } => {
-                self.state = InteractionState::SuppressedUntilRelease { button: 1 };
-                HostAction::ReleaseGrab { time }
+            InteractionState::LeftPressed { press_time, .. }
+            | InteractionState::Dragging { press_time, .. } => {
+                !self.freshness_pending || timestamp_at_or_after(time, press_time)
             }
-            _ => HostAction::None,
+            _ => true,
         }
     }
+
+    /// A held-button observation has passed the queued-event boundary. Old events
+    /// were consumed before it; the temporary timestamp guard can now end. This
+    /// also permits arbitrarily long holds across X timestamp wrap.
+    pub fn confirm_button_held(&mut self) {
+        self.freshness_pending = false;
+    }
+
+    pub fn has_left_gesture(&self) -> bool {
+        matches!(
+            self.state,
+            InteractionState::LeftPressed { .. } | InteractionState::Dragging { .. }
+        )
+    }
+
+    pub fn cancel_on_wm_mismatch(&mut self, time: u32) -> HostAction {
+        self.cancel(time)
+    }
+}
+
+// X timestamps wrap at 32 bits. The temporary freshness guard ends at the first
+// ordered held-button observation, rather than limiting the lifetime of a hold.
+fn timestamp_at_or_after(time: u32, earlier: u32) -> bool {
+    time.wrapping_sub(earlier) as i32 >= 0
 }
 
 #[cfg(test)]
@@ -869,5 +900,44 @@ mod tests {
         let release_action = mgr.handle_left_release(root, (80, 80), 1020, &bounds);
         assert_eq!(release_action, HostAction::None);
         assert_eq!(mgr.state(), InteractionState::Idle);
+    }
+    #[test]
+    fn stale_events_cannot_complete_new_gesture_including_timestamp_wrap() {
+        let mut manager = InteractionManager::new();
+        let bounds = sample_bounds();
+        let point = Point::new(100, 100);
+        manager.handle_left_press(point, (80, 80), u32::MAX - 10, point);
+        manager.on_grab_acquired();
+        manager.cancel(0);
+        manager.handle_left_press(point, (80, 80), 5, point);
+        manager.on_grab_acquired();
+        assert_eq!(
+            manager.handle_left_release(point, (80, 80), u32::MAX - 1, &bounds),
+            HostAction::None
+        );
+        assert_eq!(
+            manager.handle_motion(Point::new(200, 200), u32::MAX - 1, &bounds),
+            HostAction::None
+        );
+        assert!(!manager.accepts_gesture_time(u32::MAX - 1));
+        assert!(manager.has_left_gesture());
+        assert_eq!(
+            manager.handle_left_release(point, (80, 80), 6, &bounds),
+            HostAction::ReleaseGrabAndToggleColor { time: 6 }
+        );
+    }
+    #[test]
+    fn confirmed_stationary_hold_can_release_after_half_timestamp_period() {
+        let mut manager = InteractionManager::new();
+        let point = Point::new(100, 100);
+        manager.handle_left_press(point, (80, 80), 1000, point);
+        manager.on_grab_acquired();
+        manager.confirm_button_held();
+        let late = 1000u32.wrapping_add((i32::MAX as u32) + 1);
+        assert!(manager.accepts_gesture_time(late));
+        assert_eq!(
+            manager.handle_left_release(point, (80, 80), late, &sample_bounds()),
+            HostAction::ReleaseGrabAndToggleColor { time: late }
+        );
     }
 }

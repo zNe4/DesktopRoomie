@@ -147,12 +147,25 @@ fn main() {
         }
     };
 
-    let layout = query_desktop_layout(
-        &conn,
-        screen.root,
-        screen.width_in_pixels,
-        screen.height_in_pixels,
-    );
+    let atoms = match x11::monitors::LayoutAtoms::subscribe(&conn, screen.root) {
+        Ok(atoms) => atoms,
+        Err(error) => {
+            eprintln!("[ERROR] Geometry subscription failed: {error}");
+            process::exit(1);
+        }
+    };
+    let layout = match query_desktop_layout(&conn, screen.root, &atoms, None) {
+        Ok(layout) => layout,
+        Err(error) => {
+            eprintln!("[ERROR] Desktop geometry query failed: {error}");
+            process::exit(1);
+        }
+    };
+    let selected_monitor = layout
+        .primary_monitor
+        .as_ref()
+        .expect("validated monitor")
+        .name_atom;
 
     // If pure diagnosis requested, print diagnostics and exit cleanly (M01.1 mode)
     if config.diagnose {
@@ -162,8 +175,8 @@ fn main() {
         return;
     }
 
-    // M02.3: Bounded dragging and stable grab offsets
-    println!("Mission M02.4: WM confirmation and event efficiency...");
+    // M02.5 retains bounded dragging and adds interruption recovery.
+    println!("Mission M02.5: interruption recovery and changing bounds...");
 
     // 1. Discover 32-bit alpha Render visual
     let alpha_vis = match find_alpha_visual(&conn) {
@@ -193,7 +206,7 @@ fn main() {
 
     // 2. Validate geometry & bounds
     let body_size = Size::new(WINDOW_WIDTH as u32, WINDOW_HEIGHT as u32);
-    let valid_bounds = match compute_valid_origin_bounds(layout.usable_area, body_size) {
+    let valid_bounds = match checked_probe_bounds(layout.usable_area) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("\n[ERROR] Bounded placement validation failed: {}", e);
@@ -224,6 +237,12 @@ fn main() {
         layout.usable_area.height
     );
     println!("  Valid origin bounds: {}", valid_bounds);
+    if let Some(monitor) = &layout.primary_monitor {
+        println!(
+            "  Selected monitor identity: atom=0x{:x}, outputs={:?}",
+            monitor.name_atom, monitor.outputs
+        );
+    }
 
     // Optional startup delay (for testing focus behavior during mapping)
     if let Some(delay) = config.delay_secs {
@@ -265,7 +284,9 @@ fn main() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[ERROR] Failed to initialize renderer: {}", e);
-            let _ = probe_window.destroy(&conn);
+            if let Err(cleanup) = probe_window.destroy(&conn) {
+                eprintln!("[ERROR] Window cleanup failed: {cleanup}");
+            }
             process::exit(1);
         }
     };
@@ -273,8 +294,10 @@ fn main() {
     // Perform initial paint (fatal on failure)
     if let Err(e) = renderer.paint(&conn, probe_window.window) {
         eprintln!("[ERROR] Initial paint failed: {}", e);
-        let _ = renderer.destroy(&conn);
-        let _ = probe_window.destroy(&conn);
+        let _ = x11::resource::cleanup_all([
+            Box::new(|| renderer.destroy(&conn)),
+            Box::new(|| probe_window.destroy(&conn)),
+        ]);
         process::exit(1);
     }
 
@@ -287,711 +310,693 @@ fn main() {
         );
     }
 
-    // 5. Event loop
-    let conn_fd = conn.stream().as_raw_fd();
-    let start_time = Instant::now();
-    let mut running = true;
-    let mut mapped_logged = false;
-    let mut interaction = InteractionManager::new();
-    let mut pointer_tracker = PointerCaptureTracker::new();
-    let mut pending_move: Option<Point> = None;
-    let mut buffered_event: Option<Event> = None;
-    let mut awaiting_final_confirmation: Option<Point> = None;
-    let mut confirmation_deadline: Option<Instant> = None;
+    let mut runtime = ProbeRuntime::new();
+    let result = run_probe(
+        &conn,
+        screen.root,
+        &config,
+        &atoms,
+        selected_monitor,
+        &mut probe_window,
+        &mut renderer,
+        &mut runtime,
+        valid_bounds,
+    );
+    let outcome = finish_probe_with(result, || {
+        runtime.correction = None;
+        let cancellation = runtime.cancel(&conn, &mut probe_window, "shutdown");
+        let cleanup = x11::resource::cleanup_all([
+            Box::new(|| cancellation),
+            Box::new(|| renderer.destroy(&conn)),
+            Box::new(|| probe_window.destroy(&conn)),
+        ]);
+        if runtime.pointer.is_grabbed() {
+            eprintln!("[ERROR] Pointer release remains unconfirmed; connection teardown is best effort only");
+        }
+        cleanup
+    });
+    if outcome.is_err() {
+        process::exit(1);
+    }
+    println!("  Probe exited cleanly.");
+}
 
-    const MAX_EVENT_BATCH: usize = 64;
+/// Cleanup always runs; a fatal host error retains diagnostic priority over cleanup failures.
+fn finish_probe_with(
+    result: Result<(), HostError>,
+    cleanup: impl FnOnce() -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    if let Err(error) = &result {
+        eprintln!("[ERROR] {error}");
+    }
+    let cleanup_result = cleanup();
+    result.and(cleanup_result)
+}
 
-    while running {
-        // Check duration deadline at start of each iteration
-        if let Some(sec) = config.duration_secs {
-            let duration = Duration::from_secs(sec);
-            let elapsed = start_time.elapsed();
-            if elapsed >= duration {
-                println!("  Duration limit reached ({}s). Exiting cleanly.", sec);
-                if let Err(e) = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME) {
-                    fatal_host_error(
-                        &format!("Failed to release pointer capture on timeout: {}", e),
-                        &conn,
-                        &mut pointer_tracker,
-                        &renderer,
-                        &probe_window,
-                    );
-                }
-                break;
+fn checked_probe_bounds(
+    area: crate::geometry::Rect,
+) -> Result<crate::geometry::ValidOriginBounds, HostError> {
+    let bounds =
+        compute_valid_origin_bounds(area, Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()))?;
+    for coordinate in [bounds.min_x, bounds.max_x, bounds.min_y, bounds.max_y] {
+        i16::try_from(coordinate)
+            .map_err(|_| "Selected-monitor placement exceeds supported X11 coordinate range")?;
+    }
+    Ok(bounds)
+}
+
+type HostError = Box<dyn std::error::Error>;
+const POINTER_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyAvailability {
+    AwaitingMap,
+    Unavailable,
+    Validating,
+    Ready,
+    Destroyed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SafetyDecision {
+    NoChange,
+    HoldConfirmed,
+    Cancel,
+}
+
+#[derive(Default)]
+struct GestureSafety {
+    generation: u64,
+    deadline: Option<Instant>,
+    observation: Option<(u64, bool, u64)>,
+}
+impl GestureSafety {
+    fn acquired(&mut self, now: Instant) {
+        self.generation = self.generation.wrapping_add(1);
+        self.deadline = Some(now + POINTER_CHECK_INTERVAL);
+        self.observation = None;
+    }
+    fn clear(&mut self) {
+        self.deadline = None;
+        self.observation = None;
+    }
+    fn observed(&mut self, pressed: bool, sequence: u64) {
+        self.observation = Some((self.generation, pressed, sequence));
+        self.deadline = None;
+    }
+    // Events with a last-processed request sequence below QueryPointer precede the
+    // observation. Apply it before later events, or once the queue is empty.
+    fn apply(&mut self, active: bool, now: Instant, next_sequence: Option<u64>) -> SafetyDecision {
+        if self
+            .observation
+            .is_some_and(|(_, _, sequence)| next_sequence.is_some_and(|next| next < sequence))
+        {
+            return SafetyDecision::NoChange;
+        }
+        let Some((generation, pressed, _)) = self.observation.take() else {
+            return SafetyDecision::NoChange;
+        };
+        if !active || generation != self.generation {
+            return SafetyDecision::NoChange;
+        }
+        if pressed {
+            self.deadline = Some(now + POINTER_CHECK_INTERVAL);
+            SafetyDecision::HoldConfirmed
+        } else {
+            self.clear();
+            SafetyDecision::Cancel
+        }
+    }
+}
+
+struct ProbeRuntime {
+    interaction: InteractionManager,
+    pointer: PointerCaptureTracker,
+    pending_move: Option<Point>,
+    final_target: Option<Point>,
+    confirmation_deadline: Option<Instant>,
+    safety: GestureSafety,
+    body: BodyAvailability,
+    correction: Option<(Point, Instant)>,
+}
+impl ProbeRuntime {
+    fn new() -> Self {
+        Self {
+            interaction: InteractionManager::new(),
+            pointer: PointerCaptureTracker::new(),
+            pending_move: None,
+            final_target: None,
+            confirmation_deadline: None,
+            safety: GestureSafety::default(),
+            body: BodyAvailability::AwaitingMap,
+            correction: None,
+        }
+    }
+
+    fn apply_safety(&mut self, now: Instant, next_sequence: Option<u64>) -> bool {
+        match self
+            .safety
+            .apply(self.interaction.has_left_gesture(), now, next_sequence)
+        {
+            SafetyDecision::NoChange => false,
+            SafetyDecision::HoldConfirmed => {
+                self.interaction.confirm_button_held();
+                false
+            }
+            SafetyDecision::Cancel => true,
+        }
+    }
+
+    fn cancel_with(
+        &mut self,
+        window: &mut ManagedProbeWindow,
+        release: impl FnOnce(&mut PointerCaptureTracker) -> Result<(), HostError>,
+    ) -> Result<(), HostError> {
+        self.safety.clear();
+        cancel_movement_with(
+            &mut self.interaction,
+            &mut self.pending_move,
+            &mut self.final_target,
+            &mut self.confirmation_deadline,
+            window,
+            |_| release(&mut self.pointer),
+        )
+    }
+
+    fn cancel(
+        &mut self,
+        conn: &impl Connection,
+        window: &mut ManagedProbeWindow,
+        reason: &str,
+    ) -> Result<(), HostError> {
+        if self.interaction.has_left_gesture() || self.pointer.is_grabbed() {
+            println!("[INPUT] Cancelling gesture: {reason}");
+        }
+        self.cancel_with(window, |pointer| {
+            pointer
+                .release_if_held(conn, x11rb::CURRENT_TIME)
+                .map(|_| ())
+        })
+    }
+    fn unavailable(&mut self, destroyed: bool) {
+        self.body = if destroyed {
+            BodyAvailability::Destroyed
+        } else {
+            BodyAvailability::Unavailable
+        };
+        self.correction = None;
+    }
+    fn flush_move(
+        &mut self,
+        conn: &impl Connection,
+        window: &mut ManagedProbeWindow,
+    ) -> Result<(), HostError> {
+        if let Some(target) = self.pending_move.take() {
+            if target != window.requested_origin() {
+                window.configure_position(conn, target)?;
+                self.confirmation_deadline = Some(Instant::now() + CONFIRMATION_TIMEOUT);
             }
         }
-
-        // Check expired confirmation deadlines alongside duration deadline, before processing another batch
-        check_confirmation_timeout(
-            &conn,
-            screen.root,
-            &mut confirmation_deadline,
-            &mut probe_window,
-            &mut awaiting_final_confirmation,
-            &mut interaction,
-            &mut pointer_tracker,
-            &renderer,
-            &mut pending_move,
-        );
-
-        // 1. Drain a bounded batch of available X11 events
-        let event_batch = match drain_events_bounded(&mut buffered_event, MAX_EVENT_BATCH, || {
-            conn.poll_for_event()
-        }) {
-            Ok(b) => b,
-            Err(e) => {
-                fatal_host_error(
-                    &format!("X11 connection poll error: {}", e),
-                    &conn,
-                    &mut pointer_tracker,
-                    &renderer,
-                    &probe_window,
-                );
-            }
+        Ok(())
+    }
+    fn accepts_input(&self) -> bool {
+        self.body == BodyAvailability::Ready
+    }
+    fn can_reconcile(&self) -> bool {
+        !matches!(
+            self.body,
+            BodyAvailability::AwaitingMap
+                | BodyAvailability::Unavailable
+                | BodyAvailability::Destroyed
+        ) && self.correction.is_none()
+    }
+    fn placement(
+        &mut self,
+        conn: &impl Connection,
+        root: u32,
+        window: &mut ManagedProbeWindow,
+        bounds: &crate::geometry::ValidOriginBounds,
+    ) -> Result<(), HostError> {
+        if !self.can_reconcile() {
+            return Ok(());
+        }
+        let actual = window.query_actual_root_geometry(conn, root)?;
+        self.placement_with(window, actual, bounds, |window, target| {
+            window.configure_position(conn, target)
+        })
+    }
+    fn placement_with(
+        &mut self,
+        window: &mut ManagedProbeWindow,
+        actual: crate::geometry::Rect,
+        bounds: &crate::geometry::ValidOriginBounds,
+        request: impl FnOnce(&mut ManagedProbeWindow, Point) -> Result<(), HostError>,
+    ) -> Result<(), HostError> {
+        if !self.can_reconcile() {
+            return Ok(());
+        }
+        if actual.size() != Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()) {
+            return Err(format!(
+                "Unsupported body dimensions on placement verification: {}",
+                actual.size()
+            )
+            .into());
+        }
+        window.confirmed_origin = actual.origin();
+        window.cancel_in_flight_moves();
+        let target = bounds.clamp(actual.origin());
+        if target == actual.origin() {
+            self.body = BodyAvailability::Ready;
+        } else {
+            self.body = BodyAvailability::Validating;
+            request(window, target)?;
+            self.correction = Some((target, Instant::now() + CONFIRMATION_TIMEOUT));
+            println!("[PLACEMENT] Changed bounds require one corrective placement to {target}; awaiting verification");
+        }
+        Ok(())
+    }
+    fn check_correction(
+        &mut self,
+        now: Instant,
+        actual: Point,
+        bounds: &crate::geometry::ValidOriginBounds,
+    ) -> Result<bool, HostError> {
+        let Some((target, deadline)) = self.correction else {
+            return Ok(false);
         };
+        if now < deadline {
+            return Ok(false);
+        }
+        self.correction = None;
+        if actual != target {
+            return Err(format!("WM refused necessary bounds correction: requested {target}, confirmed {actual}; will not retry").into());
+        }
+        self.body = if bounds.clamp(actual) == actual {
+            BodyAvailability::Ready
+        } else {
+            BodyAvailability::Validating
+        };
+        Ok(true)
+    }
+}
 
-        // 2. Process drained events
-        for event in event_batch {
-            match event {
-                Event::MotionNotify(ev) if ev.event == probe_window.window => {
-                    let pointer_root = Point::new(ev.root_x as i32, ev.root_y as i32);
-                    let was_dragging = interaction.is_dragging();
-                    if let HostAction::MoveWindow { target } =
-                        interaction.handle_motion(pointer_root, ev.time, &valid_bounds)
-                    {
-                        if !was_dragging {
-                            println!(
-                                "[INPUT] Drag started at root ({}, {}), target origin {}",
-                                ev.root_x, ev.root_y, target
-                            );
-                        }
-                        pending_move = Some(target);
+fn relevant_layout_event(
+    event: &Event,
+    root: u32,
+    window: u32,
+    atoms: &x11::monitors::LayoutAtoms,
+) -> bool {
+    match event {
+        Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => true,
+        Event::ConfigureNotify(ev) => ev.window == root,
+        Event::PropertyNotify(ev) => {
+            (ev.window == root && (ev.atom == atoms.workarea || ev.atom == atoms.current_desktop))
+                || (ev.window == window && ev.atom == atoms.wm_desktop)
+        }
+        _ => false,
+    }
+}
+fn interrupts_pending_movement(
+    event: &Event,
+    root: u32,
+    window: u32,
+    atoms: &x11::monitors::LayoutAtoms,
+) -> bool {
+    relevant_layout_event(event, root, window, atoms)
+        || match event {
+            Event::ButtonPress(ev) => ev.event == window && ev.detail == 3,
+            Event::UnmapNotify(ev) => ev.window == window,
+            Event::DestroyNotify(ev) => ev.window == window,
+            Event::ClientMessage(ev) => ev.window == window,
+            Event::Error(_) => true,
+            _ => false,
+        }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_probe(
+    conn: &x11rb::rust_connection::RustConnection,
+    root: u32,
+    config: &Config,
+    atoms: &x11::monitors::LayoutAtoms,
+    selected_monitor: u32,
+    window: &mut ManagedProbeWindow,
+    renderer: &mut Renderer,
+    runtime: &mut ProbeRuntime,
+    initial_bounds: crate::geometry::ValidOriginBounds,
+) -> Result<(), HostError> {
+    let mut bounds = initial_bounds;
+    let mut buffered_event = None;
+    let start = Instant::now();
+    let duration_deadline = config
+        .duration_secs
+        .map(|sec| {
+            start
+                .checked_add(Duration::from_secs(sec))
+                .ok_or("Duration exceeds supported monotonic deadline")
+        })
+        .transpose()?;
+    loop {
+        let now = Instant::now();
+        if duration_deadline.is_some_and(|dl| now >= dl) {
+            runtime.cancel(conn, window, "duration expiry")?;
+            return Ok(());
+        }
+        // Confirmation is bounded even during sustained incoming event traffic.
+        if let Some((_, deadline)) = runtime.correction {
+            if now >= deadline {
+                if !window.is_viewable(conn)? {
+                    runtime.cancel(
+                        conn,
+                        window,
+                        "body unavailable during correction verification",
+                    )?;
+                    runtime.unavailable(false);
+                    continue;
+                }
+                let actual = window.query_actual_root_geometry(conn, root)?;
+                if actual.size() != Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()) {
+                    return Err("Body resized during bounds correction".into());
+                }
+                runtime.check_correction(now, actual.origin(), &bounds)?;
+                window.cancel_in_flight_moves();
+                runtime.placement(conn, root, window, &bounds)?;
+            }
+        } else {
+            let window_id = window.window;
+            check_confirmation_timeout_with(
+                &mut runtime.confirmation_deadline,
+                window,
+                &mut runtime.final_target,
+                &mut runtime.interaction,
+                &mut runtime.pending_move,
+                || {
+                    let actual = ManagedProbeWindow::query_window_actual_root_geometry(
+                        conn, window_id, root,
+                    )?;
+                    if actual.size() != Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()) {
+                        return Err("Body resized during movement verification".into());
+                    }
+                    Ok(actual.origin())
+                },
+                |time| runtime.pointer.release_if_held(conn, time).map(|_| ()),
+            )?;
+            if !runtime.interaction.has_left_gesture() {
+                runtime.safety.clear();
+            }
+        }
+        if runtime.safety.deadline.is_some_and(|dl| now >= dl) {
+            let (sequence, pressed) = crate::x11::pointer::left_button_pressed(conn, root)?;
+            runtime.safety.observed(pressed, sequence);
+        }
+
+        let batch = drain_events_bounded(&mut buffered_event, 64, || {
+            conn.poll_for_event_with_sequence()
+        })?;
+        for (event, sequence) in batch {
+            if matches!(&event, Event::DestroyNotify(ev) if ev.window == window.window) {
+                window.window_resource.externally_destroyed();
+            }
+            if runtime.apply_safety(Instant::now(), Some(sequence)) {
+                runtime.cancel(
+                    conn,
+                    window,
+                    "QueryPointer confirmed initiating button released",
+                )?;
+            }
+            let right_cancelled = matches!(&event, Event::ButtonPress(ev) if ev.event == window.window && ev.detail == 3)
+                && runtime.interaction.has_left_gesture();
+            if matches!(&event, Event::ButtonPress(ev) if ev.event == window.window && ev.detail == 3 && !runtime.interaction.accepts_gesture_time(ev.time))
+            {
+                continue;
+            }
+            if interrupts_pending_movement(&event, root, window.window, atoms) {
+                runtime.cancel(conn, window, "host or right-button interruption")?;
+            } else if !matches!(event, Event::MotionNotify(_)) {
+                runtime.flush_move(conn, window)?;
+            }
+            if relevant_layout_event(&event, root, window.window, atoms) {
+                let layout = query_desktop_layout(conn, root, atoms, Some(selected_monitor))?;
+                bounds = checked_probe_bounds(layout.usable_area)?;
+                if !matches!(
+                    runtime.body,
+                    BodyAvailability::AwaitingMap | BodyAvailability::Unavailable
+                ) {
+                    if window.verified_visible(conn, layout.current_desktop, atoms.wm_desktop)? {
+                        runtime.body = BodyAvailability::Validating;
+                        runtime.placement(conn, root, window, &bounds)?;
+                    } else {
+                        runtime.unavailable(false);
                     }
                 }
-                other_event => {
-                    // Flush pending move before handling any non-motion event
-                    flush_pending_move(
-                        &mut pending_move,
-                        &mut probe_window,
-                        &conn,
-                        &mut pointer_tracker,
-                        &renderer,
-                        &mut confirmation_deadline,
-                    );
-
-                    match other_event {
-                        Event::MapNotify(ev) if ev.window == probe_window.window => {
-                            if !mapped_logged {
-                                mapped_logged = true;
-                                match probe_window.query_actual_root_geometry(&conn, screen.root) {
-                                    Ok(actual_geometry) => {
-                                        println!("\n[Placement Verification (MapNotify)]");
-                                        println!(
-                                            "  Startup placement: requested={}, actual={}",
-                                            requested_origin,
-                                            actual_geometry.origin()
-                                        );
-                                        println!(
-                                            "  Actual mapped geometry: {} (size: {})",
-                                            actual_geometry,
-                                            actual_geometry.size()
-                                        );
+                continue;
+            }
+            match event {
+                Event::MapNotify(ev) if ev.window == window.window => {
+                    runtime.cancel(conn, window, "map verification")?;
+                    let layout = query_desktop_layout(conn, root, atoms, Some(selected_monitor))?;
+                    bounds = checked_probe_bounds(layout.usable_area)?;
+                    if window.verified_visible(conn, layout.current_desktop, atoms.wm_desktop)? {
+                        runtime.body = BodyAvailability::Validating;
+                        runtime.placement(conn, root, window, &bounds)?;
+                        println!("[PLACEMENT] Verified map at {}", window.confirmed_origin());
+                    } else {
+                        runtime.unavailable(false);
+                    }
+                }
+                Event::UnmapNotify(ev) if ev.window == window.window => {
+                    runtime.unavailable(false);
+                }
+                Event::DestroyNotify(ev) if ev.window == window.window => {
+                    window.window_resource.externally_destroyed();
+                    runtime.unavailable(true);
+                    println!("[LIFECYCLE] Body externally destroyed; shutting down");
+                    return Ok(());
+                }
+                Event::ConfigureNotify(ev) if ev.window == window.window => {
+                    if matches!(
+                        runtime.body,
+                        BodyAvailability::Unavailable | BodyAvailability::AwaitingMap
+                    ) {
+                        continue;
+                    }
+                    match window.handle_configure_notify(conn, root, &ev)? {
+                        ConfigureReconciliation::UnexpectedSizeChange { expected, actual } => {
+                            return Err(format!(
+                                "WM altered body dimensions: expected {expected}, actual {actual}"
+                            )
+                            .into())
+                        }
+                        _ if runtime.correction.is_some() => {} // fixed deadline verifies the live position
+                        ConfigureReconciliation::Confirmed { origin, .. } => {
+                            if window.in_flight_moves.is_empty() {
+                                if runtime.final_target.is_some_and(|target| target != origin) {
+                                    runtime.cancel(conn, window, "final-position mismatch")?;
+                                } else {
+                                    runtime.final_target = None;
+                                    runtime.confirmation_deadline = None;
+                                }
+                            }
+                        }
+                        ConfigureReconciliation::GenuineMismatch {
+                            requested,
+                            confirmed,
+                        } => {
+                            eprintln!("[WARN] WM adjusted movement: requested {requested}, confirmed {confirmed}");
+                            runtime.cancel(conn, window, "WM movement mismatch")?;
+                        }
+                        ConfigureReconciliation::InFlightCatchUp { .. } => {
+                            runtime.confirmation_deadline =
+                                Some(Instant::now() + CONFIRMATION_TIMEOUT);
+                        }
+                        ConfigureReconciliation::StaleHistorical { .. } => {}
+                    }
+                }
+                Event::MotionNotify(ev) if ev.event == window.window && runtime.accepts_input() => {
+                    let was_dragging = runtime.interaction.is_dragging();
+                    if let HostAction::MoveWindow { target } = runtime.interaction.handle_motion(
+                        Point::new(ev.root_x.into(), ev.root_y.into()),
+                        ev.time,
+                        &bounds,
+                    ) {
+                        if !was_dragging {
+                            println!("[INPUT] Drag started; target origin {target}");
+                        }
+                        runtime.pending_move = Some(target);
+                    }
+                }
+                Event::ButtonPress(ev) if ev.event == window.window && runtime.accepts_input() => {
+                    use x11rb::protocol::xproto::KeyButMask;
+                    match ev.detail {
+                        1 if !ev.state.contains(KeyButMask::BUTTON1) => {
+                            let origin = window.query_actual_root_origin(conn, root)?;
+                            if let HostAction::AcquireGrab { time } =
+                                runtime.interaction.handle_left_press(
+                                    Point::new(ev.root_x.into(), ev.root_y.into()),
+                                    (ev.event_x, ev.event_y),
+                                    ev.time,
+                                    origin,
+                                )
+                            {
+                                match grab_pointer(conn, window.window, time)? {
+                                    GrabStatus::SUCCESS => {
+                                        runtime.pointer.set_grabbed(true);
+                                        runtime.interaction.on_grab_acquired();
+                                        runtime.safety.acquired(Instant::now());
+                                        runtime.final_target = None;
+                                        println!("[INPUT] Left gesture captured");
                                     }
-                                    Err(e) => {
-                                        fatal_host_error(
-                                            &format!(
-                                                "Failed to query actual root geometry on MapNotify: {}",
-                                                e
-                                            ),
-                                            &conn,
-                                            &mut pointer_tracker,
-                                            &renderer,
-                                            &probe_window,
-                                        );
+                                    status => {
+                                        runtime.interaction.on_grab_denied();
+                                        eprintln!("[WARN] Pointer capture denied: {status:?}");
                                     }
                                 }
                             }
                         }
-                        Event::ConfigureNotify(ev) if ev.window == probe_window.window => {
-                            match probe_window.handle_configure_notify(&conn, screen.root, &ev) {
-                                Ok(ConfigureReconciliation::Confirmed { origin, .. }) => {
-                                    if let Some(expected_final) = awaiting_final_confirmation {
-                                        if origin == expected_final {
-                                            awaiting_final_confirmation = None;
-                                            println!(
-                                                "[INPUT] Final placement confirmed by WM at {}",
-                                                origin
-                                            );
-                                        } else if probe_window.in_flight_moves.is_empty() {
-                                            eprintln!(
-                                                "[WARN] Final placement adjusted by WM to {} (expected {}); cancelling interaction.",
-                                                origin, expected_final
-                                            );
-                                            awaiting_final_confirmation = None;
-                                            if let HostAction::ReleaseGrab { time } = interaction
-                                                .cancel_on_wm_mismatch(x11rb::CURRENT_TIME)
-                                            {
-                                                if let Err(e) =
-                                                    pointer_tracker.release_if_held(&conn, time)
-                                                {
-                                                    fatal_host_error(
-                                                        &format!(
-                                                            "Failed to release pointer capture on mismatch cancellation: {}",
-                                                            e
-                                                        ),
-                                                        &conn,
-                                                        &mut pointer_tracker,
-                                                        &renderer,
-                                                        &probe_window,
-                                                    );
-                                                }
-                                            }
-                                            pending_move = None;
-                                            probe_window.cancel_in_flight_moves();
-                                        }
-                                    }
-                                    if probe_window.in_flight_moves.is_empty()
-                                        && awaiting_final_confirmation.is_none()
-                                    {
-                                        confirmation_deadline = None;
-                                    }
-                                }
-                                Ok(ConfigureReconciliation::InFlightCatchUp { .. }) => {
-                                    confirmation_deadline =
-                                        Some(Instant::now() + CONFIRMATION_TIMEOUT);
-                                }
-                                Ok(ConfigureReconciliation::StaleHistorical { .. }) => {}
-                                Ok(ConfigureReconciliation::GenuineMismatch {
-                                    requested,
-                                    confirmed,
-                                }) => {
-                                    eprintln!(
-                                        "[WARN] Window manager refused or adjusted requested movement: requested {}, confirmed {}; cancelling interaction.",
-                                        requested, confirmed
-                                    );
-                                    if let Some(expected_final) = awaiting_final_confirmation.take()
-                                    {
-                                        eprintln!(
-                                            "[WARN] Final placement adjusted by WM to {} (expected {})",
-                                            confirmed, expected_final
-                                        );
-                                    }
-                                    if let HostAction::ReleaseGrab { time } =
-                                        interaction.cancel_on_wm_mismatch(x11rb::CURRENT_TIME)
-                                    {
-                                        if let Err(e) = pointer_tracker.release_if_held(&conn, time)
-                                        {
-                                            fatal_host_error(
-                                                &format!(
-                                                    "Failed to release pointer capture on mismatch cancellation: {}",
-                                                    e
-                                                ),
-                                                &conn,
-                                                &mut pointer_tracker,
-                                                &renderer,
-                                                &probe_window,
-                                            );
-                                        }
-                                    }
-                                    pending_move = None;
-                                    probe_window.cancel_in_flight_moves();
-                                    confirmation_deadline = None;
-                                }
-                                Ok(ConfigureReconciliation::UnexpectedSizeChange {
-                                    expected,
-                                    actual,
-                                }) => {
-                                    fatal_host_error(
-                                        &format!(
-                                            "Window manager altered probe dimensions unexpectedly: expected {}, received {}",
-                                            expected, actual
-                                        ),
-                                        &conn,
-                                        &mut pointer_tracker,
-                                        &renderer,
-                                        &probe_window,
-                                    );
-                                }
-                                Err(e) => {
-                                    fatal_host_error(
-                                        &format!("Failed to reconcile ConfigureNotify: {}", e),
-                                        &conn,
-                                        &mut pointer_tracker,
-                                        &renderer,
-                                        &probe_window,
-                                    );
-                                }
-                            }
-                        }
-                        Event::Expose(exp) if exp.window == probe_window.window => {
-                            // Blit only on exp.count == 0 (final sub-rectangle of composite exposure)
-                            if exp.count == 0 {
-                                if let Err(e) = renderer.paint(&conn, probe_window.window) {
-                                    fatal_host_error(
-                                        &format!("Repaint on Expose failed: {}", e),
-                                        &conn,
-                                        &mut pointer_tracker,
-                                        &renderer,
-                                        &probe_window,
-                                    );
-                                }
-                            }
-                        }
-                        Event::EnterNotify(ev) if ev.event == probe_window.window => {
-                            println!(
-                                "[INPUT] Pointer entered body at ({}, {})",
-                                ev.event_x, ev.event_y
-                            );
-                        }
-                        Event::LeaveNotify(ev) if ev.event == probe_window.window => {
-                            println!(
-                                "[INPUT] Pointer left body at ({}, {})",
-                                ev.event_x, ev.event_y
-                            );
-                        }
-                        Event::ButtonPress(ev) if ev.event == probe_window.window => {
-                            match ev.detail {
-                                1 => {
-                                    let pointer_root =
-                                        Point::new(ev.root_x as i32, ev.root_y as i32);
-                                    let local = (ev.event_x, ev.event_y);
-                                    let actual_origin = match probe_window
-                                        .query_actual_root_origin(&conn, screen.root)
-                                    {
-                                        Ok(origin) => origin,
-                                        Err(e) => {
-                                            fatal_host_error(
-                                                &format!(
-                                                    "Failed to query actual window origin on press: {}",
-                                                    e
-                                                ),
-                                                &conn,
-                                                &mut pointer_tracker,
-                                                &renderer,
-                                                &probe_window,
-                                            );
-                                        }
-                                    };
-
-                                    match interaction.handle_left_press(
-                                        pointer_root,
-                                        local,
-                                        ev.time,
-                                        actual_origin,
-                                    ) {
-                                        HostAction::AcquireGrab { time } => {
-                                            match grab_pointer(&conn, probe_window.window, time) {
-                                                Ok(GrabStatus::SUCCESS) => {
-                                                    pointer_tracker.set_grabbed(true);
-                                                    interaction.on_grab_acquired();
-                                                    awaiting_final_confirmation = None;
-                                                    println!(
-                                                        "[INPUT] ButtonPress: button=1 (Left) at ({}, {}) -> pointer capture acquired",
-                                                        ev.event_x, ev.event_y
-                                                    );
-                                                }
-                                                Ok(status) => {
-                                                    interaction.on_grab_denied();
-                                                    println!(
-                                                        "[INPUT] ButtonPress: button=1 (Left) -> pointer capture denied ({:?}), recovered to Idle",
-                                                        status
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    fatal_host_error(
-                                                        &format!(
-                                                            "GrabPointer request failed: {}",
-                                                            e
-                                                        ),
-                                                        &conn,
-                                                        &mut pointer_tracker,
-                                                        &renderer,
-                                                        &probe_window,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        _ => {
-                                            println!(
-                                                "[INPUT] ButtonPress: button=1 (Left) at ({}, {}) (outside interactive shape)",
-                                                ev.event_x, ev.event_y
-                                            );
-                                        }
-                                    }
-                                }
-                                3 => match interaction.handle_right_press(ev.time) {
-                                    HostAction::ReleaseGrab { time } => {
-                                        if let Err(e) = pointer_tracker.release_if_held(&conn, time)
-                                        {
-                                            fatal_host_error(
-                                                &format!(
-                                                    "Failed to release pointer capture on cancel: {}",
-                                                    e
-                                                ),
-                                                &conn,
-                                                &mut pointer_tracker,
-                                                &renderer,
-                                                &probe_window,
-                                            );
-                                        }
-                                        pending_move = None;
-                                        probe_window.cancel_in_flight_moves();
-                                        confirmation_deadline = None;
-                                        awaiting_final_confirmation = None;
-                                        println!(
-                                            "[INPUT] ButtonPress: button=3 (Right) -> cancelled active gesture and released capture"
-                                        );
-                                    }
-                                    HostAction::ExitCleanly => {
-                                        println!(
-                                            "[INPUT] ButtonPress: button=3 (Right) on body at ({}, {}) -> clean exit requested.",
-                                            ev.event_x, ev.event_y
-                                        );
-                                        running = false;
-                                        break;
-                                    }
-                                    _ => {}
-                                },
-                                other => {
-                                    interaction.handle_other_button_press(other, ev.time);
-                                    println!(
-                                        "[INPUT] ButtonPress: button={} at ({}, {}) (ignored)",
-                                        other, ev.event_x, ev.event_y
-                                    );
-                                }
-                            }
-                        }
-                        Event::ButtonRelease(ev) if ev.event == probe_window.window => {
-                            match ev.detail {
-                                1 => {
-                                    let pointer_root =
-                                        Point::new(ev.root_x as i32, ev.root_y as i32);
-                                    let local = (ev.event_x, ev.event_y);
-                                    match interaction.handle_left_release(
-                                        pointer_root,
-                                        local,
-                                        ev.time,
-                                        &valid_bounds,
-                                    ) {
-                                        HostAction::ReleaseGrabAndMoveWindow { time, target } => {
-                                            if target != probe_window.requested_origin() {
-                                                if let Err(e) =
-                                                    probe_window.configure_position(&conn, target)
-                                                {
-                                                    fatal_host_error(
-                                                        &format!(
-                                                            "Failed to finalize window position at {}: {}",
-                                                            target, e
-                                                        ),
-                                                        &conn,
-                                                        &mut pointer_tracker,
-                                                        &renderer,
-                                                        &probe_window,
-                                                    );
-                                                }
-                                            }
-                                            if let Err(e) =
-                                                pointer_tracker.release_if_held(&conn, time)
-                                            {
-                                                fatal_host_error(
-                                                    &format!(
-                                                        "Failed to release pointer capture on drag completion: {}",
-                                                        e
-                                                    ),
-                                                    &conn,
-                                                    &mut pointer_tracker,
-                                                    &renderer,
-                                                    &probe_window,
-                                                );
-                                            }
-                                            if probe_window.in_flight_moves.is_empty()
-                                                && probe_window.confirmed_origin() == target
-                                            {
-                                                awaiting_final_confirmation = None;
-                                                confirmation_deadline = None;
-                                                println!(
-                                                    "[INPUT] Drag completed at root ({}, {}), target origin {} (already confirmed by WM)",
-                                                    ev.root_x, ev.root_y, target
-                                                );
-                                            } else {
-                                                awaiting_final_confirmation = Some(target);
-                                                confirmation_deadline =
-                                                    Some(Instant::now() + CONFIRMATION_TIMEOUT);
-                                                println!(
-                                                    "[INPUT] Drag completed at root ({}, {}), requested origin {}; awaiting WM confirmation",
-                                                    ev.root_x, ev.root_y, target
-                                                );
-                                            }
-                                        }
-                                        HostAction::ReleaseGrabAndToggleColor { time } => {
-                                            if let Err(e) =
-                                                pointer_tracker.release_if_held(&conn, time)
-                                            {
-                                                fatal_host_error(
-                                                    &format!(
-                                                        "Failed to release pointer capture on click release: {}",
-                                                        e
-                                                    ),
-                                                    &conn,
-                                                    &mut pointer_tracker,
-                                                    &renderer,
-                                                    &probe_window,
-                                                );
-                                            }
-                                            match renderer.toggle_color(&conn, probe_window.window)
-                                            {
-                                                Ok(theme) => {
-                                                    println!(
-                                                        "[INPUT] ButtonRelease: button=1 (Left) at ({}, {}) on shape -> completed click, toggled body color to {}",
-                                                        ev.event_x,
-                                                        ev.event_y,
-                                                        theme.name()
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    fatal_host_error(
-                                                        &format!(
-                                                            "Color toggle on ButtonRelease failed: {}",
-                                                            e
-                                                        ),
-                                                        &conn,
-                                                        &mut pointer_tracker,
-                                                        &renderer,
-                                                        &probe_window,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        HostAction::ReleaseGrab { time } => {
-                                            if let Err(e) =
-                                                pointer_tracker.release_if_held(&conn, time)
-                                            {
-                                                fatal_host_error(
-                                                    &format!(
-                                                        "Failed to release pointer capture on click cancellation: {}",
-                                                        e
-                                                    ),
-                                                    &conn,
-                                                    &mut pointer_tracker,
-                                                    &renderer,
-                                                    &probe_window,
-                                                );
-                                            }
-                                            println!(
-                                                "[INPUT] ButtonRelease: button=1 (Left) at ({}, {}) outside shape -> click cancelled without toggle",
-                                                ev.event_x, ev.event_y
-                                            );
-                                        }
-                                        HostAction::None => {
-                                            println!(
-                                                "[INPUT] ButtonRelease: button=1 (Left) at ({}, {}) (stale/suppressed)",
-                                                ev.event_x, ev.event_y
-                                            );
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                other => {
-                                    interaction.handle_other_button_release(other, ev.time);
-                                    println!(
-                                        "[INPUT] ButtonRelease: button={} at ({}, {}) (ignored)",
-                                        other, ev.event_x, ev.event_y
-                                    );
-                                }
-                            }
-                        }
-                        Event::ClientMessage(msg) if msg.window == probe_window.window => {
-                            let data = msg.data.as_data32();
-                            if data[0] == probe_window.wm_delete_window {
-                                println!("  Received WM_DELETE_WINDOW. Exiting cleanly.");
-                                if let Err(e) =
-                                    pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME)
-                                {
-                                    fatal_host_error(
-                                        &format!(
-                                            "Failed to release pointer capture on WM_DELETE_WINDOW: {}",
-                                            e
-                                        ),
-                                        &conn,
-                                        &mut pointer_tracker,
-                                        &renderer,
-                                        &probe_window,
-                                    );
-                                }
-                                running = false;
-                                break;
-                            }
-                        }
-                        Event::Error(xerr) => {
-                            fatal_host_error(
-                                &format!("Asynchronous X11 protocol error received: {:?}", xerr),
-                                &conn,
-                                &mut pointer_tracker,
-                                &renderer,
-                                &probe_window,
-                            );
+                        // The common pre-dispatch cancellation consumed right-cancel. Only a
+                        // fresh idle right press with left physically up can request M02.4 quit.
+                        3 if !right_cancelled
+                            && !ev.state.contains(KeyButMask::BUTTON1)
+                            && runtime.interaction.handle_right_press(ev.time)
+                                == HostAction::ExitCleanly =>
+                        {
+                            return Ok(());
                         }
                         _ => {}
                     }
                 }
+                Event::ButtonRelease(ev) if ev.event == window.window => {
+                    if ev.detail != 1 {
+                        continue;
+                    }
+                    let action = runtime.interaction.handle_left_release(
+                        Point::new(ev.root_x.into(), ev.root_y.into()),
+                        (ev.event_x, ev.event_y),
+                        ev.time,
+                        &bounds,
+                    );
+                    match action {
+                        HostAction::ReleaseGrabAndMoveWindow { time, target } => {
+                            if target != window.requested_origin() {
+                                window.configure_position(conn, target)?;
+                            }
+                            runtime.pointer.release_if_held(conn, time)?;
+                            runtime.safety.clear();
+                            if window.in_flight_moves.is_empty()
+                                && window.confirmed_origin() == target
+                            {
+                                runtime.final_target = None;
+                                runtime.confirmation_deadline = None;
+                            } else {
+                                runtime.final_target = Some(target);
+                                runtime.confirmation_deadline =
+                                    Some(Instant::now() + CONFIRMATION_TIMEOUT);
+                            }
+                            println!("[INPUT] Drag released at requested origin {target}");
+                        }
+                        HostAction::ReleaseGrabAndToggleColor { time } => {
+                            runtime.pointer.release_if_held(conn, time)?;
+                            runtime.safety.clear();
+                            let theme = renderer.toggle_color(conn, window.window)?;
+                            println!("[INPUT] Click completed: {}", theme.name());
+                        }
+                        HostAction::ReleaseGrab { time } => {
+                            runtime.pointer.release_if_held(conn, time)?;
+                            runtime.safety.clear();
+                        }
+                        _ => {}
+                    }
+                }
+                Event::Expose(ev) if ev.window == window.window && ev.count == 0 => {
+                    renderer.paint(conn, window.window)?;
+                }
+                Event::ClientMessage(ev)
+                    if ev.window == window.window
+                        && ev.data.as_data32()[0] == window.wm_delete_window =>
+                {
+                    return Ok(());
+                }
+                Event::Error(error) => {
+                    return Err(format!("Asynchronous X11 error: {error:?}").into())
+                }
+                _ => {} // LeaveNotify never cancels a stationary hold.
             }
-            if !running {
-                break;
+        }
+
+        // Look one event ahead before the batch-end flush. An interruption at the
+        // batch boundary must discard the coalesced move just like one within a batch.
+        if let Some((event, sequence)) = conn.poll_for_event_with_sequence()? {
+            if runtime.apply_safety(Instant::now(), Some(sequence)) {
+                runtime.cancel(
+                    conn,
+                    window,
+                    "QueryPointer confirmed initiating button released",
+                )?;
             }
-        }
-
-        if !running {
-            break;
-        }
-
-        // Flush any remaining pending move before sleeping
-        flush_pending_move(
-            &mut pending_move,
-            &mut probe_window,
-            &conn,
-            &mut pointer_tracker,
-            &renderer,
-            &mut confirmation_deadline,
-        );
-
-        if !running {
-            break;
-        }
-
-        // Perform all X11 operations before the final empty-event check:
-        // Check if movement confirmation deadline has expired
-        check_confirmation_timeout(
-            &conn,
-            screen.root,
-            &mut confirmation_deadline,
-            &mut probe_window,
-            &mut awaiting_final_confirmation,
-            &mut interaction,
-            &mut pointer_tracker,
-            &renderer,
-            &mut pending_move,
-        );
-
-        // Flush any pending requests before waiting
-        if let Err(e) = conn.flush() {
-            fatal_host_error(
-                &format!("Failed to flush X11 connection: {}", e),
-                &conn,
-                &mut pointer_tracker,
-                &renderer,
-                &probe_window,
-            );
-        }
-
-        // Before sleeping on the socket, verify no events remain buffered in x11rb
-        // (which can occur if the drained batch reached MAX_EVENT_BATCH or if
-        // synchronous reply() calls received and queued incoming server events).
-        if buffered_event.is_some() {
+            let interrupted = interrupts_pending_movement(&event, root, window.window, atoms);
+            buffered_event = Some((event, sequence));
+            if !interrupted {
+                runtime.flush_move(conn, window)?;
+            }
             continue;
         }
-        match conn.poll_for_event() {
-            Ok(Some(ev)) => {
-                buffered_event = Some(ev);
-                continue;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                fatal_host_error(
-                    &format!("X11 connection poll error: {}", e),
-                    &conn,
-                    &mut pointer_tracker,
-                    &renderer,
-                    &probe_window,
-                );
-            }
+        if runtime.apply_safety(Instant::now(), None) {
+            runtime.cancel(
+                conn,
+                window,
+                "QueryPointer confirmed initiating button released",
+            )?;
+            continue;
         }
-
-        // Compute timeout until duration limit or confirmation deadline
-        let mut timeout_ms = -1;
+        runtime.flush_move(conn, window)?;
+        conn.flush()?;
+        // reply()/check() can have buffered events. Process them before a safety observation
+        // or socket wait, preserving ordinary release and fresh-press ordering across batches.
+        if let Some(event) = conn.poll_for_event_with_sequence()? {
+            buffered_event = Some(event);
+            continue;
+        }
         let now = Instant::now();
-
-        if let Some(sec) = config.duration_secs {
-            let duration = Duration::from_secs(sec);
-            let elapsed = start_time.elapsed();
-            if elapsed >= duration {
-                continue; // Loop top will perform clean shutdown
-            }
-            let remaining = duration - elapsed;
-            let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-            timeout_ms = if timeout_ms == -1 {
-                ms
-            } else {
-                timeout_ms.min(ms)
-            };
-        }
-
-        if let Some(dl) = confirmation_deadline {
-            if now >= dl {
-                continue; // Loop around to process expired confirmation deadline immediately
-            }
-            let remaining = dl - now;
-            let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-            timeout_ms = if timeout_ms == -1 {
-                ms
-            } else {
-                timeout_ms.min(ms)
-            };
-        }
-
+        let timeout = [
+            duration_deadline,
+            runtime.confirmation_deadline,
+            runtime.correction.map(|(_, dl)| dl),
+            runtime.safety.deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|dl| dl.saturating_duration_since(now))
+        .min();
+        let timeout_ms = timeout.map_or(-1, |duration| {
+            duration.as_millis().min(i32::MAX as u128) as i32
+        });
         let mut pfd = PollFd {
-            fd: conn_fd,
+            fd: conn.stream().as_raw_fd(),
             events: POLLIN,
             revents: 0,
         };
-
-        let ret = unsafe { poll(&mut pfd as *mut _, 1, timeout_ms) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::Interrupted {
-                fatal_host_error(
-                    &format!("Socket poll error: {}", err),
-                    &conn,
-                    &mut pointer_tracker,
-                    &renderer,
-                    &probe_window,
-                );
+        let result = unsafe { poll(&mut pfd, 1, timeout_ms) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error.into());
             }
+        } else if pfd.revents & (0x0008 | 0x0010 | 0x0020) != 0 {
+            return Err(
+                format!("X11 socket unavailable (poll revents=0x{:x})", pfd.revents).into(),
+            );
         }
     }
-
-    // 6. Cleanup after clean exit
-    println!("\n[Cleanup]");
-    let mut cleanup_failed = false;
-    if let Err(e) = pointer_tracker.release_if_held(&conn, x11rb::CURRENT_TIME) {
-        eprintln!("[ERROR] Failed to release pointer capture: {}", e);
-        cleanup_failed = true;
-    }
-    if let Err(e) = renderer.destroy(&conn) {
-        eprintln!("[ERROR] Failed to destroy renderer resources: {}", e);
-        cleanup_failed = true;
-    }
-    if let Err(e) = probe_window.destroy(&conn) {
-        eprintln!("[ERROR] Failed to destroy window resources: {}", e);
-        cleanup_failed = true;
-    }
-
-    if cleanup_failed {
-        eprintln!("[ERROR] Server-side resource cleanup failed.");
-        process::exit(1);
-    }
-
-    println!("  Resources released cleanly.");
-    println!("  Probe exited cleanly.");
 }
 
 /// Drains available X11 events into a bounded batch, prepending any previously buffered event.
-pub fn drain_events_bounded<E, F>(
-    buffered_event: &mut Option<Event>,
+pub fn drain_events_bounded<T, E, F>(
+    buffered_event: &mut Option<T>,
     max_batch: usize,
     mut poll_fn: F,
-) -> Result<Vec<Event>, E>
+) -> Result<Vec<T>, E>
 where
-    F: FnMut() -> Result<Option<Event>, E>,
+    F: FnMut() -> Result<Option<T>, E>,
 {
     let mut batch = Vec::new();
     if let Some(ev) = buffered_event.take() {
@@ -1006,159 +1011,62 @@ where
     Ok(batch)
 }
 #[allow(clippy::too_many_arguments)]
-fn check_confirmation_timeout_with<F, R>(
-    confirmation_deadline: &mut Option<Instant>,
-    probe_window: &mut ManagedProbeWindow,
-    awaiting_final_confirmation: &mut Option<Point>,
+fn cancel_movement_with(
     interaction: &mut InteractionManager,
     pending_move: &mut Option<Point>,
-    mut query_fn: F,
-    mut release_grab_fn: R,
-) -> Result<bool, Box<dyn std::error::Error>>
-where
-    F: FnMut() -> Result<Point, Box<dyn std::error::Error>>,
-    R: FnMut(u32) -> Result<(), Box<dyn std::error::Error>>,
-{
-    if let Some(dl) = *confirmation_deadline {
-        if Instant::now() >= dl {
-            let live_origin = query_fn()?;
-            let size = Size::new(probe_window.width as u32, probe_window.height as u32);
-            let rec = probe_window.reconcile_live_snapshot(live_origin, size);
-            *confirmation_deadline = None;
-
-            match rec {
-                ConfigureReconciliation::Confirmed { origin, .. } => {
-                    if let Some(final_target) = awaiting_final_confirmation.take() {
-                        if origin == final_target {
-                            println!("[INPUT] Final placement confirmed by WM at {}", origin);
-                        } else {
-                            eprintln!(
-                                "[WARN] Final placement adjusted by WM to {} (expected {}); cancelling interaction.",
-                                origin, final_target
-                            );
-                            if let HostAction::ReleaseGrab { time } =
-                                interaction.cancel_on_wm_mismatch(x11rb::CURRENT_TIME)
-                            {
-                                release_grab_fn(time)?;
-                            }
-                            *pending_move = None;
-                            probe_window.cancel_in_flight_moves();
-                        }
-                    }
-                }
-                ConfigureReconciliation::GenuineMismatch {
-                    requested,
-                    confirmed,
-                } => {
-                    eprintln!(
-                        "[WARN] Movement confirmation timed out: requested {}, confirmed {}; cancelling interaction.",
-                        requested, confirmed
-                    );
-                    if let Some(final_target) = awaiting_final_confirmation.take() {
-                        eprintln!(
-                            "[WARN] Final placement adjusted by WM to {} (expected {})",
-                            confirmed, final_target
-                        );
-                    }
-                    if let HostAction::ReleaseGrab { time } =
-                        interaction.cancel_on_wm_mismatch(x11rb::CURRENT_TIME)
-                    {
-                        release_grab_fn(time)?;
-                    }
-                    *pending_move = None;
-                    probe_window.cancel_in_flight_moves();
-                }
-                _ => {}
-            }
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    final_target: &mut Option<Point>,
+    deadline: &mut Option<Instant>,
+    window: &mut ManagedProbeWindow,
+    release: impl FnOnce(u32) -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    interaction.cancel(x11rb::CURRENT_TIME);
+    *pending_move = None;
+    *final_target = None;
+    *deadline = None;
+    window.cancel_in_flight_moves();
+    release(x11rb::CURRENT_TIME)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn check_confirmation_timeout(
-    conn: &impl Connection,
-    screen_root: x11rb::protocol::xproto::Window,
+fn check_confirmation_timeout_with<F, R>(
     confirmation_deadline: &mut Option<Instant>,
-    probe_window: &mut ManagedProbeWindow,
-    awaiting_final_confirmation: &mut Option<Point>,
+    window: &mut ManagedProbeWindow,
+    final_target: &mut Option<Point>,
     interaction: &mut InteractionManager,
-    pointer_tracker: &mut PointerCaptureTracker,
-    renderer: &Renderer,
     pending_move: &mut Option<Point>,
-) {
-    let window_id = probe_window.window;
-    if let Err(e) = check_confirmation_timeout_with(
-        confirmation_deadline,
-        probe_window,
-        awaiting_final_confirmation,
-        interaction,
-        pending_move,
-        || ManagedProbeWindow::query_window_actual_root_origin(conn, window_id, screen_root),
-        |time| pointer_tracker.release_if_held(conn, time).map(|_| ()),
-    ) {
-        fatal_host_error(
-            &format!("Failed during confirmation timeout handling: {}", e),
-            conn,
-            pointer_tracker,
-            renderer,
-            probe_window,
-        );
+    mut query: F,
+    release: R,
+) -> Result<bool, HostError>
+where
+    F: FnMut() -> Result<Point, HostError>,
+    R: FnOnce(u32) -> Result<(), HostError>,
+{
+    if !confirmation_deadline.is_some_and(|dl| Instant::now() >= dl) {
+        return Ok(false);
     }
-}
-
-fn flush_pending_move(
-    pending_move: &mut Option<Point>,
-    probe_window: &mut ManagedProbeWindow,
-    conn: &impl Connection,
-    pointer_tracker: &mut PointerCaptureTracker,
-    renderer: &Renderer,
-    confirmation_deadline: &mut Option<Instant>,
-) {
-    if let Some(target) = pending_move.take() {
-        if target != probe_window.requested_origin() {
-            if let Err(e) = probe_window.configure_position(conn, target) {
-                fatal_host_error(
-                    &format!("Failed to move window to {}: {}", target, e),
-                    conn,
-                    pointer_tracker,
-                    renderer,
-                    probe_window,
-                );
-            }
-            *confirmation_deadline = Some(Instant::now() + CONFIRMATION_TIMEOUT);
-        }
-    }
-}
-
-fn fatal_host_error(
-    err_msg: &str,
-    conn: &impl Connection,
-    pointer_tracker: &mut PointerCaptureTracker,
-    renderer: &Renderer,
-    probe_window: &ManagedProbeWindow,
-) -> ! {
-    eprintln!("[ERROR] {}", err_msg);
-    if let Err(e) = pointer_tracker.release_if_held(conn, x11rb::CURRENT_TIME) {
+    let live = query()?;
+    let rec =
+        window.reconcile_live_snapshot(live, Size::new(window.width.into(), window.height.into()));
+    if matches!(rec, ConfigureReconciliation::Confirmed { .. })
+        && final_target.is_none_or(|target| target == live)
+    {
+        *final_target = None;
+        *confirmation_deadline = None;
+    } else {
         eprintln!(
-            "[ERROR] Failed to release pointer capture during error exit: {}",
-            e
+            "[WARN] Movement confirmation mismatch: requested {}, confirmed {live}; cancelling",
+            window.requested_origin()
         );
+        cancel_movement_with(
+            interaction,
+            pending_move,
+            final_target,
+            confirmation_deadline,
+            window,
+            release,
+        )?;
     }
-    if let Err(e) = renderer.destroy(conn) {
-        eprintln!(
-            "[ERROR] Failed to destroy renderer during error exit: {}",
-            e
-        );
-    }
-    if let Err(e) = probe_window.destroy(conn) {
-        eprintln!(
-            "[ERROR] Failed to destroy probe window during error exit: {}",
-            e
-        );
-    }
-    process::exit(1);
+    Ok(true)
 }
 
 fn run_diagnostics(
@@ -1384,6 +1292,8 @@ mod tests {
     #[test]
     fn test_confirmation_timeout_with_no_further_events() {
         let mut window = ManagedProbeWindow {
+            window_resource: Default::default(),
+            colormap_resource: Default::default(),
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
@@ -1435,6 +1345,8 @@ mod tests {
     #[test]
     fn test_awaiting_final_confirmation_rejects_mismatched_target() {
         let mut window = ManagedProbeWindow {
+            window_resource: Default::default(),
+            colormap_resource: Default::default(),
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
@@ -1487,6 +1399,8 @@ mod tests {
         }
 
         let mut window = ManagedProbeWindow {
+            window_resource: Default::default(),
+            colormap_resource: Default::default(),
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
@@ -1569,6 +1483,8 @@ mod tests {
     #[test]
     fn test_two_consecutive_drags_with_delayed_confirmation_of_first() {
         let mut window = ManagedProbeWindow {
+            window_resource: Default::default(),
+            colormap_resource: Default::default(),
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
@@ -1714,6 +1630,8 @@ mod tests {
     #[test]
     fn test_expired_deadline_query_buffers_release_processes_before_socket_wait() {
         let mut window = ManagedProbeWindow {
+            window_resource: Default::default(),
+            colormap_resource: Default::default(),
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
@@ -1841,5 +1759,402 @@ mod tests {
             "Buffered release must be processed before any socket wait"
         );
         assert!(interaction.is_idle());
+    }
+    fn test_window() -> ManagedProbeWindow {
+        ManagedProbeWindow {
+            window_resource: Default::default(),
+            colormap_resource: Default::default(),
+            window: 100,
+            colormap: 1,
+            wm_delete_window: 2,
+            requested_origin: Point::new(100, 100),
+            confirmed_origin: Point::new(100, 100),
+            in_flight_moves: Default::default(),
+            superseded_moves: Default::default(),
+            width: 160,
+            height: 160,
+        }
+    }
+    fn captured_runtime() -> ProbeRuntime {
+        let mut runtime = ProbeRuntime::new();
+        runtime.body = BodyAvailability::Ready;
+        runtime.interaction.handle_left_press(
+            Point::new(180, 180),
+            (80, 80),
+            1000,
+            Point::new(100, 100),
+        );
+        runtime.interaction.on_grab_acquired();
+        runtime.pointer.set_grabbed(true);
+        runtime.safety.acquired(Instant::now());
+        runtime
+    }
+
+    #[test]
+    fn cancellation_invalidates_movement_before_failed_release_and_cleanup_retries() {
+        let mut runtime = captured_runtime();
+        let mut window = test_window();
+        runtime.pending_move = Some(Point::new(200, 200));
+        runtime.final_target = Some(Point::new(220, 220));
+        runtime.confirmation_deadline = Some(Instant::now());
+        window.in_flight_moves.push_back(Point::new(190, 190));
+        assert!(runtime
+            .cancel_with(&mut window, |pointer| pointer
+                .release_with(|| Err("injected ungrab failure".into()))
+                .map(|_| ()))
+            .is_err());
+        assert!(runtime.pending_move.is_none());
+        assert!(runtime.final_target.is_none());
+        assert!(runtime.confirmation_deadline.is_none());
+        assert!(runtime.safety.deadline.is_none());
+        assert!(window.in_flight_moves.is_empty());
+        assert!(window.superseded_moves.contains(&Point::new(190, 190)));
+        assert!(runtime.pointer.is_grabbed());
+        assert_eq!(
+            runtime.interaction.handle_left_release(
+                Point::new(180, 180),
+                (80, 80),
+                1010,
+                &crate::geometry::ValidOriginBounds::new(0, 1000, 0, 1000)
+            ),
+            HostAction::None
+        );
+        runtime
+            .cancel_with(&mut window, |pointer| {
+                pointer.release_with(|| Ok(())).map(|_| ())
+            })
+            .unwrap();
+        assert!(!runtime.pointer.is_grabbed());
+    }
+
+    #[test]
+    fn stationary_hold_rearms_safety_indefinitely_and_release_cancels_without_position() {
+        let mut runtime = captured_runtime();
+        let mut now = Instant::now();
+        for sequence in 1..1000 {
+            now += POINTER_CHECK_INTERVAL;
+            runtime.safety.observed(true, sequence);
+            assert!(!runtime.apply_safety(now, None));
+            assert_eq!(runtime.safety.deadline, Some(now + POINTER_CHECK_INTERVAL));
+            assert!(runtime.interaction.has_left_gesture());
+        }
+        runtime.safety.observed(false, 1000);
+        assert!(runtime.apply_safety(now, None));
+        let mut window = test_window();
+        runtime
+            .cancel_with(&mut window, |pointer| {
+                pointer.release_with(|| Ok(())).map(|_| ())
+            })
+            .unwrap();
+        assert!(runtime.pending_move.is_none());
+        assert!(runtime.final_target.is_none());
+    }
+
+    #[test]
+    fn safety_observation_waits_for_pre_query_release_but_not_later_events() {
+        let mut runtime = captured_runtime();
+        let now = Instant::now();
+        runtime.safety.observed(false, 70000); // extended sequence, beyond 16-bit wrap
+        assert!(!runtime.apply_safety(now, Some(69999)));
+        let action = runtime.interaction.handle_left_release(
+            Point::new(180, 180),
+            (80, 80),
+            1010,
+            &crate::geometry::ValidOriginBounds::new(0, 1000, 0, 1000),
+        );
+        assert_eq!(action, HostAction::ReleaseGrabAndToggleColor { time: 1010 });
+        assert!(!runtime.apply_safety(now, Some(70000)));
+        assert!(runtime.safety.observation.is_none());
+
+        let mut runtime = captured_runtime();
+        runtime.safety.observed(false, 70000);
+        assert!(runtime.apply_safety(now, Some(70000)));
+        assert!(runtime.safety.deadline.is_none());
+    }
+
+    #[test]
+    fn buffered_new_press_invalidates_prior_safety_observation() {
+        let mut runtime = captured_runtime();
+        let now = Instant::now();
+        runtime.safety.observed(false, 900);
+        // The queued release and fresh press both preceded the query response boundary.
+        runtime.interaction.handle_left_release(
+            Point::new(180, 180),
+            (80, 80),
+            1010,
+            &crate::geometry::ValidOriginBounds::new(0, 1000, 0, 1000),
+        );
+        assert!(!runtime.apply_safety(now, Some(899)));
+        runtime.interaction.handle_left_press(
+            Point::new(180, 180),
+            (80, 80),
+            1020,
+            Point::new(100, 100),
+        );
+        runtime.interaction.on_grab_acquired();
+        runtime.safety.acquired(now);
+        assert!(!runtime.apply_safety(now, Some(900)));
+        assert!(runtime.safety.deadline.is_some());
+        assert!(runtime.interaction.has_left_gesture());
+    }
+
+    #[test]
+    fn interruption_discards_coalesced_move_and_release_preserves_flush_order() {
+        use x11rb::protocol::xproto::{ButtonPressEvent, UnmapNotifyEvent, UNMAP_NOTIFY_EVENT};
+        let atoms = x11::monitors::LayoutAtoms {
+            workarea: 3,
+            current_desktop: 4,
+            wm_desktop: 5,
+        };
+        let release = Event::ButtonRelease(ButtonReleaseEvent {
+            response_type: 5,
+            detail: 1,
+            sequence: 1,
+            time: 1010,
+            root: 1,
+            event: 100,
+            child: 0,
+            root_x: 200,
+            root_y: 200,
+            event_x: 80,
+            event_y: 80,
+            state: KeyButMask::BUTTON1,
+            same_screen: true,
+        });
+        assert!(!interrupts_pending_movement(&release, 1, 100, &atoms));
+        let unmap = Event::UnmapNotify(UnmapNotifyEvent {
+            response_type: UNMAP_NOTIFY_EVENT,
+            sequence: 1,
+            event: 100,
+            window: 100,
+            from_configure: false,
+        });
+        assert!(interrupts_pending_movement(&unmap, 1, 100, &atoms));
+        let right = Event::ButtonPress(ButtonPressEvent {
+            detail: 3,
+            ..match release {
+                Event::ButtonRelease(ev) => ev,
+                _ => unreachable!(),
+            }
+        });
+        assert!(interrupts_pending_movement(&right, 1, 100, &atoms));
+        let mut runtime = captured_runtime();
+        runtime.pending_move = Some(Point::new(200, 200));
+        let mut window = test_window();
+        runtime
+            .cancel_with(&mut window, |pointer| {
+                pointer.release_with(|| Ok(())).map(|_| ())
+            })
+            .unwrap();
+        assert!(runtime.pending_move.is_none());
+    }
+
+    #[test]
+    fn unavailable_body_defers_placement_and_verified_remap_requires_correction_first() {
+        let mut runtime = ProbeRuntime::new();
+        let mut window = test_window();
+        let bounds = crate::geometry::ValidOriginBounds::new(0, 50, 0, 50);
+        let actual = crate::geometry::Rect::new(100, 100, 160, 160);
+        runtime.unavailable(false);
+        runtime
+            .placement_with(&mut window, actual, &bounds, |_, _| {
+                panic!("unavailable body must not move")
+            })
+            .unwrap();
+        assert!(!runtime.accepts_input());
+        runtime.body = BodyAvailability::Validating; // production verified map gate
+        let calls = std::cell::Cell::new(0);
+        runtime
+            .placement_with(&mut window, actual, &bounds, |_, target| {
+                assert_eq!(target, Point::new(50, 50));
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert!(!runtime.accepts_input());
+        runtime
+            .placement_with(&mut window, actual, &bounds, |_, _| {
+                panic!("must verify before requesting again")
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        let deadline = runtime.correction.unwrap().1;
+        assert!(!runtime
+            .check_correction(
+                deadline - Duration::from_millis(1),
+                Point::new(100, 100),
+                &bounds
+            )
+            .unwrap());
+        assert!(runtime
+            .check_correction(deadline, Point::new(50, 50), &bounds)
+            .unwrap());
+        assert!(runtime.accepts_input());
+        runtime.unavailable(true);
+        runtime
+            .placement_with(&mut window, actual, &bounds, |_, _| {
+                panic!("destroyed body must not move")
+            })
+            .unwrap();
+        assert!(!runtime.accepts_input());
+    }
+
+    #[test]
+    fn refused_correction_fails_without_retry_and_movement_failure_still_cleans_up() {
+        let mut runtime = captured_runtime();
+        let mut window = test_window();
+        let bounds = crate::geometry::ValidOriginBounds::new(0, 50, 0, 50);
+        let deadline = Instant::now();
+        runtime.correction = Some((Point::new(50, 50), deadline));
+        let result = runtime
+            .check_correction(deadline, Point::new(100, 100), &bounds)
+            .map(|_| ());
+        let calls = std::cell::Cell::new(0);
+        let error = finish_probe_with(result, || {
+            runtime.cancel_with(&mut window, |pointer| {
+                pointer
+                    .release_with(|| {
+                        calls.set(1);
+                        Ok(())
+                    })
+                    .map(|_| ())
+            })?;
+            x11::resource::cleanup_all([Box::new(|| {
+                assert_eq!(calls.get(), 1);
+                calls.set(2);
+                Err("injected cleanup failure".into())
+            })])
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("WM refused necessary bounds correction"));
+        assert_eq!(calls.get(), 2);
+        assert!(!runtime.pointer.is_grabbed());
+
+        runtime.body = BodyAvailability::Validating;
+        let error = runtime
+            .placement_with(
+                &mut window,
+                crate::geometry::Rect::new(100, 100, 160, 160),
+                &bounds,
+                |_, _| Err("injected movement failure".into()),
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "injected movement failure");
+        assert!(runtime.correction.is_none());
+    }
+
+    #[test]
+    fn workspace_workarea_and_root_geometry_are_relevant_but_unrelated_properties_are_not() {
+        use x11rb::protocol::xproto::{Property, PropertyNotifyEvent};
+        let atoms = x11::monitors::LayoutAtoms {
+            workarea: 3,
+            current_desktop: 4,
+            wm_desktop: 5,
+        };
+        let property = |window, atom| {
+            Event::PropertyNotify(PropertyNotifyEvent {
+                response_type: 28,
+                sequence: 1,
+                window,
+                atom,
+                time: 1000,
+                state: Property::NEW_VALUE,
+            })
+        };
+        for event in [property(1, 3), property(1, 4), property(100, 5)] {
+            assert!(relevant_layout_event(&event, 1, 100, &atoms));
+            assert!(interrupts_pending_movement(&event, 1, 100, &atoms));
+        }
+        assert!(!relevant_layout_event(&property(100, 99), 1, 100, &atoms));
+        assert!(!relevant_layout_event(&property(999, 3), 1, 100, &atoms));
+    }
+    #[test]
+    fn safety_boundary_survives_multiple_batches_without_swallowing_ordinary_release() {
+        let mut runtime = captured_runtime();
+        let now = Instant::now();
+        runtime.safety.observed(false, 70000);
+        let mut queue = std::collections::VecDeque::new();
+        for _ in 0..69 {
+            queue.push_back((None, 69999));
+        }
+        queue.push_back((Some(1010), 69999)); // ordinary release buffered by QueryPointer
+        let mut buffered = None;
+        let mut completions = 0;
+        for batch_index in 0..2 {
+            let batch =
+                drain_events_bounded(&mut buffered, 64, || Ok::<_, ()>(queue.pop_front())).unwrap();
+            if batch_index == 0 {
+                assert_eq!(batch.len(), 64);
+            }
+            for (release, sequence) in batch {
+                assert!(!runtime.apply_safety(now, Some(sequence)));
+                if let Some(time) = release {
+                    assert_eq!(
+                        runtime.interaction.handle_left_release(
+                            Point::new(180, 180),
+                            (80, 80),
+                            time,
+                            &crate::geometry::ValidOriginBounds::new(0, 1000, 0, 1000)
+                        ),
+                        HostAction::ReleaseGrabAndToggleColor { time }
+                    );
+                    completions += 1;
+                }
+            }
+        }
+        assert!(!runtime.apply_safety(now, None));
+        assert_eq!(completions, 1);
+        assert!(runtime.safety.deadline.is_none());
+    }
+
+    #[test]
+    fn failed_corrective_move_preserves_primary_error_and_attempts_release_before_destruction() {
+        let mut runtime = captured_runtime();
+        let mut window = test_window();
+        runtime.body = BodyAvailability::Validating;
+        let bounds = crate::geometry::ValidOriginBounds::new(0, 50, 0, 50);
+        let result = runtime.placement_with(
+            &mut window,
+            crate::geometry::Rect::new(100, 100, 160, 160),
+            &bounds,
+            |_, _| Err("injected move failure".into()),
+        );
+        let trace = std::cell::RefCell::new(Vec::new());
+        let error = finish_probe_with(result, || {
+            let cancellation = runtime.cancel_with(&mut window, |pointer| {
+                pointer
+                    .release_with(|| {
+                        trace.borrow_mut().push("ungrab");
+                        Err("injected release failure".into())
+                    })
+                    .map(|_| ())
+            });
+            x11::resource::cleanup_all([
+                Box::new(|| cancellation),
+                Box::new(|| {
+                    trace.borrow_mut().push("renderer");
+                    Ok(())
+                }),
+                Box::new(|| {
+                    trace.borrow_mut().push("window");
+                    Ok(())
+                }),
+            ])
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected move failure");
+        assert_eq!(*trace.borrow(), ["ungrab", "renderer", "window"]);
+        assert!(runtime.pointer.is_grabbed()); // explicit failed release obligation
+        assert!(runtime.pending_move.is_none());
+        assert!(runtime.final_target.is_none());
+    }
+
+    #[test]
+    fn unsupported_x11_coordinate_range_is_rejected_before_placement() {
+        assert!(checked_probe_bounds(crate::geometry::Rect::new(32700, 0, 1920, 1080)).is_err());
+        assert!(checked_probe_bounds(crate::geometry::Rect::new(-40000, 0, 1920, 1080)).is_err());
+        assert!(checked_probe_bounds(crate::geometry::Rect::new(-1920, 0, 1920, 1080)).is_ok());
     }
 }
