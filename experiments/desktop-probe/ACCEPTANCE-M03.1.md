@@ -1,6 +1,6 @@
 # A00-M03.1 verification and pending owner acceptance
 
-Decision: **architecture approved; focused review corrections await publication and matching CI; owner acceptance NOT RUN and on hold**.
+Decision: **implementation/source review PASS; matching CI PASS; owner real-host acceptance L01–L13 NOT RUN**.
 
 Evidence recorded 2026-10-08. Scope is M03.1 only. This record does not mark M03.1 or A00 accepted and does not authorize a later mission.
 
@@ -23,7 +23,23 @@ Owner-supplied GitHub Actions evidence for that exact SHA: [run 37772959174](htt
 
 Independent review approved the architecture but found that an expired root `_NET_SUPPORTED` notification unnecessarily read capabilities before the final body observation. The review also required rejecting empty removal mutations at the transport boundary. Therefore `ca80f6c010e8b686838de2b943da2c8e221a34e2` is **not the final accepted M03.1 executable**. Successful CI on that revision does not supersede those findings.
 
-The focused correction session started with a clean working tree on `m03` at that exact SHA. Corrections remain uncommitted on that baseline. The corrected executable SHA and its new matching CI run are **PENDING owner publication** and must be recorded afterward. No commit, push, branch creation or graphical acceptance was performed in this session.
+The focused correction session started with a clean working tree on `m03` at that exact SHA and ended with uncommitted corrections on that baseline. No commit, push, branch creation or graphical acceptance was performed by Codex in that session.
+
+## Corrected publication and final pre-host review
+
+The owner subsequently published those focused corrections on branch `m03` at **`f8332ec99e876db1d809cd718dc76dff9fd38e27`**.
+
+GitHub Actions [run 37775474758](https://github.com/zNe4/DesktopRoomie/actions/runs/37775474758) executed against that exact SHA and **SUCCEEDED**. Observed CI evidence:
+
+- format PASS;
+- build PASS;
+- Clippy with `-D warnings` PASS;
+- tests PASS — **139 passed, 0 failed, 0 ignored, 0 measured, 0 filtered out**;
+- CI toolchain: `rustc 1.99.0 (b940084d7 2026-09-28)`, `cargo 1.99.0 (5f94df478 2026-08-27)`.
+
+Independent focused review compared `f8332ec…` directly against `ca80f6c…`. The correction commit was limited to `src/main.rs`, `src/x11/state.rs`, this acceptance record and `M03.1-IMPLEMENTATION.md`. The expired-`_NET_SUPPORTED` deadline path now performs the required final body observation without an unnecessary capability read, and empty removals are rejected before X11 request construction. No remaining source-level blocker was found for M03.1 real-host acceptance.
+
+The first published revision `ca80f6c…` remains part of the evidence trail but is **superseded for acceptance by `f8332ec…`**. Owner L01–L13 is still **NOT RUN**; it is now the next gate.
 
 ## Original implementation-session local automated verification
 
@@ -57,7 +73,7 @@ Complete correction-session checks, run from the repository root using the deskt
 | `cargo test --manifest-path experiments/desktop-probe/Cargo.toml` | PASS — exit 0; 139 passed, 0 failed, 0 ignored, 0 measured, 0 filtered out |
 | `git diff --check` | PASS — exit 0, no whitespace diagnostics |
 
-Formatting was applied with `cargo fmt --manifest-path experiments/desktop-probe/Cargo.toml` before verification. The complete resulting diff against `ca80f6c010e8b686838de2b943da2c8e221a34e2` was inspected for scope and regressions. No unrelated M02 source, dependency, lockfile or CI workflow was changed. These local results describe the uncommitted correction tree, not a new published revision or CI result.
+Formatting was applied with `cargo fmt --manifest-path experiments/desktop-probe/Cargo.toml` before verification. The complete resulting diff against `ca80f6c010e8b686838de2b943da2c8e221a34e2` was inspected for scope and regressions. No unrelated M02 source, dependency, lockfile or CI workflow was changed. These local results describe the correction session before publication. The exact corrected tree was later published as `f8332ec99e876db1d809cd718dc76dff9fd38e27`, whose matching CI evidence is recorded above.
 
 ## Controlled / injected evidence
 
@@ -78,7 +94,7 @@ All rows below were exercised by the passing unit suite. They are synthetic prop
 
 ## Owner real-host instructions
 
-**On hold: do not begin L01–L13 yet.** These procedures remain instructions for later owner execution, after the focused corrections are reviewed and the corrected published executable and matching CI evidence are recorded.
+**Ready for owner execution.** Source review and matching CI are complete for `f8332ec99e876db1d809cd718dc76dff9fd38e27`. The procedures below are now the active M03.1 gate. Do not advance to M03.2 until their results are recorded and reviewed.
 
 Use the actual target Openbox/X11/Picom session. Before testing, record the executable revision and dirty status, WM/compositor versions, relevant rules, monitor/workarea/workspace facts, and exact launch command. Keep a portion of the body exposed during Below/Normal tests and use a finite duration when testing covered states. Independent recovery is M03.2 scope.
 
@@ -121,4 +137,4 @@ For every row record actual outcome, focus observation method, exact command, en
 - A partial transition can leave Normal if removal succeeds and addition fails. Diagnostics retain the readable result; there is no rollback.
 - Below may cover the only menu control. Independent recovery remains deliberately deferred; finite duration is available.
 
-The first published revision passed CI and received architectural approval, but review required the focused fixes above. Review of those corrections, their published executable identity and matching CI evidence remain pending. Owner L01–L13 acceptance is NOT RUN and on hold. M03.1 is not yet accepted. Do not advance to M03.2 or other missions.
+The first published revision passed CI and received architectural approval, then was superseded by the focused correction revision `f8332ec99e876db1d809cd718dc76dff9fd38e27`. Independent source review of that corrected revision is PASS and matching GitHub CI run 37775474758 is PASS with 139 tests. Owner L01–L13 acceptance remains NOT RUN and is the next gate. M03.1 is not yet finally accepted. Do not advance to M03.2 or other missions.
