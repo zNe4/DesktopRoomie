@@ -927,6 +927,28 @@ fn layer_property_event(event: &Event, body: u32, atoms: &LayerAtoms) -> bool {
     matches!(event, Event::PropertyNotify(ev) if ev.window == body && ev.atom == atoms.state)
 }
 
+fn service_layer_support_event_with(
+    layers: &mut LayerController,
+    read_support: impl FnOnce() -> Result<PropertyResult<LayerSupport>, HostError>,
+    final_observation: impl FnOnce(&mut LayerController) -> Result<(), HostError>,
+    mut now: impl FnMut() -> Instant,
+) -> Result<(), HostError> {
+    let Some(deadline) = layers.deadline() else {
+        return Ok(());
+    };
+    // An expired operation needs only its final body observation, not capabilities.
+    if now() >= deadline {
+        return final_observation(layers);
+    }
+    let advertised = read_support()?;
+    if now() >= deadline {
+        final_observation(layers)
+    } else {
+        validate_layer_support(layers, advertised);
+        Ok(())
+    }
+}
+
 fn interrupts_layer(
     event: &Event,
     root: u32,
@@ -1228,25 +1250,12 @@ fn run_probe(
             }
             if matches!(&event, Event::PropertyNotify(ev) if ev.window == root && ev.atom == layer_atoms.supported)
             {
-                if runtime.layers.pending().is_some() {
-                    let advertised = layer_atoms.read_support(conn, root)?;
-                    if runtime
-                        .layers
-                        .deadline()
-                        .is_some_and(|deadline| Instant::now() >= deadline)
-                    {
-                        service_layer(
-                            conn,
-                            &layer_atoms,
-                            root,
-                            window.window,
-                            &mut runtime.layers,
-                            None,
-                        )?;
-                    } else {
-                        validate_layer_support(&mut runtime.layers, advertised);
-                    }
-                }
+                service_layer_support_event_with(
+                    &mut runtime.layers,
+                    || layer_atoms.read_support(conn, root),
+                    |layers| service_layer(conn, &layer_atoms, root, window.window, layers, None),
+                    Instant::now,
+                )?;
                 continue;
             }
             if let Some(popup) = runtime.menu.as_ref() {
@@ -3935,6 +3944,41 @@ mod layer_runtime_tests {
             )
             .unwrap();
             assert!(layers.pending().is_none());
+        }
+    }
+
+    #[test]
+    fn expired_support_event_skips_capabilities_and_only_observes_final_body_state() {
+        let started = Instant::now();
+        for final_observed in [ObservedLayer::Above, ObservedLayer::Normal] {
+            let mut layers = LayerController::default();
+            pending_above(&mut layers, started);
+            let handled_at = layers.deadline().unwrap() + Duration::from_millis(1);
+            let reads = Cell::new(0);
+            service_layer_support_event_with(
+                &mut layers,
+                || panic!("expired _NET_SUPPORTED event must not read capabilities"),
+                |layers| {
+                    service_layer_with(
+                        layers,
+                        None,
+                        || {
+                            reads.set(reads.get() + 1);
+                            Ok(Ok(final_observed))
+                        },
+                        || panic!("final body observation must not query capabilities"),
+                        |_| panic!("final body observation must not send a mutation"),
+                        || handled_at,
+                    )
+                },
+                || handled_at,
+            )
+            .unwrap();
+            assert_eq!(reads.get(), 1);
+            assert_eq!(layers.observed, Some(final_observed));
+            assert_eq!(layers.desired, Some(Layer::Above));
+            assert!(layers.pending().is_none());
+            assert!(layers.deadline().is_none());
         }
     }
 

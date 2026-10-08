@@ -1,10 +1,10 @@
 # A00-M03.1 verification and pending owner acceptance
 
-Decision: **implementation ready for independent review; owner acceptance NOT RUN**.
+Decision: **architecture approved; focused review corrections await publication and matching CI; owner acceptance NOT RUN and on hold**.
 
 Evidence recorded 2026-10-08. Scope is M03.1 only. This record does not mark M03.1 or A00 accepted and does not authorize a later mission.
 
-## Revision identity and environment
+## Original implementation-session history and environment
 
 - Starting branch: `main`; starting HEAD: `2968b7520041fbc4d5c605668e8fd6473643a932`.
 - Starting working tree: clean, unchanged from the read-only planning pass. No intervening owner edits were present.
@@ -13,10 +13,19 @@ Evidence recorded 2026-10-08. Scope is M03.1 only. This record does not mark M03
 - No commit, push, branch creation, staging, or discard was performed. No dependency/lockfile/CI workflow change was made.
 - Local toolchain: `rustc 1.99.0 (b940084d7 2026-09-28)`; `cargo 1.99.0 (5f94df478 2026-08-27)`.
 - Current target-host environment snapshot: **NOT RUN**. The established target is Openbox 3.6.1 / X11 / Picom v13 on Archcraft; historical M02 values are not a fresh observation of this implementation.
-- GitHub CI for the new implementation: **NOT RUN / not published**. Record an exact executable commit and corresponding CI run after owner-authorized publication. Do not substitute M02 CI evidence.
-- Independent review of the implemented diff: **PENDING**. The owner supplied approval of the plan with the three corrections implemented here.
+- At the end of that original session, the implementation was not published, matching GitHub CI was NOT RUN, and independent review of the implemented diff was PENDING. The owner had supplied approval of the plan with the three corrections implemented here.
 
-## Local automated verification
+## First publication and independent review
+
+The owner subsequently published the first M03.1 executable on branch `m03` at `ca80f6c010e8b686838de2b943da2c8e221a34e2`.
+
+Owner-supplied GitHub Actions evidence for that exact SHA: [run 37772959174](https://github.com/zNe4/DesktopRoomie/actions/runs/37772959174), **SUCCESS**. Observed steps: format PASS, build PASS, Clippy with `-D warnings` PASS, tests PASS — **137 passed, 0 failed**. This records the owner's evidence; no new CI run was performed in the correction session.
+
+Independent review approved the architecture but found that an expired root `_NET_SUPPORTED` notification unnecessarily read capabilities before the final body observation. The review also required rejecting empty removal mutations at the transport boundary. Therefore `ca80f6c010e8b686838de2b943da2c8e221a34e2` is **not the final accepted M03.1 executable**. Successful CI on that revision does not supersede those findings.
+
+The focused correction session started with a clean working tree on `m03` at that exact SHA. Corrections remain uncommitted on that baseline. The corrected executable SHA and its new matching CI run are **PENDING owner publication** and must be recorded afterward. No commit, push, branch creation or graphical acceptance was performed in this session.
+
+## Original implementation-session local automated verification
 
 Commands executed from the repository root under the desktoproomie-verify procedure:
 
@@ -32,6 +41,24 @@ Commands executed from the repository root under the desktoproomie-verify proced
 
 The complete tracked diff and new source/document files were reviewed for scope and M02 regressions. New-file whitespace was checked separately against `/dev/null` because `git diff --check` does not include untracked files. No graphical process was launched. No real-host layer/fullscreen/focus result is inferred from these automated checks.
 
+## Focused correction-session verification
+
+The changes are limited to `src/main.rs`, `src/x11/state.rs`, this report and `M03.1-IMPLEMENTATION.md`. The root support-event handler checks the existing fixed deadline before any capability read; an already-expired operation immediately uses the final fresh body observation. It still checks expiry again after an in-budget capability read. Request construction now returns an error for an empty Remove before any X11 send; valid payloads are unchanged.
+
+Two deterministic regression tests were added: expired support-event handling with both matching and mismatching final body states (exactly one body read, no capability reads or mutations), and rejection of empty removal request construction.
+
+Complete correction-session checks, run from the repository root using the desktoproomie-verify procedure:
+
+| Exact command | Actual result |
+| --- | --- |
+| `cargo fmt --manifest-path experiments/desktop-probe/Cargo.toml --check` | PASS — exit 0 |
+| `cargo build --manifest-path experiments/desktop-probe/Cargo.toml` | PASS — exit 0 |
+| `cargo clippy --manifest-path experiments/desktop-probe/Cargo.toml --all-targets -- -D warnings` | PASS — exit 0, no warnings |
+| `cargo test --manifest-path experiments/desktop-probe/Cargo.toml` | PASS — exit 0; 139 passed, 0 failed, 0 ignored, 0 measured, 0 filtered out |
+| `git diff --check` | PASS — exit 0, no whitespace diagnostics |
+
+Formatting was applied with `cargo fmt --manifest-path experiments/desktop-probe/Cargo.toml` before verification. The complete resulting diff against `ca80f6c010e8b686838de2b943da2c8e221a34e2` was inspected for scope and regressions. No unrelated M02 source, dependency, lockfile or CI workflow was changed. These local results describe the uncommitted correction tree, not a new published revision or CI result.
+
 ## Controlled / injected evidence
 
 All rows below were exercised by the passing unit suite. They are synthetic property, clock, event, and host callback tests, not live WM refusal or X server failure observations.
@@ -40,9 +67,9 @@ All rows below were exercised by the passing unit suite. They are synthetic prop
 | --- | --- |
 | Absolute transition rules | All target/observed combinations, Conflict, idempotence, opposite removal, no redundant addition after a matching removal, maximum one removal plus one addition |
 | Property/capability parsing | Present empty and unrelated atoms; Above/Below/Conflict; absent mapped state rejected; wrong type/format, truncation, inconsistent payload and oversized data rejected; absent/missing support prevents mutation |
-| Transport | Root destination, propagation false, both substructure masks, body client ID, format 32, absolute action and source 1 payload |
+| Transport | Root destination, propagation false, both substructure masks, body client ID, format 32, absolute action and source 1 payload; correction adds rejection of empty removals before request construction |
 | Confirmation | Checked mutation followed by fresh read; immediate completion; relevant stale notifications reread current truth; unrelated notifications cannot confirm; no layer sequence gate |
-| Fixed deadline | Sustained event fixtures, no extension during phases, final read success/mismatch, no addition at expiry, expiry during support query, no timer or resurrection after termination |
+| Fixed deadline | Sustained event fixtures, no extension during phases, final read success/mismatch, no addition at expiry, expiry during support query, no timer or resurrection after termination; correction adds expired support-event handling without any capability read |
 | Later ownership | A newly started drag and newly acquired popup leave addition enabled; interaction state and capture owner remain unchanged |
 | Menu | All five row outcomes on matching release; layer-row mismatch/outside/wrong-button/chord rejection; canonical rendering labels match hits; larger menu fits corners or refuses invalid fit |
 | Busy and cleanup | Selecting-popup checked release/destruction precedes dispatch; later layer selection is busy without replacing the original operation; failed release/destruction prevents dispatch |
@@ -50,6 +77,8 @@ All rows below were exercised by the passing unit suite. They are synthetic prop
 | M02 regressions | All 112 original cases retain intent, including pointer freshness, release debt, movement/bounds, popup lifecycle and cleanup; Dismiss/Quit indices updated and selection coverage extended |
 
 ## Owner real-host instructions
+
+**On hold: do not begin L01–L13 yet.** These procedures remain instructions for later owner execution, after the focused corrections are reviewed and the corrected published executable and matching CI evidence are recorded.
 
 Use the actual target Openbox/X11/Picom session. Before testing, record the executable revision and dirty status, WM/compositor versions, relevant rules, monitor/workarea/workspace facts, and exact launch command. Keep a portion of the body exposed during Below/Normal tests and use a finite duration when testing covered states. Independent recovery is M03.2 scope.
 
@@ -92,4 +121,4 @@ For every row record actual outcome, focus observation method, exact command, en
 - A partial transition can leave Normal if removal succeeds and addition fails. Diagnostics retain the readable result; there is no rollback.
 - Below may cover the only menu control. Independent recovery remains deliberately deferred; finite duration is available.
 
-Automated verification passed. Independent implemented-diff review, matching published-revision CI evidence and owner L01–L13 acceptance are pending. M03.1 is not yet accepted. Do not advance to M03.2 or other missions.
+The first published revision passed CI and received architectural approval, but review required the focused fixes above. Review of those corrections, their published executable identity and matching CI evidence remain pending. Owner L01–L13 acceptance is NOT RUN and on hold. M03.1 is not yet accepted. Do not advance to M03.2 or other missions.

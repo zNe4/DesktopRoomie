@@ -91,8 +91,16 @@ impl LayerAtoms {
         })
     }
 
-    pub fn request(&self, root: Window, body: Window, mutation: Mutation) -> LayerRequest {
+    pub fn request(
+        &self,
+        root: Window,
+        body: Window,
+        mutation: Mutation,
+    ) -> Result<LayerRequest, HostError> {
         let (action, first, second) = match mutation {
+            Mutation::Remove(flags) if !flags.above && !flags.below => {
+                return Err("cannot remove an empty set of layer flags".into());
+            }
             Mutation::Remove(flags) => (
                 0,
                 if flags.above { self.above } else { self.below },
@@ -105,12 +113,12 @@ impl LayerAtoms {
             Mutation::AddAbove => (1, self.above, 0),
             Mutation::AddBelow => (1, self.below, 0),
         };
-        LayerRequest {
+        Ok(LayerRequest {
             destination: root,
             propagate: false,
             mask: EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
             event: ClientMessageEvent::new(32, body, self.state, [action, first, second, 1, 0]),
-        }
+        })
     }
 
     pub fn send(
@@ -120,7 +128,7 @@ impl LayerAtoms {
         body: Window,
         mutation: Mutation,
     ) -> Result<(), HostError> {
-        let request = self.request(root, body, mutation);
+        let request = self.request(root, body, mutation)?;
         conn.send_event(
             request.propagate,
             request.destination,
@@ -266,6 +274,20 @@ mod tests {
     }
 
     #[test]
+    fn empty_removal_cannot_construct_an_x11_request() {
+        assert!(atoms()
+            .request(
+                100,
+                200,
+                Mutation::Remove(Flags {
+                    above: false,
+                    below: false,
+                }),
+            )
+            .is_err());
+    }
+
+    #[test]
     fn ewmh_envelope_is_root_directed_absolute_and_nonactivating() {
         for (mutation, payload) in [
             (Mutation::AddAbove, [1, 12, 0, 1, 0]),
@@ -292,7 +314,7 @@ mod tests {
                 [0, 12, 13, 1, 0],
             ),
         ] {
-            let request = atoms().request(100, 200, mutation);
+            let request = atoms().request(100, 200, mutation).unwrap();
             assert!(!request.propagate);
             assert_eq!(request.destination, 100);
             assert_eq!(
