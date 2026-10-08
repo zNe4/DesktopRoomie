@@ -12,15 +12,25 @@ The project uses a supervised multi-agent workflow:
 
 - **ChatGPT, in a separate authoritative session:** external research and literature reviews; comparison of open-source implementations, technical approaches, and dependencies; research reports and architectural recommendations; research prerequisites, roadmaps, and high-level design decisions; bounded implementation specifications and Codex mission prompts; model and reasoning-effort selection per mission; independent review of completed work.
 - **Codex:** inspect existing code and interfaces, implement assigned missions, maintain meaningful tests, debug failures, perform applicable build/format/lint/test checks, update technical documentation required by the mission, and report risks and ambiguities.
-- **Human owner:** supervise, approve decisions and scope changes, perform manual desktop acceptance, and authorize commits and pushes. The owner is Codex's intermediary with the authoritative ChatGPT session.
+- **Human owner:** supervise, approve decisions and scope changes, perform manual desktop acceptance, and authorize mission-scoped Git publication where appropriate. The owner is Codex's intermediary with the authoritative ChatGPT session.
 
 Work on one assigned mission at a time. Read its specification and inspect existing code and Git status before editing. Respect explicit scope boundaries, preserve local changes and already verified behavior, and prefer small, auditable changes. Do not implement future roadmap features opportunistically or perform unrelated refactoring. Report ambiguities before consequential decisions. Alternatives may be proposed, but consequential architectural changes require approval.
 
-Do not commit, push, create branches, or discard changes without explicit authorization. Suggested commits or branch workflows in older documents are not authorization. Do not automatically advance to the next mission.
+### Mission-scoped Git authority
+
+By default, do not create branches, commit, push, merge, discard changes, or advance missions without explicit authorization. Older documents and example workflows are not standing authorization.
+
+The owner may authorize publication in a **specific assignment** that names the target mission branch (such as `m03`), expected starting branch/base SHA, and permission to commit/push. In that case, and only for that assignment, Codex may create/switch to the named branch when instructed, commit only verified mission-scoped work, and push that branch to `origin` with an ordinary non-force push.
+
+Codex may not push directly to `main`, merge, force-push, rewrite published history, delete branches, create releases/tags, or include unrelated local/owner changes. Inspect status, HEAD, diff, and intended paths before the commit; preserve existing work. If the remote branch moved or a normal push is rejected, stop and report rather than automatically merging, rebasing, or forcing. Never treat a successful push or CI run as owner acceptance.
+
+Report the authorized branch, base SHA, new commit/pushed SHA, checks performed, push result, pending CI/manual acceptance, and final Git status. ChatGPT independently reviews the exact published diff and CI; the owner controls acceptance and merges. The detailed process will be maintained in `docs/WORKFLOW.md` after D00-M01.
 
 ## Documentation and authority
 
 The current mission specification and explicitly approved decisions determine implementation scope. Planning documents provide context; their proposals and historical status labels are not proof of current implementation or acceptance. Inspect code and verification evidence.
+
+**Current documentation mission:** [D00-M01 documentation/context hygiene](docs/DesktopRoomie-D00-M01-documentation-context-hygiene.md) is an approved docs-only contract. Its planned `docs/INDEX.md`, `STATUS.md`, `ARCHITECTURE.md`, `INVARIANTS.md`, and `WORKFLOW.md` do not exist yet; do not assume they are available until D00-M01 creates them. Once created, follow their navigation/current-status guidance, preserving the more specific accepted mission evidence.
 
 Relevant implementation references:
 
