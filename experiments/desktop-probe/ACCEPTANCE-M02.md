@@ -1,6 +1,6 @@
 # A00-M02 integrated acceptance
 
-Decision: initially Pending review
+Decision: Passed after independent final review
 
 Evidence recorded: 2026-10-07, for A00-M02.7-C. Owner observations and supervising-review/CI facts below were supplied by the owner in the assignment. Local commands and source inspection were performed by Codex. Codex did not run graphical tests during this documentation mission.
 
@@ -9,9 +9,9 @@ Evidence recorded: 2026-10-07, for A00-M02.7-C. Owner observations and supervisi
 - Tested code revision R: `d8dc1abef8b6a8d9395342b234f2f0beb912bc7b`.
 - CI-tested SHA: `d8dc1abef8b6a8d9395342b234f2f0beb912bc7b`.
 - Local baseline: clean working tree on `m2.7b`, HEAD exactly R.
-- Final documentation/review revision: **to be filled after publication and independent final review**.
+- Published acceptance-evidence documentation revision: `6bf98166afc598dc6882a937b58f8d7662b3c85e`. This final status correction is subsequent documentation; its commit SHA is not assigned in advance.
 
-Before preparing evidence, `git diff R -- experiments/desktop-probe/src experiments/desktop-probe/Cargo.toml experiments/desktop-probe/Cargo.lock .github/workflows` was empty (using the full SHA for R). Rust source, Cargo manifest/lockfile, and workflow therefore corresponded to R. Documentation may be committed after R without changing executable source; that documentation revision must be recorded separately rather than replacing the tested-code identity. No commit or push was made in this mission.
+Before preparing evidence, `git diff R -- experiments/desktop-probe/src experiments/desktop-probe/Cargo.toml experiments/desktop-probe/Cargo.lock .github/workflows` was empty (using the full SHA for R). Rust source, Cargo manifest/lockfile, and workflow therefore corresponded to R. Documentation may be committed after R without changing executable source; that documentation revision must be recorded separately rather than replacing the tested-code identity. Codex itself made no commit or push during its documentation session; the owner subsequently published the evidence in revision `6bf98166afc598dc6882a937b58f8d7662b3c85e`.
 
 ## Target environment
 
@@ -30,7 +30,7 @@ Owner-reported rediscovery on the real target desktop:
 | Final root geometry | 1920×1080 |
 | EWMH desktops | 5; current desktop 0 |
 | Final `_NET_WORKAREA` | x=10, y=48, w=1900, h=1022 |
-| Final active window | Previously focused application, not the probe |
+| Final `_NET_ACTIVE_WINDOW` | `0x40c4e8`; window identity was not resolved in the captured snapshot |
 | Probe diagnostics | Root depth 24 bpp; RENDER v0.11; SHAPE v1.1; 32-bit TrueColor alpha-capable candidates found |
 | Diagnostic selection | Primary monitor `eDP-2`; final usable area x=10, y=48, w=1900, h=1022 |
 
@@ -79,11 +79,11 @@ Final acceptance relies on run **37579752824 for R**, not only the earlier workf
 
 ## Independent ChatGPT review
 
-The owner reports that M02.7-A's workflow was independently reviewed and approved. The supervising ChatGPT independently reviewed R's B1 source diff and exact GitHub CI run and approved R for integrated manual acceptance. No review ID or timestamp was supplied. These approvals preceded integrated acceptance; they do not replace the pending independent final review of this record.
+The owner reports that M02.7-A's workflow was independently reviewed and approved. The supervising ChatGPT independently reviewed R's B1 source diff and exact GitHub CI run and approved R for integrated manual acceptance. No review ID or timestamp was supplied. These approvals preceded integrated acceptance. The owner subsequently authorized recording the independent final review's passing decision with the documentation corrections reflected here.
 
 ## Owner integrated T01–T26 matrix
 
-All real-host rows record the owner's observations at frozen revision R. Controlled rows record Codex's deterministic reruns approved as evidence by the supervising review. PASS here describes the row's evidence; the final mission decision remains pending review.
+All real-host rows record the owner's observations at frozen revision R. Controlled rows record Codex's deterministic reruns approved as evidence by the supervising review. PASS here describes the row's evidence; independent final review accepted T01–T26 as sufficient evidence for M02 completion.
 
 | ID | Status | Method | Actual observed result | Evidence type / limitations |
 | --- | --- | --- | --- | --- |
@@ -210,10 +210,14 @@ No additional CPU ticks were detected during the 90.26-second interval at the ke
 - The final snapshot had one active monitor; T09 occurred with a temporarily connected secondary monitor. Earlier bounds logs cannot be assigned the later workarea.
 - Exact commands for each owner manual run, an integrated direct input-focus query, and application-specific Openbox-rule details were not supplied. Continued typing is actual focus evidence; no missing details have been invented.
 
-These limitations are disclosed for independent review. The specification permits controlled evidence for T16/T22/T23, and the supervising review explicitly approved that method for this acceptance. No stuck capture, focus theft, invalid placement or broken quit/recovery was reported. This record does not approve later A00/A01 roadmap work.
+These disclosed limitations were accepted by independent final review as non-blocking. The specification permits controlled evidence for T16/T22/T23, and the supervising review explicitly approved that method for this acceptance. No stuck capture, focus theft, invalid placement or broken quit/recovery was reported. This record does not approve later A00/A01 roadmap work.
 
 Final documentation checks: `git diff --check` passed (exit 0). Because the new acceptance file was untracked, `git diff --no-index --check /dev/null experiments/desktop-probe/ACCEPTANCE-M02.md` was also run: no whitespace diagnostics; exit 1 reflects the new-file difference under `--no-index`, not an exit-0 pass. The complete new file and tracked environment-note diff were reviewed for factual accuracy. Final source/Cargo/workflow comparison against R remained empty; historical acceptance records were unchanged. No graphical tests were rerun for documentation edits.
 
 ## Final decision
 
-Pending independent final review
+Passed after independent final review
+
+All required M02 automated checks passed, and GitHub CI passed at frozen executable revision R (`d8dc1abef8b6a8d9395342b234f2f0beb912bc7b`). T01–T26 have sufficient accepted evidence. The disclosed T16/T22/T23 limitations are accepted and non-blocking. No unresolved focus theft, stuck capture, invalid placement, menu/quit failure, or cleanup blocker remains.
+
+A00-M02 is complete. Later A00-G3 work remains separate and is not implied complete.
