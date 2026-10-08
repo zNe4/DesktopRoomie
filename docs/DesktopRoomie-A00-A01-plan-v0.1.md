@@ -185,10 +185,13 @@ Create an **A01-W extension** after the stable body, with its own acceptance gat
 | Order | Minigoal | Demonstration |
 | --- | --- | --- |
 | W1 | Observe the geometry and lifecycle of one user-selected ordinary window. | A debug outline tracks movement/resizing and notices minimize/close/workspace changes. |
+| W1.1 | **Window-relative stacking (deferred feasibility):** attempt to place Vanilla above one selected ordinary managed window and below another without changing keyboard focus. | With two overlapping test applications, request and verify a bounded between-windows order; record whether Openbox maintains it across raise/focus, minimize/restore, close, and workspace changes, or safely fall back to global layering. |
 | W2 | Perch on a selected reachable edge. | Vanilla stays attached while the window moves; if the supporting edge disappears or becomes invalid she returns safely to the floor. |
 | W3 | Climb to that edge through an explicit action. | A manually requested climb has valid start/end positions, animation, cancellation, and fallback. |
 | W4 | Move a selected window through an explicit permitted action. | A controlled test window moves as intended without trying to fight WM policy or affecting unrelated windows. |
 | W5 | Request selected window operations with a matching performance. | A tested minimize/other operation accompanies the intended animation. Close needs its own explicit interaction design. |
+
+W1.1 is a **z-order** capability, not geometric perching (W2) or automatically reading applications. Global Above/Normal/Below in A00-M03 is a prerequisite, but does not imply arbitrary interleaving among managed windows. An X11 relative-restack request is subject to Openbox policy and may not persist when the user raises or focuses another window. Research the relevant EWMH/X11 request path and real Openbox results just in time, including target identity, transient/group relationships, disappearing targets, conflicting layer policies, input/focus isolation, and event-driven reconciliation. Avoid constant restacking, undocumented WM tricks, and surveillance of unrelated windows. A stable sandwich is an aspiration until independently verified; fall back visibly to proven global layers if unsupported.
 
 These are future goals, not promises that all windows expose usable titlebars or controls. Geometric perching and asking the WM to move a window are different capabilities. Literal titlebar-button clicking is an additional theme/application-dependent experiment, not a required implementation of semantic window actions. No autonomous manipulation is introduced just because the technical capability exists.
 
@@ -209,4 +212,4 @@ Before the first coding mission, obtain:
 2. Active monitor count, resolution/scaling, and any panel/dock reserving space. A01 will use one chosen monitor even if more are connected.
 3. The reference images when starting G2; they do not block A00.
 
-All other open defaults above can be tried and revised. The next programming assignment is **A00-G1**, followed immediately by the small G2/G3 proving executable. No general architecture rewrite or complete sprite production is needed before that experiment.
+The A00-G1/G2 probe and integrated A00-M02 acceptance are complete. The next active assignment is **A00-M03.1**, as specified by [A00-M03: Placement, Recovery and Host Selection](DesktopRoomie-A00-M03-placement-recovery-host-selection.md); its first gate is a read-only Codex plan and independent review. A01-W1.1 remains deferred. No general architecture rewrite or complete sprite production is needed for M03.
