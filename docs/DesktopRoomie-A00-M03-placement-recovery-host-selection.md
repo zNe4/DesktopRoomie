@@ -1,6 +1,6 @@
 # DesktopRoomie — A00-M03: Placement, Recovery and Host Selection
 
-Status: architecture/design contract approved for **M03.1 read-only Codex planning**. No M03 implementation or real-host acceptance is claimed.
+Status: **M03.1 accepted** on the target Openbox/X11/Picom host. M03.2 remains design-only preliminary scope and requires its own detailed plan/review before implementation.
 Prepared against main revision 614dfb22b944e5f9ec0d30a1dcfcf15e3ca41223 (2026-10-08).
 Owner authority: owner runs target-host acceptance and authorizes implementation, commits, pushes and merges. Codex may not silently advance.
 Roadmap mapping: A00-G3.1 (layers, fullscreen, hide/recovery); A00-G3.2 (workspaces); A00-G3.3 (final host decision).
@@ -132,18 +132,12 @@ Reuse all accepted M02 contracts and record the combined implementation's exact 
 
 A01-W1.1 differs from M03 global layers: it seeks relative z-order among selected managed ordinary windows and must establish compatibility with Openbox WM policy, re-raising/focus, window/group lifecycle and input isolation before any guarantee. If infeasible, explicitly fall back to proven Above/Normal/Below. Do not prebuild for it in M03.
 
-## 9. Next action: read-only Codex plan for M03.1
+## 9. Next action after accepted M03.1
 
 Use a Codex-capable model with **High reasoning effort**. Read AGENTS.md, the mission document, M02 specification/acceptance, the host research and actual current code. Codex should:
-- report exact branch/HEAD and dirty state; do not overwrite or stash user changes;
-- map existing window atom/property handling, event loop, popup and pointer ownership, and test seams;
-- propose narrow file-by-file modifications for **M03.1 only** and exact WM request/verification protocol;
-- explain property observation, transition/timeout/failure handling and no-focus safeguards;
-- map L01–L13 and deterministic cases to implementation and verification;
-- flag deviations/architectural questions; do not change any files, run destructive commands, create branches, commit, push or implement;
-- provide an ordered bounded implementation plan for independent ChatGPT review.
+M03.1 planning, implementation, independent source review, matching CI, and owner L01–L13 acceptance are complete. Preserve its specification and evidence as historical contract material rather than rewriting it to describe later missions.
 
-Only after the plan is reviewed and approved should the owner authorize M03.1 coding.
+Before M03.2, run the planned documentation/context-hygiene checkpoint so current architecture, invariants, document authority, mission status, and contributor workflow are easy to recover without replaying long chat history. Then design **M03.2 only** from the preliminary boundary in section 5, with a fresh read-only Codex plan and independent review before implementation. M03.2 remains responsible for managed hide/show plus independent same-instance recovery/control; do not opportunistically include M03.3 workspace placement.
 
 ## 10. Primary references
 

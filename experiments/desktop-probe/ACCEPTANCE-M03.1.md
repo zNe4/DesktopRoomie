@@ -1,8 +1,8 @@
-# A00-M03.1 verification and pending owner acceptance
+# A00-M03.1 verification and owner acceptance
 
-Decision: **implementation/source review PASS; matching CI PASS; owner real-host acceptance L01–L13 NOT RUN**.
+Decision: **ACCEPTED — implementation/source review PASS, matching CI PASS, and owner real-host acceptance L01–L13 PASS on the target Openbox/X11/Picom host**.
 
-Evidence recorded 2026-10-08. Scope is M03.1 only. This record does not mark M03.1 or A00 accepted and does not authorize a later mission.
+Evidence recorded 2026-10-08. Scope is M03.1 only. This record marks **M03.1 accepted**; it does not mark all of A00-M03 or A00 accepted and does not authorize M03.2 implementation without its own design/review gate.
 
 ## Original implementation-session history and environment
 
@@ -12,7 +12,7 @@ Evidence recorded 2026-10-08. Scope is M03.1 only. This record does not mark M03
 - Final changes: five modified source files (`src/geometry.rs`, `src/interaction.rs`, `src/main.rs`, `src/x11/menu.rs`, `src/x11/mod.rs`), two new source files, this report, and `M03.1-IMPLEMENTATION.md`.
 - No commit, push, branch creation, staging, or discard was performed. No dependency/lockfile/CI workflow change was made.
 - Local toolchain: `rustc 1.99.0 (b940084d7 2026-09-28)`; `cargo 1.99.0 (5f94df478 2026-08-27)`.
-- Current target-host environment snapshot: **NOT RUN**. The established target is Openbox 3.6.1 / X11 / Picom v13 on Archcraft; historical M02 values are not a fresh observation of this implementation.
+- Fresh M03.1 probe diagnostics on the owner host: X11 root `0x6ae`; 1920×1080 screen; primary monitor `eDP-2` at +0+0; current desktop 0; desktop workarea x=10, y=48, w=1900, h=1022; RENDER 0.11 and SHAPE 1.1 available. The established target session is Openbox 3.6.1 / X11 / Picom v13 on Archcraft; this diagnostic invocation did not independently re-query the WM/compositor version strings.
 - At the end of that original session, the implementation was not published, matching GitHub CI was NOT RUN, and independent review of the implemented diff was PENDING. The owner had supplied approval of the plan with the three corrections implemented here.
 
 ## First publication and independent review
@@ -94,7 +94,7 @@ All rows below were exercised by the passing unit suite. They are synthetic prop
 
 ## Owner real-host instructions
 
-**Ready for owner execution.** Source review and matching CI are complete for `f8332ec99e876db1d809cd718dc76dff9fd38e27`. The procedures below are now the active M03.1 gate. Do not advance to M03.2 until their results are recorded and reviewed.
+**Completed on the owner host.** Source review and matching CI were complete for `f8332ec99e876db1d809cd718dc76dff9fd38e27`, and the owner then executed the real-host matrix below on the target Openbox/X11/Picom desktop. All L01–L13 rows passed. The documentation-only commits above the code revision do not change the accepted executable source.
 
 Use the actual target Openbox/X11/Picom session. Before testing, record the executable revision and dirty status, WM/compositor versions, relevant rules, monitor/workarea/workspace facts, and exact launch command. Keep a portion of the body exposed during Below/Normal tests and use a finite duration when testing covered states. Independent recovery is M03.2 scope.
 
@@ -111,19 +111,19 @@ Right-click and release on the body to open Above / Normal / Below / Dismiss / Q
 
 | ID | Status | Owner procedure and evidence required |
 | --- | --- | --- |
-| L01 | NOT RUN | Delayed launch while typing in another application; record unchanged startup appearance and continued typing focus. |
-| L02 | NOT RUN | Select Above against two partly overlapping ordinary windows; record actual coverage, body state diagnostic and released menu capture. |
-| L03 | NOT RUN | Select Normal, then focus/raise ordinary windows; record neither layer flag and actual normal-layer ordering. No fixed relative position is promised. |
-| L04 | NOT RUN | Select Below; ordinary windows should cover overlap. Keep an exposed body area for menu access; record actual ordering. |
-| L05 | NOT RUN | Cycle Above → Below → Normal → Above repeatedly; record final flags, stability, one body and no activation. |
-| L06 | NOT RUN | Select an already established layer again; record no-op diagnostic, no extra mutation, no unexpected flicker/capture/focus transfer. |
-| L07 | NOT RUN | Establish Above and close the popup; enter an ordinary application's actual fullscreen mode. Record whether focused fullscreen naturally covers the body. Maximization alone is insufficient. |
-| L08 | NOT RUN | Exit fullscreen without another layer request; record natural return to the previous Above relationship and continued application usability, or the exact WM limitation. |
-| L09 | NOT RUN | Type continuously while performing several menu/layer changes; record the application receiving characters. `_NET_ACTIVE_WINDOW` alone is insufficient. |
-| L10 | NOT RUN | After layer changes, test offset-preserving drag, release outside body, right-cancel, transparent-padding click-through and menu dismiss. Verify bounds, no stale action, no click replay and subsequent normal desktop input. |
-| L11 | NOT RUN | Open the five-row popup at corners/edges and with a narrow usable area; record complete fit or safe refusal without retained capture. Do not change unrelated WM settings to force a pass. |
-| L12 | NOT RUN | Let duration expire with the popup open and, if reproducible, a pending layer request. Record clean exit, exit status and usable input. A synthetic pending-state test is already covered above; do not relabel it real-host evidence. |
-| L13 | NOT RUN | Perform at least 20 mixed layer/menu/drag operations in one process; record count and absence of stale ownership, orphan popup/body or control degradation. Check Quit and return to idle socket waiting. |
+| L01 | PASS | Delayed launch while typing: Vanilla appeared without taking keyboard focus; typing remained in the active application. |
+| L02 | PASS | Above placed Vanilla above ordinary overlapping windows and remained effective while other windows were focused. |
+| L03 | PASS | Normal participated in ordinary WM stacking correctly. In the observed arrangement Vanilla preserved useful relative placement between ordinary windows while focus changed; this is evidence, not a guarantee of arbitrary relative-window control. |
+| L04 | PASS | Below placed ordinary windows over Vanilla as expected while the body remained controllable where exposed. |
+| L05 | PASS | Repeated Above / Normal / Below cycling in multiple orders remained stable with no duplicate body, stuck layer, or activation. The WM preserved prior useful relative stacking relationships across transitions. |
+| L06 | PASS | Re-selecting the already active layer was idempotent with no visible disruption or control/focus regression. |
+| L07 | PASS | With Vanilla Above, Firefox genuine fullscreen via F11 covered Vanilla naturally. No fullscreen observer or re-raise logic was needed. |
+| L08 | PASS | Exiting Firefox fullscreen restored Vanilla above ordinary windows automatically without another layer request. |
+| L09 | PASS | Typing remained in the user's application while opening/using the menu and changing layers. |
+| L10 | PASS | Offset-preserving drag, release outside the body, right-cancel, transparent-padding click-through, menu dismissal, and menu use during/after layer changes all behaved normally with no stale input state or click replay observed. |
+| L11 | PASS | The five-row menu rendered and operated correctly across tested screen positions/edges, with no retained capture. |
+| L12 | PASS | Finite-duration expiry cleaned up body/menu and returned normal input, including while the menu was being interacted with and while layer activity was occurring. |
+| L13 | PASS | More than 20 mixed menu/layer/drag operations in one process showed no lag, stale capture, orphan popup/body, layer instability, or accumulated degradation. |
 
 Optional one-shot property snapshots of the body and chosen fullscreen application can support these observations; the probe contains no fullscreen observer or active-window polling. A short idle CPU/RSS observation can supplement L13 without adding permanent telemetry.
 
@@ -137,4 +137,4 @@ For every row record actual outcome, focus observation method, exact command, en
 - A partial transition can leave Normal if removal succeeds and addition fails. Diagnostics retain the readable result; there is no rollback.
 - Below may cover the only menu control. Independent recovery remains deliberately deferred; finite duration is available.
 
-The first published revision passed CI and received architectural approval, then was superseded by the focused correction revision `f8332ec99e876db1d809cd718dc76dff9fd38e27`. Independent source review of that corrected revision is PASS and matching GitHub CI run 37775474758 is PASS with 139 tests. Owner L01–L13 acceptance remains NOT RUN and is the next gate. M03.1 is not yet finally accepted. Do not advance to M03.2 or other missions.
+The first published revision passed CI and received architectural approval, then was superseded by the focused correction revision `f8332ec99e876db1d809cd718dc76dff9fd38e27`. Independent source review of that corrected revision is PASS and matching GitHub CI run 37775474758 is PASS with 139 tests. Owner L01–L13 real-host acceptance is also PASS. **M03.1 is accepted.** The accepted host behavior includes reliable Above/Normal/Below control, focus isolation, natural fullscreen precedence/restoration, preserved M02 input semantics, clean expiry, and stable sustained mixed interaction. Next technical work is M03.2 design; a documentation/context-hygiene checkpoint is planned first and does not itself authorize M03.2 implementation.
