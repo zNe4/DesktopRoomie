@@ -103,6 +103,8 @@ The labels below refer to the existing [canonical roadmap](https://github.com/zN
 **Output:** a small **A00/A01 host-pattern comparison** against our proven X11/bspwm/Picom behavior.  
 **Do not automatically adopt:** Tauri or the project's GUI stack just because it uses Rust. The host technology remains an evidence-driven decision.
 
+**A00 targeted pass completed 2026-10-08:** the source-level Linux-host refresh and the remaining A00-G3 standards research are recorded in [studies/R00-M01-nekoai-linux-host-a00-g3.md](studies/R00-M01-nekoai-linux-host-a00-g3.md). The current disposition is to retain the native Rust + x11rb managed X11 host for A00/A01 unless real-host A00-G3 evidence contradicts it. Revisit NekoAI at A01-G1 only for newly relevant host/recovery behavior; do not redo the completed A00 comparison by default.
+
 ### R00-M02 — shimeji-rs: clean Rust/X11 movement and sprite mechanics
 
 **Repository:** [danhab99/shimeji-rs](https://github.com/danhab99/shimeji-rs)  
@@ -266,13 +268,33 @@ The labels below refer to the existing [canonical roadmap](https://github.com/zN
 **Research questions:** How are individual private states separated from shared-world state? How do two characters avoid contradictory claims about shared events? Which contracts belong to reusable DesktopRoomie rather than private Vanilla? How are pack schemas, licenses, migration, permissions and safe public synthetic fixtures designed?  
 **Output:** a tested **two-character ownership model** and a **public/private content boundary** for any released engine.
 
+### R00-M12 — Spine 2D runtime and private asset feasibility
+
+**Input:** a private official chibi Vanilla Spine 2D export is available as `.skel`, `.atlas`, and `.png`, with multiple existing animations. The copyrighted asset files remain private and are not to be committed to DesktopRoomie.  
+**Best time:** immediately after A00-G3 and before **A01-G2.1**, alongside the targeted A01 movement/animation studies rather than during host proof work.  
+**Why study it:** this may replace a custom frame-sheet-first pipeline with a skeletal animation path that preserves authored anchors, interpolation, skins/attachments, and a richer existing animation repertoire. The decision must be based on the export's actual Spine version/features, runtime feasibility, licensing, and rendering costs.
+
+**Research questions**
+- What exact Spine export/runtime version does the binary `.skel` require, and can that version be identified without redistributing the private asset?
+- Which animations, skins, slots, attachments, draw-order changes, events, constraints, and atlas pages are present and actually useful for A01?
+- What are the authored origin, scale, bounds, facing conventions, and per-animation extents? Can one stable body/action coordinate contract cover them?
+- Which maintained Spine runtime paths are viable with the current Rust/native-X11 host, and what rendering backend or bridge would each require?
+- What are the runtime/editor license obligations for a private application and for any future public DesktopRoomie engine? Can public tests use a synthetic/public Spine fixture while the official Vanilla files stay private?
+- How do alpha mode, texture filtering, atlas packing, clipping/mesh attachments, interpolation, and animation mixing affect visual correctness and CPU/GPU cost?
+- Can semantic actions such as idle/look/walk/sit/sleep/held/fall/land/touch map cleanly onto the available animation set, including interruption and cross-fade rules?
+- If direct runtime integration is impractical, is offline rendering to a derived private frame set a legitimate fallback, and what behavior/quality would be lost?
+
+**Inspect:** the private export only in an approved local/private workspace; official Spine runtime/version/licensing documentation; maintained runtime implementations and their rendering interfaces; a synthetic or redistributable fixture for public code/tests.  
+**Output:** a **Spine feasibility ADR + private animation inventory + public runtime smoke-test plan**, ending in an explicit choice among direct skeletal runtime, private offline bake, or deferral.  
+**Do not automatically adopt:** an unofficial reverse-engineered runtime, redistribution of official Vanilla assets, a renderer/framework rewrite merely to host Spine, or a frame extraction pipeline before the authored skeletal option is evaluated.
+
 ---
 
 ## 5. Suggested execution order (do not front-load every study)
 
 ### Immediate, lightweight work: current A00 → early A01
 
-**Priority 1:** `R00-M01`, concentrating on Linux/X11 host and focus/input failure modes. **Priority 2:** `R00-M02` and `R00-M03` only when the corresponding movement/platform implementation is about to start. A *brief* look at Mochi's event-to-action flow may be useful when we introduce A01's replaceable idle scheduler, but the full brain/Spine study waits for A04.
+**Priority 1:** the targeted A00 pass of `R00-M01` is complete; use its recorded A00-G3 findings while finishing host selection, and revisit only if real-host evidence exposes a missing failure mode. **Priority 2:** immediately after A00-G3, run `R00-M12` before A01-G2.1 so the new private Spine 2D export is evaluated before committing to a custom frame-sheet pipeline. **Priority 3:** run `R00-M02` and `R00-M03` when A01 movement/animation/physics implementation is about to start. A *brief* look at Mochi's event-to-action flow may be useful when we introduce A01's replaceable idle scheduler, but the full brain/Spine *cognition* study (`R00-M05`) still waits for A04.
 
 **Checkpoint:** a one-page note that answers “what implementation issue do we now understand better?” and records whether the lesson requires a code change. A note with no recommended change is a perfectly valid result.
 
