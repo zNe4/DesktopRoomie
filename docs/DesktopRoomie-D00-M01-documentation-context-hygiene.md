@@ -1,6 +1,6 @@
 # DesktopRoomie — D00-M01: Documentation and Context Hygiene
 
-**Decision:** approved documentation design; implementation and independent review still pending.  
+**Decision:** **ACCEPTED** on 2026-10-08 after independent documentation/source-scope review and owner approval. Original implementation contract and acceptance criteria are preserved below.  
 **Baseline:** A00-M03.1 accepted 2026-10-08 on target Openbox/X11/Picom, documented at `experiments/desktop-probe/ACCEPTANCE-M03.1.md`.  
 **Sequencing:** D00-M01 precedes A00-M03.2 design and implementation.  
 **Scope:** documentation and contributor instructions only; do not change the desktop-probe code, Cargo files, scripts, CI, Git behavior, or host configuration.
@@ -139,3 +139,15 @@ Do not run unnecessary Cargo/X11/graphical tests for a docs-only edit. Report on
 Report starting/ending branch/HEAD, clean/dirty state, every changed path, documents/links added, lifecycle banners added, exact checks/results, unresolved contradictions, and any deferred maintenance notes. If the explicit Codex assignment authorizes commit/push on the designated mission branch, report the exact pushed SHA and push outcome (CI may still be pending).
 
 The repository documentation mission is complete only after independent review and human acceptance. **Next technical assignment afterward is A00-M03.2 read-only design for hide/show and same-instance independent recovery, not implementation.**
+## 9. Final acceptance record — 2026-10-08
+
+**Decision: D00-M01 ACCEPTED.** The owner approved closure after an independent ChatGPT review of the published documentation changes. The acceptance applies only to this docs-only mission, not to M03.2 implementation or remaining A00 work.
+
+- **Approved baseline:** `47746975437c75e8244b6dc95ee714bf40135d6c` (approved contract and scoped Codex publication authority).
+- **Reviewed D00-M01 implementation revision:** `e3266aeee5a4757f465b90376bcf97838e225888` on `m03`, one commit after that baseline.
+- **Matching GitHub CI:** [run 37807374691](https://github.com/zNe4/DesktopRoomie/actions/runs/37807374691) completed successfully for that exact revision.
+- **Independent review:** PASS. All five planned context documents, public README, AGENTS integration, and targeted historical lifecycle notices were present. Scope remained documentation-only. The context bundle recovered current status, source ownership, established invariants, collaboration authority, and evidence provenance without requiring the complete chat/idea history.
+- **Documentation reference review:** 107 relative links had existing destinations; the reviewed heading anchors resolved. The changed paths were Markdown-only, with no Rust, Cargo, CI, or binary changes. Changes from the reviewed executable `f8332ec99e876db1d809cd718dc76dff9fd38e27` through the D00-M01 implementation were documentation-only.
+- **Limit:** the accepted source executable remains `f8332ec99e876db1d809cd718dc76dff9fd38e27`; documentation publication and acceptance are not new host tests or code acceptance. This final status-only documentation revision follows the reviewed D00-M01 content revision.
+
+**Next task:** A00-M03.2 read-only design for managed hide/show and independent same-instance recovery/control. The preliminary M03.2 boundary in the A00-M03 contract is not implementation authorization.

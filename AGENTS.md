@@ -32,7 +32,7 @@ The current mission specification and explicitly approved decisions determine im
 
 **Cold-start reading order:** this file → [current checkpoint](docs/STATUS.md) → [implemented architecture](docs/ARCHITECTURE.md) → [accepted invariants](docs/INVARIANTS.md) → the assigned approved mission specification. Use [docs/INDEX.md](docs/INDEX.md) for relevant deeper contracts, evidence, historical explanation, plans, and research; do not load all history by default.
 
-STATUS is a checkpoint, not execution authority. ARCHITECTURE describes source ownership, not a refactor plan. INVARIANTS are accepted review obligations; do not override a specific approved change by inference. Acceptance records identify observed/reviewed revisions; distinguish tested executable code from later docs-only HEAD. The active [D00-M01 documentation contract](docs/DesktopRoomie-D00-M01-documentation-context-hygiene.md) remains subject to independent review and owner approval; its publication does not authorize M03.2.
+STATUS is a checkpoint, not execution authority. ARCHITECTURE describes source ownership, not a refactor plan. INVARIANTS are accepted review obligations; do not override a specific approved change by inference. Acceptance records identify observed/reviewed revisions; distinguish tested executable code from later docs-only HEAD. The [accepted D00-M01 documentation contract](docs/DesktopRoomie-D00-M01-documentation-context-hygiene.md) established this context layer. The next technical gate is M03.2 **read-only design**; do not treat this documentation acceptance as authorization to implement M03.2.
 
 Relevant implementation references:
 

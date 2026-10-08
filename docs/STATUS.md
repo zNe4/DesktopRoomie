@@ -1,6 +1,6 @@
 # Current checkpoint
 
-Updated 2026-10-08 for [D00-M01](DesktopRoomie-D00-M01-documentation-context-hygiene.md). This is a context checkpoint, not permission to implement a next mission.
+Updated 2026-10-08 after acceptance of [D00-M01](DesktopRoomie-D00-M01-documentation-context-hygiene.md). This is a context checkpoint, not permission to implement a next mission.
 
 ## Accepted foundation
 
@@ -20,8 +20,8 @@ Host focus/click-through/stacking/fullscreen observations come from the owner. A
 
 ## Active work and next gate
 
-- **D00-M01:** documentation/context layer prepared under the approved docs-only contract; independent ChatGPT review and owner approval **pending**. Publication does not confer acceptance.
-- **Next technical gate after that acceptance:** A00-M03.2 **read-only design** for managed hide/show and independent same-instance recovery/control, with a fresh bounded plan and independent review before implementation. [M03 section 5](DesktopRoomie-A00-M03-placement-recovery-host-selection.md#5-m032--preliminary-design-boundary-not-yet-implementation-authority) is preliminary scope, not coding authorization.
+- **D00-M01 ACCEPTED:** documentation/context hygiene completed. The independent review of docs-only implementation `e3266aeee5a4757f465b90376bcf97838e225888` passed scope, document authority, source ownership, invariants, link/reference checks, cold-start recovery, and matching GitHub CI [run 37807374691](https://github.com/zNe4/DesktopRoomie/actions/runs/37807374691). The owner approved acceptance on 2026-10-08. The final documentation-status commit is separate from the reviewed executable revision.
+- **Next active technical gate:** A00-M03.2 **read-only design** for managed hide/show and independent same-instance recovery/control, with a fresh bounded plan and independent review before implementation. [M03 section 5](DesktopRoomie-A00-M03-placement-recovery-host-selection.md#5-m032--preliminary-design-boundary-not-yet-implementation-authority) is preliminary scope, not coding authorization.
 - **Deferred:** M03.3 same-instance workspace placement and M03.4 integrated A00 acceptance/host decision; A01 relative-window stacking and companion presentation/behavior. The [completed host study](research/studies/R00-M01-nekoai-linux-host-a00-g3.md) informs A00-G3; additional [R00 studies](research/ProjectVanilla-R00-external-projects-research-roadmap.md) are just-in-time design dependencies, not automatic work or blockers for unrelated missions.
 
 ## Meaningful limitations

@@ -24,7 +24,7 @@ DesktopRoomie is the reusable software; Project Vanilla is its private character
 
 ## Context and mission contracts
 
-- [D00-M01 documentation/context hygiene](DesktopRoomie-D00-M01-documentation-context-hygiene.md): approved docs-only contract; acceptance remains subject to independent review and owner approval.
+- [D00-M01 documentation/context hygiene](DesktopRoomie-D00-M01-documentation-context-hygiene.md): **accepted** docs-only context layer, with independent review and owner approval recorded in the mission document.
 - [A00-M01 desktop probe](DesktopRoomie-A00-M01-desktop-probe.md): accepted foundation's original contract.
 - [A00-M02 dragging and release](DesktopRoomie-A00-M02-dragging-and-release.md): accepted foundation's original detailed contract.
 - [A00-M03 placement, recovery and host selection](DesktopRoomie-A00-M03-placement-recovery-host-selection.md): accepted M03.1 contract plus preliminary, unimplemented M03.2–M03.4 scope. Read STATUS before interpreting historical next-action language.
