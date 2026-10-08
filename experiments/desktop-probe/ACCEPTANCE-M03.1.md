@@ -1,5 +1,7 @@
 # A00-M03.1 verification and owner acceptance
 
+> Lifecycle note (2026-10-08, D00-M01): earlier pre-host NOT RUN/unverified wording below describes intermediate checkpoints and is superseded by the final owner L01–L13 PASS matrix and accepted decision in this record. The accepted executable is `f8332ec99e876db1d809cd718dc76dff9fd38e27`; later documentation revisions do not change its tested-code identity. See [current checkpoint](../../docs/STATUS.md). Historical evidence is preserved.
+
 Decision: **ACCEPTED — implementation/source review PASS, matching CI PASS, and owner real-host acceptance L01–L13 PASS on the target Openbox/X11/Picom host**.
 
 Evidence recorded 2026-10-08. Scope is M03.1 only. This record marks **M03.1 accepted**; it does not mark all of A00-M03 or A00 accepted and does not authorize M03.2 implementation without its own design/review gate.

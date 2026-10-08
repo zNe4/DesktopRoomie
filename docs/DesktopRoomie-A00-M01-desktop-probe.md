@@ -1,5 +1,7 @@
 # DesktopRoomie — A00-M01: The first desktop probe
 
+> Lifecycle note (2026-10-08): the unimplemented status below belongs to this original 2026-10-04 brief. M01 was subsequently accepted; see [M01 acceptance](../experiments/desktop-probe/ACCEPTANCE.md) and [current checkpoint](STATUS.md). The original contract is preserved.
+
 Status: implementation brief, not implemented or validated.
 Date: 2026-10-04.
 Parent: A00/A01 execution roadmap v0.1.

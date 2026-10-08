@@ -22,15 +22,17 @@ By default, do not create branches, commit, push, merge, discard changes, or adv
 
 The owner may authorize publication in a **specific assignment** that names the target mission branch (such as `m03`), expected starting branch/base SHA, and permission to commit/push. In that case, and only for that assignment, Codex may create/switch to the named branch when instructed, commit only verified mission-scoped work, and push that branch to `origin` with an ordinary non-force push.
 
-Codex may not push directly to `main`, merge, force-push, rewrite published history, delete branches, create releases/tags, or include unrelated local/owner changes. Inspect status, HEAD, diff, and intended paths before the commit; preserve existing work. If the remote branch moved or a normal push is rejected, stop and report rather than automatically merging, rebasing, or forcing. Never treat a successful push or CI run as owner acceptance.
+Codex may not push directly to `main`, merge, force-push, rewrite published history, delete branches, create releases/tags, or include unrelated local/owner changes. Inspect status, HEAD, diff, and intended paths before the commit; preserve existing work. On branch/base mismatch, divergence, unexpected remote movement, unrelated dirty owner changes, or a normal push rejection, stop and report; do not automatically merge, rebase, force, discard, or reconcile. Never treat a successful push or CI run as owner acceptance.
 
-Report the authorized branch, base SHA, new commit/pushed SHA, checks performed, push result, pending CI/manual acceptance, and final Git status. ChatGPT independently reviews the exact published diff and CI; the owner controls acceptance and merges. The detailed process will be maintained in `docs/WORKFLOW.md` after D00-M01.
+Report the authorized branch, base SHA, new commit/pushed SHA, checks performed, push result, pending CI/manual acceptance, and final Git status. ChatGPT independently reviews the exact published diff and CI; the owner controls acceptance and merges. Follow the detailed process in [docs/WORKFLOW.md](docs/WORKFLOW.md).
 
 ## Documentation and authority
 
 The current mission specification and explicitly approved decisions determine implementation scope. Planning documents provide context; their proposals and historical status labels are not proof of current implementation or acceptance. Inspect code and verification evidence.
 
-**Current documentation mission:** [D00-M01 documentation/context hygiene](docs/DesktopRoomie-D00-M01-documentation-context-hygiene.md) is an approved docs-only contract. Its planned `docs/INDEX.md`, `STATUS.md`, `ARCHITECTURE.md`, `INVARIANTS.md`, and `WORKFLOW.md` do not exist yet; do not assume they are available until D00-M01 creates them. Once created, follow their navigation/current-status guidance, preserving the more specific accepted mission evidence.
+**Cold-start reading order:** this file → [current checkpoint](docs/STATUS.md) → [implemented architecture](docs/ARCHITECTURE.md) → [accepted invariants](docs/INVARIANTS.md) → the assigned approved mission specification. Use [docs/INDEX.md](docs/INDEX.md) for relevant deeper contracts, evidence, historical explanation, plans, and research; do not load all history by default.
+
+STATUS is a checkpoint, not execution authority. ARCHITECTURE describes source ownership, not a refactor plan. INVARIANTS are accepted review obligations; do not override a specific approved change by inference. Acceptance records identify observed/reviewed revisions; distinguish tested executable code from later docs-only HEAD. The active [D00-M01 documentation contract](docs/DesktopRoomie-D00-M01-documentation-context-hygiene.md) remains subject to independent review and owner approval; its publication does not authorize M03.2.
 
 Relevant implementation references:
 
