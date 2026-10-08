@@ -128,6 +128,8 @@ The parent roadmap's G1/G2/G3 labels are retained. Each minigoal leaves the curr
 
 References are required before producing final artwork. The existing ChatGPT pet may guide the visual discussion, but a new desktop-specific sheet is expected. A static placeholder can unblock code; it cannot satisfy the final companion presentation gate.
 
+Note: A private official chibi Vanilla Spine 2D export is now available (.skel, .atlas, .png) with multiple existing animations. Before designing a custom frame-sheet pipeline, A01-G2.1 should evaluate this asset's Spine runtime/version requirements and enumerate its usable animations, skins/attachments, origin/scale, and bounds. The copyrighted asset files remain private and must not be committed to the public DesktopRoomie repository.
+
 **Checkpoint:** recognizable Vanilla with a small, coherent animation vocabulary.
 
 ### A01-G3 — Physical interaction and a little independent life
