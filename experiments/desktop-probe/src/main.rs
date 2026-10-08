@@ -1,5 +1,6 @@
 mod geometry;
 mod interaction;
+mod layer;
 mod x11;
 
 use std::env;
@@ -15,11 +16,13 @@ use x11rb::protocol::xproto::{GrabStatus, VisualClass};
 use x11rb::protocol::Event;
 
 use crate::geometry::{calculate_centered_origin, compute_valid_origin_bounds, Point, Size};
-use crate::interaction::{HostAction, InteractionManager, InteractionState};
+use crate::interaction::{HostAction, InteractionManager, InteractionState, MenuOutcome};
+use crate::layer::{Layer, LayerController, Mutation, ObservedLayer, Step};
 use crate::x11::menu::{MenuPopup, PopupInputGate};
 use crate::x11::monitors::query_desktop_layout;
 use crate::x11::pointer::{grab_pointer, CaptureOwner, PointerCaptureTracker};
 use crate::x11::render::{Renderer, WINDOW_HEIGHT, WINDOW_WIDTH};
+use crate::x11::state::{LayerAtoms, LayerSupport, PropertyResult};
 use crate::x11::visual::find_alpha_visual;
 use crate::x11::window::{ConfigureReconciliation, ManagedProbeWindow};
 
@@ -97,10 +100,10 @@ fn parse_args() -> Result<Config, String> {
 }
 
 fn print_help() {
-    println!("DesktopRoomie - A00-M02.6: Desktop Probe");
+    println!("DesktopRoomie - A00-M03.1: Desktop Probe");
     println!();
     println!("Left click toggles color; left drag moves the body.");
-    println!("Right click opens Dismiss/Quit after release. Outside left click dismisses.");
+    println!("Right click opens Above/Normal/Below/Dismiss/Quit after release. Outside left click dismisses.");
     println!();
     println!("USAGE:");
     println!("  desktop-probe [OPTIONS]");
@@ -121,7 +124,7 @@ fn main() {
         }
     };
 
-    println!("=== DesktopRoomie A00-M02.6: Desktop Probe ===");
+    println!("=== DesktopRoomie A00-M03.1: Desktop Probe ===");
 
     // Connect to X11 display session
     let (conn, screen_num) = match x11rb::connect(None) {
@@ -180,7 +183,7 @@ fn main() {
     }
 
     // M02.5 retains bounded dragging and adds interruption recovery.
-    println!("Mission M02.6: mouse-only menu and reliable dismissal...");
+    println!("Mission M03.1: managed layers and mouse-only controls...");
 
     // 1. Discover 32-bit alpha Render visual
     let alpha_vis = match find_alpha_visual(&conn) {
@@ -310,7 +313,7 @@ fn main() {
         println!("  Probe running for {} seconds (or until closed)...", sec);
     } else {
         println!(
-            "  Left-click toggles body color; right-click opens Dismiss/Quit. Launch with --duration <SECONDS> for automatic termination."
+            "  Left-click toggles body color; right-click opens Above/Normal/Below/Dismiss/Quit. Launch with --duration <SECONDS> for automatic termination."
         );
     }
 
@@ -328,6 +331,7 @@ fn main() {
         layout.usable_area,
     );
     let outcome = finish_probe_with(result, || {
+        abort_layer(&mut runtime.layers, "shutdown");
         runtime.correction = None;
         let cancellation = runtime.cancel(&conn, &mut probe_window, "shutdown");
         let cleanup = x11::resource::cleanup_all([
@@ -479,6 +483,7 @@ struct ProbeRuntime {
     correction: Option<(Point, Instant)>,
     menu: Option<MenuPopup>,
     menu_generation: u64,
+    layers: LayerController,
 }
 impl ProbeRuntime {
     fn new() -> Self {
@@ -493,6 +498,7 @@ impl ProbeRuntime {
             correction: None,
             menu: None,
             menu_generation: 0,
+            layers: LayerController::default(),
         }
     }
 
@@ -566,6 +572,37 @@ impl ProbeRuntime {
         // Even failed release must not skip popup cleanup. Retain resources on failure.
         cleanup_menu_with(&mut self.menu, release, destroy)
     }
+    /// The selecting popup's obligations must be settled before dispatch. Later
+    /// pointer ownership is deliberately absent from the layer controller.
+    fn complete_menu_with(
+        &mut self,
+        window: &mut ManagedProbeWindow,
+        outcome: MenuOutcome,
+        release: impl FnOnce(&mut PointerCaptureTracker) -> Result<(), HostError>,
+        destroy: impl FnOnce(&MenuPopup) -> Result<(), HostError>,
+        dispatch: impl FnOnce(&mut LayerController, Layer) -> Result<(), HostError>,
+    ) -> Result<bool, HostError> {
+        self.cancel_menu_with(window, release, destroy)?;
+        if self.pointer.is_grabbed() || self.menu.is_some() {
+            return Err("Menu obligations remain before action dispatch".into());
+        }
+        match outcome {
+            MenuOutcome::Dismiss => println!("[MENU] Dismissed"),
+            MenuOutcome::Quit => {
+                println!("[MENU] Quit selected");
+                abort_layer(&mut self.layers, "Quit");
+                return Ok(true);
+            }
+            MenuOutcome::SetLayer(target) => {
+                if self.body != BodyAvailability::Ready {
+                    eprintln!("[LAYER] Request {target:?} rejected: body placement is not ready");
+                } else {
+                    dispatch(&mut self.layers, target)?;
+                }
+            }
+        }
+        Ok(false)
+    }
     fn sync_safety(&mut self, previous: Option<u8>) {
         let active = self.interaction.active_button();
         if active != previous {
@@ -628,6 +665,7 @@ impl ProbeRuntime {
         Ok(status)
     }
     fn unavailable(&mut self, destroyed: bool) {
+        abort_layer(&mut self.layers, "body unavailable");
         self.body = if destroyed {
             BodyAvailability::Destroyed
         } else {
@@ -729,6 +767,176 @@ impl ProbeRuntime {
         };
         Ok(true)
     }
+}
+
+fn abort_layer(layers: &mut LayerController, reason: &str) {
+    let pending = layers.abort();
+    if pending.is_some() {
+        eprintln!(
+            "[LAYER] Operation ended: {reason}; target={:?}, last readable={:?}, phase={:?}",
+            layers.desired,
+            layers.observed,
+            pending.map(|p| p.phase)
+        );
+    }
+}
+
+fn read_layer_with(
+    layers: &mut LayerController,
+    read: &mut impl FnMut() -> Result<PropertyResult<ObservedLayer>, HostError>,
+) -> Result<Option<ObservedLayer>, HostError> {
+    match read()? {
+        Ok(observed) => Ok(Some(observed)),
+        Err(reason) => {
+            eprintln!(
+                "[LAYER] Unverifiable state: {reason}; last readable={:?}",
+                layers.observed
+            );
+            abort_layer(layers, reason);
+            Ok(None)
+        }
+    }
+}
+
+fn validate_layer_support(
+    layers: &mut LayerController,
+    advertised: PropertyResult<LayerSupport>,
+) -> bool {
+    let Some(pending) = layers.pending() else {
+        return true;
+    };
+    match advertised {
+        Ok(support) if support.allows(pending.required) => true,
+        support => {
+            eprintln!(
+                "[LAYER] Required advertised support {:?} unavailable: {support:?}",
+                pending.required
+            );
+            abort_layer(layers, "unsupported or malformed _NET_SUPPORTED");
+            false
+        }
+    }
+}
+
+/// Bounded orchestration shared by real requests and deterministic host fakes.
+/// Reads return protocol errors separately from recoverable property problems.
+fn service_layer_with(
+    layers: &mut LayerController,
+    request: Option<Layer>,
+    mut read: impl FnMut() -> Result<PropertyResult<ObservedLayer>, HostError>,
+    mut support: impl FnMut() -> Result<PropertyResult<LayerSupport>, HostError>,
+    mut send: impl FnMut(Mutation) -> Result<(), HostError>,
+    mut now: impl FnMut() -> Instant,
+) -> Result<(), HostError> {
+    if let Some(target) = request {
+        if layers.pending().is_some() {
+            println!(
+                "[LAYER] Request {target:?} rejected: busy with {:?}",
+                layers.desired
+            );
+            return Ok(());
+        }
+        println!("[LAYER] Requested {target:?}");
+    }
+    let accepted = now();
+    let result = (|| {
+        let Some(observed) = read_layer_with(layers, &mut read)? else {
+            return Ok(());
+        };
+        let previous = layers.observed;
+        let mut step = match request {
+            Some(target) => layers.begin(target, observed, accepted),
+            None => layers.observe(observed, now()),
+        };
+        if previous != Some(observed) {
+            println!("[LAYER] Fresh observed state: {observed:?}");
+        }
+        loop {
+            match step {
+                Step::Send(mutation) => {
+                    // The entire planned transition is preflighted before its
+                    // first mutation and rechecked before a possible addition.
+                    // If time expires during a read/check, only a final read is allowed.
+                    if !layers.deadline().is_some_and(|deadline| now() >= deadline) {
+                        let advertised = support()?;
+                        if !layers.deadline().is_some_and(|deadline| now() >= deadline)
+                            && !validate_layer_support(layers, advertised)
+                        {
+                            return Ok(());
+                        }
+                    }
+                    if layers.deadline().is_some_and(|deadline| now() >= deadline) {
+                        let Some(observed) = read_layer_with(layers, &mut read)? else {
+                            return Ok(());
+                        };
+                        step = layers.observe(observed, now());
+                        continue;
+                    }
+                    send(mutation)?;
+                    println!("[LAYER] X11 checked {mutation:?}; awaiting fresh WM state");
+                    let Some(observed) = read_layer_with(layers, &mut read)? else {
+                        return Ok(());
+                    };
+                    println!("[LAYER] Fresh observed state: {observed:?}");
+                    step = layers.observe(observed, now());
+                }
+                Step::AlreadyMatches => {
+                    println!(
+                        "[LAYER] Already matches {:?}; no mutation or support proof",
+                        layers.desired
+                    );
+                    return Ok(());
+                }
+                Step::Confirmed => {
+                    println!("[LAYER] Confirmed property state {:?}; visual stacking requires owner observation", layers.observed);
+                    return Ok(());
+                }
+                Step::TimedOut(phase) => {
+                    eprintln!("[LAYER] Timeout: target={:?}, last readable={:?}, phase={phase:?}; no retry", layers.desired, layers.observed);
+                    return Ok(());
+                }
+                Step::Busy | Step::Waiting => return Ok(()),
+            }
+        }
+    })();
+    if result.is_err() {
+        abort_layer(layers, "fatal X11 layer operation failure");
+    }
+    result
+}
+
+fn service_layer(
+    conn: &impl Connection,
+    atoms: &LayerAtoms,
+    root: u32,
+    body: u32,
+    layers: &mut LayerController,
+    request: Option<Layer>,
+) -> Result<(), HostError> {
+    service_layer_with(
+        layers,
+        request,
+        || atoms.read_body(conn, body),
+        || atoms.read_support(conn, root),
+        |mutation| atoms.send(conn, root, body, mutation),
+        Instant::now,
+    )
+}
+
+fn layer_property_event(event: &Event, body: u32, atoms: &LayerAtoms) -> bool {
+    matches!(event, Event::PropertyNotify(ev) if ev.window == body && ev.atom == atoms.state)
+}
+
+fn interrupts_layer(
+    event: &Event,
+    root: u32,
+    body: u32,
+    atoms: &x11::monitors::LayoutAtoms,
+) -> bool {
+    relevant_layout_event(event, root, body, atoms)
+        || matches!(event, Event::MapNotify(ev) if ev.window == body)
+        || matches!(event, Event::UnmapNotify(ev) if ev.window == body)
+        || matches!(event, Event::DestroyNotify(ev) if ev.window == body)
 }
 
 fn relevant_layout_event(
@@ -835,6 +1043,7 @@ fn run_probe(
     initial_area: crate::geometry::Rect,
 ) -> Result<(), HostError> {
     let root = screen.root;
+    let layer_atoms = LayerAtoms::intern(conn)?;
     let mut usable_area = initial_area;
     let mut bounds = initial_bounds;
     let mut buffered_event = None;
@@ -850,8 +1059,23 @@ fn run_probe(
     loop {
         let now = Instant::now();
         if duration_deadline.is_some_and(|dl| now >= dl) {
+            abort_layer(&mut runtime.layers, "duration expiry");
             runtime.cancel(conn, window, "duration expiry")?;
             return Ok(());
+        }
+        if runtime
+            .layers
+            .deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            service_layer(
+                conn,
+                &layer_atoms,
+                root,
+                window.window,
+                &mut runtime.layers,
+                None,
+            )?;
         }
         // Confirmation is bounded even during sustained incoming event traffic.
         if let Some((_, deadline)) = runtime.correction {
@@ -926,6 +1150,9 @@ fn run_probe(
             if let Event::Error(error) = &event {
                 return Err(format!("Asynchronous X11 error: {error:?}").into());
             }
+            if interrupts_layer(&event, root, window.window, atoms) {
+                abort_layer(&mut runtime.layers, "layout or body lifecycle change");
+            }
             if popup_lifecycle(
                 &event,
                 runtime.menu.as_ref().map(|popup| popup.input),
@@ -983,6 +1210,45 @@ fn run_probe(
                 }
                 continue;
             }
+            if layer_property_event(&event, window.window, &layer_atoms) {
+                if matches!(
+                    runtime.body,
+                    BodyAvailability::Ready | BodyAvailability::Validating
+                ) {
+                    service_layer(
+                        conn,
+                        &layer_atoms,
+                        root,
+                        window.window,
+                        &mut runtime.layers,
+                        None,
+                    )?;
+                }
+                continue;
+            }
+            if matches!(&event, Event::PropertyNotify(ev) if ev.window == root && ev.atom == layer_atoms.supported)
+            {
+                if runtime.layers.pending().is_some() {
+                    let advertised = layer_atoms.read_support(conn, root)?;
+                    if runtime
+                        .layers
+                        .deadline()
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        service_layer(
+                            conn,
+                            &layer_atoms,
+                            root,
+                            window.window,
+                            &mut runtime.layers,
+                            None,
+                        )?;
+                    } else {
+                        validate_layer_support(&mut runtime.layers, advertised);
+                    }
+                }
+                continue;
+            }
             if let Some(popup) = runtime.menu.as_ref() {
                 if let Event::Expose(ev) = &event {
                     if ev.window == popup.window && ev.count == 0 {
@@ -1024,13 +1290,24 @@ fn run_probe(
                             _ => HostAction::None,
                         };
                         runtime.sync_safety(previous);
-                        if let HostAction::CloseMenu { time, quit } = action {
-                            runtime.cancel_at(conn, window, time)?;
-                            println!(
-                                "[MENU] {}",
-                                if quit { "Quit selected" } else { "Dismissed" }
-                            );
-                            if quit {
+                        if let HostAction::CloseMenu { time, outcome } = action {
+                            let body = window.window;
+                            if runtime.complete_menu_with(
+                                window,
+                                outcome,
+                                |pointer| pointer.release_if_held(conn, time).map(|_| ()),
+                                |popup| popup.destroy(conn),
+                                |layers, target| {
+                                    service_layer(
+                                        conn,
+                                        &layer_atoms,
+                                        root,
+                                        body,
+                                        layers,
+                                        Some(target),
+                                    )
+                                },
+                            )? {
                                 return Ok(());
                             }
                         }
@@ -1048,6 +1325,14 @@ fn run_probe(
                         runtime.body = BodyAvailability::Validating;
                         runtime.placement(conn, root, window, &bounds)?;
                         println!("[PLACEMENT] Verified map at {}", window.confirmed_origin());
+                        service_layer(
+                            conn,
+                            &layer_atoms,
+                            root,
+                            window.window,
+                            &mut runtime.layers,
+                            None,
+                        )?;
                     } else {
                         runtime.unavailable(false);
                     }
@@ -1314,6 +1599,7 @@ fn run_probe(
             runtime.confirmation_deadline,
             runtime.correction.map(|(_, dl)| dl),
             runtime.safety.deadline,
+            runtime.layers.deadline(),
         ]
         .into_iter()
         .flatten()
@@ -2545,7 +2831,7 @@ mod menu_runtime_tests {
     fn cancellation_invalidates_menu_then_ungrabs_before_destroy_and_is_idempotent() {
         let mut runtime = captured_menu();
         let mut body = tests::test_window();
-        runtime.interaction.menu_press(1, MenuHit::Row(1), 100, 0);
+        runtime.interaction.menu_press(1, MenuHit::Row(4), 100, 0);
         runtime.safety.acquired(Instant::now());
         runtime.pending_move = Some(Point::new(200, 200));
         let trace = RefCell::new(Vec::new());
@@ -2689,7 +2975,7 @@ mod menu_runtime_tests {
     #[test]
     fn long_menu_hold_rearms_and_missed_release_cancels_without_activation() {
         let mut runtime = captured_menu();
-        runtime.interaction.menu_press(1, MenuHit::Row(1), 100, 0);
+        runtime.interaction.menu_press(1, MenuHit::Row(4), 100, 0);
         runtime.sync_safety(None);
         let now = Instant::now();
         for sequence in 70000..70100 {
@@ -2708,7 +2994,7 @@ mod menu_runtime_tests {
             )
             .unwrap();
         assert_eq!(
-            runtime.interaction.menu_release(1, MenuHit::Row(1), 110, 0),
+            runtime.interaction.menu_release(1, MenuHit::Row(4), 110, 0),
             HostAction::None
         );
     }
@@ -2717,17 +3003,17 @@ mod menu_runtime_tests {
     fn menu_neutral_has_no_timer_and_chord_invalidates_old_button_observation() {
         let mut runtime = captured_menu();
         assert!(runtime.safety.deadline.is_none());
-        runtime.interaction.menu_press(1, MenuHit::Row(1), 100, 0);
+        runtime.interaction.menu_press(1, MenuHit::Row(4), 100, 0);
         runtime.sync_safety(None);
         runtime.safety.observed(false, 70000);
-        runtime.interaction.menu_press(2, MenuHit::Row(1), 101, 1);
+        runtime.interaction.menu_press(2, MenuHit::Row(4), 101, 1);
         runtime.sync_safety(Some(1));
         assert_eq!(runtime.interaction.active_button(), Some(0));
         assert!(!runtime.apply_safety(Instant::now(), None));
         assert!(runtime.safety.observation.is_none());
         assert!(runtime.safety.deadline.is_some());
-        runtime.interaction.menu_release(1, MenuHit::Row(1), 102, 2);
-        runtime.interaction.menu_release(2, MenuHit::Row(1), 103, 0);
+        runtime.interaction.menu_release(1, MenuHit::Row(4), 102, 2);
+        runtime.interaction.menu_release(2, MenuHit::Row(4), 103, 0);
         runtime.sync_safety(Some(0));
         assert!(runtime.menu.is_some());
         assert!(runtime.pointer.is_grabbed());
@@ -2790,7 +3076,7 @@ mod menu_runtime_tests {
                         ),
                         HostAction::CloseMenu {
                             time: 102,
-                            quit: false
+                            outcome: MenuOutcome::Dismiss
                         }
                     );
                     runtime.sync_safety(Some(1));
@@ -2889,7 +3175,7 @@ mod menu_runtime_tests {
         ));
         // Duration expiry uses the same cancellation path, including a held Quit row.
         let mut runtime = captured_menu();
-        runtime.interaction.menu_press(1, MenuHit::Row(1), 100, 0);
+        runtime.interaction.menu_press(1, MenuHit::Row(4), 100, 0);
         runtime.sync_safety(None);
         runtime
             .cancel_menu_with(
@@ -2906,7 +3192,7 @@ mod menu_runtime_tests {
     fn ordered_observed_chords_preserve_menu_and_automatic_owners_until_all_up() {
         for buttons in [2, 3] {
             let mut runtime = captured_menu();
-            runtime.interaction.menu_press(1, MenuHit::Row(1), 100, 0);
+            runtime.interaction.menu_press(1, MenuHit::Row(4), 100, 0);
             runtime.sync_safety(None);
             runtime.safety.observed_buttons(1, buttons, true, 70100);
             assert!(!runtime.apply_safety(Instant::now(), Some(70099)));
@@ -3089,5 +3375,664 @@ mod menu_runtime_tests {
             .is_err());
         assert!(!runtime.accepts_input());
         assert!(runtime.menu.is_some());
+    }
+}
+
+#[cfg(test)]
+mod layer_runtime_tests {
+    use super::*;
+    use crate::geometry::{MenuHit, ValidOriginBounds};
+    use crate::interaction::MenuItem;
+    use crate::layer::{Flags, Phase};
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use x11rb::protocol::xproto::{Property, PropertyNotifyEvent};
+
+    const SUPPORT: LayerSupport = LayerSupport {
+        state: true,
+        above: true,
+        below: true,
+    };
+
+    fn captured_menu() -> ProbeRuntime {
+        let mut runtime = ProbeRuntime::new();
+        runtime.body = BodyAvailability::Ready;
+        runtime
+            .acquire_menu_with(MenuPopup::test_popup(10, 1), Point::new(0, 0), || {
+                Ok((GrabStatus::SUCCESS, 100))
+            })
+            .unwrap();
+        runtime
+    }
+
+    fn pending_above(layers: &mut LayerController, now: Instant) {
+        let reads = Cell::new(0);
+        service_layer_with(
+            layers,
+            Some(Layer::Above),
+            || {
+                reads.set(reads.get() + 1);
+                Ok(Ok(ObservedLayer::Below))
+            },
+            || Ok(Ok(SUPPORT)),
+            |mutation| {
+                assert_eq!(
+                    mutation,
+                    Mutation::Remove(Flags {
+                        above: false,
+                        below: true
+                    })
+                );
+                Ok(())
+            },
+            || now,
+        )
+        .unwrap();
+        assert_eq!(reads.get(), 2); // preflight snapshot and fresh read after checked removal
+        assert_eq!(layers.pending().unwrap().phase, Phase::AwaitRemoval);
+    }
+
+    #[test]
+    fn checked_mutations_are_each_followed_by_fresh_read_and_complete_immediately() {
+        let now = Instant::now();
+        let mut layers = LayerController::default();
+        let mut snapshots = VecDeque::from([
+            ObservedLayer::Below,
+            ObservedLayer::Normal,
+            ObservedLayer::Above,
+        ]);
+        let trace = RefCell::new(Vec::new());
+        service_layer_with(
+            &mut layers,
+            Some(Layer::Above),
+            || {
+                trace.borrow_mut().push("read");
+                Ok(Ok(snapshots.pop_front().unwrap()))
+            },
+            || {
+                trace.borrow_mut().push("support");
+                Ok(Ok(SUPPORT))
+            },
+            |mutation| {
+                trace.borrow_mut().push(match mutation {
+                    Mutation::Remove(_) => "remove/check",
+                    Mutation::AddAbove => "add/check",
+                    _ => panic!("wrong mutation"),
+                });
+                Ok(())
+            },
+            || now,
+        )
+        .unwrap();
+        assert_eq!(
+            *trace.borrow(),
+            [
+                "read",
+                "support",
+                "remove/check",
+                "read",
+                "support",
+                "add/check",
+                "read"
+            ]
+        );
+        assert_eq!(layers.observed, Some(ObservedLayer::Above));
+        assert!(layers.deadline().is_none());
+    }
+
+    #[test]
+    fn fresh_idempotence_needs_no_support_query_or_send() {
+        let mut layers = LayerController::default();
+        service_layer_with(
+            &mut layers,
+            Some(Layer::Normal),
+            || Ok(Ok(ObservedLayer::Normal)),
+            || panic!("no mutation support proof required"),
+            |_| panic!("idempotent request must not send"),
+            Instant::now,
+        )
+        .unwrap();
+        assert!(layers.deadline().is_none());
+    }
+
+    #[test]
+    fn whole_transition_support_is_checked_before_removal_and_again_before_addition() {
+        let now = Instant::now();
+        for support in [
+            Ok(LayerSupport {
+                above: false,
+                ..SUPPORT
+            }),
+            Err("malformed support"),
+        ] {
+            let mut layers = LayerController::default();
+            service_layer_with(
+                &mut layers,
+                Some(Layer::Above),
+                || Ok(Ok(ObservedLayer::Below)),
+                || Ok(support),
+                |_| panic!("must reject before removal"),
+                || now,
+            )
+            .unwrap();
+            assert!(layers.pending().is_none());
+            assert_eq!(layers.observed, Some(ObservedLayer::Below));
+        }
+        let mut layers = LayerController::default();
+        pending_above(&mut layers, now);
+        service_layer_with(
+            &mut layers,
+            None,
+            || Ok(Ok(ObservedLayer::Normal)),
+            || {
+                Ok(Ok(LayerSupport {
+                    above: false,
+                    ..SUPPORT
+                }))
+            },
+            |_| panic!("support lost: no addition or rollback"),
+            || now,
+        )
+        .unwrap();
+        assert_eq!(layers.observed, Some(ObservedLayer::Normal));
+        assert!(layers.pending().is_none());
+    }
+
+    #[test]
+    fn absent_or_malformed_body_never_confirms_normal_or_removal() {
+        let now = Instant::now();
+        for target in [Layer::Normal, Layer::Above] {
+            for reason in ["mapped body state absent", "malformed state"] {
+                let mut layers = LayerController::default();
+                layers.begin(target, ObservedLayer::Below, now);
+                service_layer_with(
+                    &mut layers,
+                    None,
+                    || Ok(Err(reason)),
+                    || panic!("no support query"),
+                    |_| panic!("unverifiable removal cannot add"),
+                    || now,
+                )
+                .unwrap();
+                assert_eq!(layers.observed, Some(ObservedLayer::Below));
+                assert!(layers.deadline().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn later_drag_and_newer_popup_do_not_defer_addition_or_change_ownership() {
+        let now = Instant::now();
+        for popup in [false, true] {
+            let mut runtime = ProbeRuntime::new();
+            runtime.body = BodyAvailability::Ready;
+            pending_above(&mut runtime.layers, now);
+            if popup {
+                runtime
+                    .acquire_menu_with(MenuPopup::test_popup(10, 2), Point::new(0, 0), || {
+                        Ok((GrabStatus::SUCCESS, 200))
+                    })
+                    .unwrap();
+            } else {
+                runtime.interaction.handle_left_press(
+                    Point::new(80, 80),
+                    (80, 80),
+                    100,
+                    Point::new(0, 0),
+                );
+                runtime
+                    .pointer
+                    .acquire_with(CaptureOwner::BodyLeft, || Ok((GrabStatus::SUCCESS, 10)))
+                    .unwrap();
+                runtime.interaction.on_grab_acquired();
+                runtime.interaction.handle_motion(
+                    Point::new(100, 100),
+                    101,
+                    &ValidOriginBounds::new(0, 500, 0, 500),
+                );
+                assert!(runtime.interaction.is_dragging());
+            }
+            let state = runtime.interaction.state();
+            let owner = runtime.pointer.owner();
+            let sends = Cell::new(0);
+            let mut snapshots = VecDeque::from([ObservedLayer::Normal, ObservedLayer::Above]);
+            service_layer_with(
+                &mut runtime.layers,
+                None,
+                || Ok(Ok(snapshots.pop_front().unwrap())),
+                || Ok(Ok(SUPPORT)),
+                |mutation| {
+                    assert_eq!(mutation, Mutation::AddAbove);
+                    sends.set(sends.get() + 1);
+                    Ok(())
+                },
+                || now,
+            )
+            .unwrap();
+            assert_eq!(sends.get(), 1);
+            assert_eq!(runtime.interaction.state(), state);
+            assert_eq!(runtime.pointer.owner(), owner);
+            assert_eq!(runtime.menu.is_some(), popup);
+            assert!(runtime.layers.pending().is_none());
+        }
+    }
+
+    #[test]
+    fn layer_selection_cleanup_precedes_dispatch_and_busy_preserves_original_operation() {
+        let now = Instant::now();
+        for busy in [false, true] {
+            let mut runtime = captured_menu();
+            if busy {
+                pending_above(&mut runtime.layers, now);
+            }
+            let pending = runtime.layers.pending();
+            runtime.interaction.menu_press(1, MenuHit::Row(2), 100, 0);
+            let HostAction::CloseMenu { outcome, .. } =
+                runtime.interaction.menu_release(1, MenuHit::Row(2), 101, 0)
+            else {
+                panic!("layer selection missing")
+            };
+            let trace = RefCell::new(Vec::new());
+            runtime
+                .complete_menu_with(
+                    &mut tests::test_window(),
+                    outcome,
+                    |pointer| {
+                        pointer
+                            .release_with(|| {
+                                trace.borrow_mut().push("ungrab");
+                                Ok(())
+                            })
+                            .map(|_| ())
+                    },
+                    |_| {
+                        trace.borrow_mut().push("destroy");
+                        Ok(())
+                    },
+                    |layers, target| {
+                        assert_eq!(*trace.borrow(), ["ungrab", "destroy"]);
+                        trace.borrow_mut().push("dispatch");
+                        service_layer_with(
+                            layers,
+                            Some(target),
+                            || {
+                                assert!(!busy);
+                                Ok(Ok(ObservedLayer::Below))
+                            },
+                            || panic!("no mutation"),
+                            |_| panic!("no mutation"),
+                            || now,
+                        )
+                    },
+                )
+                .unwrap();
+            assert_eq!(*trace.borrow(), ["ungrab", "destroy", "dispatch"]);
+            assert!(runtime.menu.is_none());
+            assert!(!runtime.pointer.is_grabbed());
+            assert!(runtime.interaction.is_idle());
+            assert_eq!(runtime.layers.pending(), pending);
+            assert_eq!(
+                runtime.layers.desired,
+                Some(if busy { Layer::Above } else { Layer::Below })
+            );
+        }
+    }
+
+    #[test]
+    fn failed_popup_release_or_destruction_blocks_dispatch_and_preserves_error_priority() {
+        for release_fails in [false, true] {
+            let mut runtime = captured_menu();
+            let destroyed = Cell::new(false);
+            let result = runtime.complete_menu_with(
+                &mut tests::test_window(),
+                MenuOutcome::SetLayer(Layer::Above),
+                |pointer| {
+                    pointer
+                        .release_with(|| {
+                            if release_fails {
+                                Err("release failure".into())
+                            } else {
+                                Ok(())
+                            }
+                        })
+                        .map(|_| ())
+                },
+                |_| {
+                    destroyed.set(true);
+                    Err("destroy failure".into())
+                },
+                |_, _| panic!("failed cleanup must not dispatch"),
+            );
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                if release_fails {
+                    "release failure"
+                } else {
+                    "destroy failure"
+                }
+            );
+            assert!(destroyed.get());
+            assert_eq!(runtime.pointer.is_grabbed(), release_fails);
+            assert!(runtime.menu.is_some());
+            assert!(runtime.layers.desired.is_none());
+        }
+    }
+
+    #[test]
+    fn protocol_read_support_send_and_check_failures_are_fatal_without_rollback() {
+        let now = Instant::now();
+        for fail_at in [
+            "read",
+            "support",
+            "send",
+            "check",
+            "post-read",
+            "second-send",
+            "second-post-read",
+        ] {
+            let mut layers = LayerController::default();
+            let reads = Cell::new(0);
+            let sends = Cell::new(0);
+            let result = service_layer_with(
+                &mut layers,
+                Some(Layer::Above),
+                || {
+                    let count = reads.get();
+                    reads.set(count + 1);
+                    if (fail_at == "read" && count == 0)
+                        || (fail_at == "post-read" && count == 1)
+                        || (fail_at == "second-post-read" && count == 2)
+                    {
+                        return Err(fail_at.into());
+                    }
+                    Ok(Ok(if count == 0 {
+                        ObservedLayer::Below
+                    } else {
+                        ObservedLayer::Normal
+                    }))
+                },
+                || {
+                    if fail_at == "support" {
+                        Err(fail_at.into())
+                    } else {
+                        Ok(Ok(SUPPORT))
+                    }
+                },
+                |_| {
+                    sends.set(sends.get() + 1);
+                    if matches!(fail_at, "send" | "check")
+                        || fail_at == "second-send" && sends.get() == 2
+                    {
+                        Err(fail_at.into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || now,
+            );
+            assert_eq!(result.unwrap_err().to_string(), fail_at);
+            assert!(layers.deadline().is_none());
+            if fail_at == "second-send" {
+                assert_eq!(sends.get(), 2);
+                assert_eq!(layers.observed, Some(ObservedLayer::Normal));
+            }
+        }
+    }
+
+    #[test]
+    fn layer_host_error_keeps_priority_over_later_pointer_and_resource_cleanup() {
+        let now = Instant::now();
+        let mut runtime = captured_menu();
+        pending_above(&mut runtime.layers, now);
+        let result = service_layer_with(
+            &mut runtime.layers,
+            None,
+            || Err("original layer read error".into()),
+            || panic!("no support"),
+            |_| panic!("no send"),
+            || now,
+        );
+        let cleanup_attempted = Cell::new(false);
+        let outcome = finish_probe_with(result, || {
+            runtime.cancel_menu_with(
+                &mut tests::test_window(),
+                |pointer| {
+                    pointer
+                        .release_with(|| Err("ungrab error".into()))
+                        .map(|_| ())
+                },
+                |_| {
+                    cleanup_attempted.set(true);
+                    Err("destroy error".into())
+                },
+            )
+        });
+        assert_eq!(
+            outcome.unwrap_err().to_string(),
+            "original layer read error"
+        );
+        assert!(cleanup_attempted.get());
+        assert!(runtime.pointer.is_grabbed());
+    }
+
+    fn property(window: u32, atom: u32, sequence: u16) -> Event {
+        Event::PropertyNotify(PropertyNotifyEvent {
+            response_type: 28,
+            sequence,
+            window,
+            atom,
+            time: 100,
+            state: Property::NEW_VALUE,
+        })
+    }
+    fn atoms() -> LayerAtoms {
+        LayerAtoms {
+            state: 20,
+            supported: 21,
+            above: 22,
+            below: 23,
+        }
+    }
+    fn layout_atoms() -> x11::monitors::LayoutAtoms {
+        x11::monitors::LayoutAtoms {
+            workarea: 30,
+            current_desktop: 31,
+            wm_desktop: 32,
+        }
+    }
+
+    #[test]
+    fn stale_relevant_notifications_reread_truth_unrelated_events_cannot_confirm_or_cancel_input() {
+        let now = Instant::now();
+        let mut layers = LayerController::default();
+        pending_above(&mut layers, now);
+        let reads = Cell::new(0);
+        for event in [
+            property(99, 20, 0),
+            property(100, 99, 0),
+            property(100, 20, 0),
+            property(100, 20, u16::MAX),
+        ] {
+            assert!(!interrupts_pending_movement(
+                &event,
+                1,
+                100,
+                &layout_atoms()
+            ));
+            assert!(!interrupts_layer(&event, 1, 100, &layout_atoms()));
+            if layer_property_event(&event, 100, &atoms()) {
+                service_layer_with(
+                    &mut layers,
+                    None,
+                    || {
+                        reads.set(reads.get() + 1);
+                        Ok(Ok(ObservedLayer::Below))
+                    },
+                    || panic!("not ready to add"),
+                    |_| panic!("stale event cannot confirm removal"),
+                    || now,
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(reads.get(), 2);
+        assert!(layers.pending().is_some());
+        service_layer_with(
+            &mut layers,
+            None,
+            || Ok(Ok(ObservedLayer::Above)),
+            || panic!("already complete"),
+            |_| panic!("already complete"),
+            || now,
+        )
+        .unwrap();
+        assert!(layers.pending().is_none());
+    }
+
+    #[test]
+    fn fixed_deadline_wins_under_event_traffic_and_final_read_can_confirm_or_timeout() {
+        let now = Instant::now();
+        for final_observed in [
+            ObservedLayer::Above,
+            ObservedLayer::Normal,
+            ObservedLayer::Conflict,
+        ] {
+            let mut layers = LayerController::default();
+            pending_above(&mut layers, now);
+            let deadline = layers.deadline().unwrap();
+            let mut queue: VecDeque<_> = (0..200).map(|_| property(99, 99, 0)).collect();
+            let mut buffered = None;
+            let mut reads = 0;
+            while !queue.is_empty() {
+                if layers.deadline().is_some_and(|time| deadline >= time) {
+                    service_layer_with(
+                        &mut layers,
+                        None,
+                        || {
+                            reads += 1;
+                            Ok(Ok(final_observed))
+                        },
+                        || panic!("timeout cannot query mutation support"),
+                        |_| panic!("timeout cannot add or retry"),
+                        || deadline,
+                    )
+                    .unwrap();
+                }
+                drain_events_bounded(&mut buffered, 64, || Ok::<_, HostError>(queue.pop_front()))
+                    .unwrap();
+                assert!(layers.deadline().is_none());
+            }
+            assert_eq!(reads, 1);
+            assert_eq!(layers.observed, Some(final_observed));
+            service_layer_with(
+                &mut layers,
+                None,
+                || Ok(Ok(ObservedLayer::Above)),
+                || panic!("late property cannot revive operation"),
+                |_| panic!("no reconciliation"),
+                || deadline,
+            )
+            .unwrap();
+            assert!(layers.pending().is_none());
+        }
+    }
+
+    #[test]
+    fn expiry_during_support_query_performs_final_read_without_sending() {
+        let started = Instant::now();
+        for advertised in [Ok(SUPPORT), Err("support malformed at expiry")] {
+            let clock = Cell::new(started);
+            let mut layers = LayerController::default();
+            let reads = Cell::new(0);
+            service_layer_with(
+                &mut layers,
+                Some(Layer::Above),
+                || {
+                    reads.set(reads.get() + 1);
+                    Ok(Ok(ObservedLayer::Normal))
+                },
+                || {
+                    clock.set(started + crate::layer::CONFIRMATION_TIMEOUT);
+                    Ok(advertised)
+                },
+                |_| panic!("deadline passed while reading support"),
+                || clock.get(),
+            )
+            .unwrap();
+            assert_eq!(reads.get(), 2);
+            assert!(layers.pending().is_none());
+        }
+    }
+
+    #[test]
+    fn quit_dismiss_duration_and_lifecycle_preserve_cleanup_and_end_only_appropriate_work() {
+        use x11rb::protocol::xproto::{DestroyNotifyEvent, MapNotifyEvent, UnmapNotifyEvent};
+        let now = Instant::now();
+        for item in [MenuItem::Dismiss, MenuItem::Quit] {
+            let mut runtime = captured_menu();
+            pending_above(&mut runtime.layers, now);
+            let quit = runtime
+                .complete_menu_with(
+                    &mut tests::test_window(),
+                    item.outcome(),
+                    |pointer| pointer.release_with(|| Ok(())).map(|_| ()),
+                    |_| Ok(()),
+                    |_, _| panic!("not a layer action"),
+                )
+                .unwrap();
+            assert_eq!(quit, item == MenuItem::Quit);
+            assert_eq!(runtime.layers.pending().is_some(), !quit);
+            assert!(!runtime.pointer.is_grabbed());
+            assert!(runtime.menu.is_none());
+        }
+        let events = [
+            property(1, 30, 0),
+            property(1, 31, 0),
+            property(100, 32, 0),
+            Event::MapNotify(MapNotifyEvent {
+                response_type: 19,
+                sequence: 0,
+                event: 1,
+                window: 100,
+                override_redirect: false,
+            }),
+            Event::UnmapNotify(UnmapNotifyEvent {
+                response_type: 18,
+                sequence: 0,
+                event: 1,
+                window: 100,
+                from_configure: false,
+            }),
+            Event::DestroyNotify(DestroyNotifyEvent {
+                response_type: 17,
+                sequence: 0,
+                event: 1,
+                window: 100,
+            }),
+        ];
+        for event in events {
+            assert!(interrupts_layer(&event, 1, 100, &layout_atoms()));
+        }
+        for reason in [
+            "duration expiry",
+            "layout or body lifecycle change",
+            "shutdown",
+        ] {
+            let mut runtime = captured_menu();
+            pending_above(&mut runtime.layers, now);
+            abort_layer(&mut runtime.layers, reason);
+            runtime
+                .cancel_menu_with(
+                    &mut tests::test_window(),
+                    |pointer| pointer.release_with(|| Ok(())).map(|_| ()),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert!(runtime.layers.deadline().is_none());
+            assert!(!runtime.pointer.is_grabbed());
+            assert!(runtime.menu.is_none());
+            assert!(runtime.interaction.is_idle());
+        }
     }
 }

@@ -4,6 +4,7 @@ use crate::geometry::{
     calculate_grab_offset, calculate_target_origin, exceeds_drag_threshold,
     is_in_interactive_silhouette, GrabOffset, MenuHit, Point, ValidOriginBounds,
 };
+use crate::layer::Layer;
 
 /// States of pointer interaction on the probe window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -71,23 +72,60 @@ pub enum HostAction {
     },
     CloseMenu {
         time: u32,
-        quit: bool,
+        outcome: MenuOutcome,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuItem {
+    Above,
+    Normal,
+    Below,
     Dismiss,
     Quit,
 }
 impl MenuItem {
+    pub const ALL: [Self; 5] = [
+        Self::Above,
+        Self::Normal,
+        Self::Below,
+        Self::Dismiss,
+        Self::Quit,
+    ];
+
+    pub fn label(self) -> &'static [u8] {
+        match self {
+            Self::Above => b"Above",
+            Self::Normal => b"Normal",
+            Self::Below => b"Below",
+            Self::Dismiss => b"Dismiss",
+            Self::Quit => b"Quit",
+        }
+    }
+
+    pub fn outcome(self) -> MenuOutcome {
+        match self {
+            Self::Above => MenuOutcome::SetLayer(Layer::Above),
+            Self::Normal => MenuOutcome::SetLayer(Layer::Normal),
+            Self::Below => MenuOutcome::SetLayer(Layer::Below),
+            Self::Dismiss => MenuOutcome::Dismiss,
+            Self::Quit => MenuOutcome::Quit,
+        }
+    }
+
     pub fn from_hit(hit: MenuHit) -> Option<Self> {
         match hit {
-            MenuHit::Row(0) => Some(Self::Dismiss),
-            MenuHit::Row(1) => Some(Self::Quit),
+            MenuHit::Row(row) => Self::ALL.get(row).copied(),
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuOutcome {
+    Dismiss,
+    Quit,
+    SetLayer(Layer),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -489,17 +527,17 @@ impl InteractionManager {
             gesture: MenuGesture::None,
         };
         self.freshness_pending = false;
-        let quit = match gesture {
+        let outcome = match gesture {
             MenuGesture::ItemPressed { item, .. }
                 if button == 1 && MenuItem::from_hit(hit) == Some(item) =>
             {
-                item == MenuItem::Quit
+                item.outcome()
             }
-            MenuGesture::OutsidePressed { .. } if button == 1 => false,
-            MenuGesture::RightDismissPressed { .. } if button == 3 => false,
+            MenuGesture::OutsidePressed { .. } if button == 1 => MenuOutcome::Dismiss,
+            MenuGesture::RightDismissPressed { .. } if button == 3 => MenuOutcome::Dismiss,
             _ => return HostAction::None,
         };
-        HostAction::CloseMenu { time, quit }
+        HostAction::CloseMenu { time, outcome }
     }
 
     /// None means no safety timer; zero means observe any held button of a chord.
@@ -1204,6 +1242,37 @@ mod tests {
 #[cfg(test)]
 mod menu_tests {
     use super::*;
+
+    #[test]
+    fn each_layer_item_rejects_other_row_outside_wrong_button_and_chord_completion() {
+        for row in 0..3 {
+            for release in [
+                MenuHit::Row((row + 1) % 5),
+                MenuHit::Outside,
+                MenuHit::Background,
+            ] {
+                let mut manager = open();
+                manager.menu_press(1, MenuHit::Row(row), 100, 0);
+                assert_eq!(manager.menu_release(1, release, 101, 0), HostAction::None);
+            }
+            let mut manager = open();
+            manager.menu_press(1, MenuHit::Row(row), 100, 0);
+            assert_eq!(
+                manager.menu_release(3, MenuHit::Row(row), 101, 0),
+                HostAction::None
+            );
+            manager.menu_press(1, MenuHit::Row(row), 102, 0);
+            manager.menu_press(2, MenuHit::Row(row), 103, 1);
+            assert_eq!(
+                manager.menu_release(1, MenuHit::Row(row), 104, 2),
+                HostAction::None
+            );
+            assert_eq!(
+                manager.menu_release(2, MenuHit::Row(row), 105, 0),
+                HostAction::None
+            );
+        }
+    }
     const ANCHOR: Point = Point::new(100, 100);
     fn open() -> InteractionManager {
         let mut manager = InteractionManager::new();
@@ -1330,8 +1399,14 @@ mod menu_tests {
     }
 
     #[test]
-    fn same_row_activates_dismiss_and_quit_only_on_release() {
-        for (row, quit) in [(0, false), (1, true)] {
+    fn same_row_activates_all_five_items_only_on_release() {
+        for (row, outcome) in [
+            (0, MenuOutcome::SetLayer(Layer::Above)),
+            (1, MenuOutcome::SetLayer(Layer::Normal)),
+            (2, MenuOutcome::SetLayer(Layer::Below)),
+            (3, MenuOutcome::Dismiss),
+            (4, MenuOutcome::Quit),
+        ] {
             let mut manager = open();
             assert_eq!(
                 manager.menu_release(1, MenuHit::Row(row), 99, 0),
@@ -1347,7 +1422,7 @@ mod menu_tests {
             ));
             assert_eq!(
                 manager.menu_release(1, MenuHit::Row(row), 101, 0),
-                HostAction::CloseMenu { time: 101, quit }
+                HostAction::CloseMenu { time: 101, outcome }
             );
             assert_eq!(
                 manager.menu_release(1, MenuHit::Row(row), 102, 0),
@@ -1358,9 +1433,9 @@ mod menu_tests {
 
     #[test]
     fn release_away_and_inert_background_leave_menu_open() {
-        for hit in [MenuHit::Row(1), MenuHit::Outside, MenuHit::Background] {
+        for hit in [MenuHit::Row(4), MenuHit::Outside, MenuHit::Background] {
             let mut manager = open();
-            manager.menu_press(1, MenuHit::Row(0), 100, 0);
+            manager.menu_press(1, MenuHit::Row(3), 100, 0);
             assert_eq!(manager.menu_release(1, hit, 101, 0), HostAction::None);
             assert_eq!(manager.active_button(), None);
             assert!(matches!(
@@ -1374,7 +1449,7 @@ mod menu_tests {
         let mut manager = open();
         manager.menu_press(1, MenuHit::Background, 100, 0);
         assert_eq!(
-            manager.menu_release(1, MenuHit::Row(1), 101, 0),
+            manager.menu_release(1, MenuHit::Row(4), 101, 0),
             HostAction::None
         );
     }
@@ -1384,7 +1459,7 @@ mod menu_tests {
         let mut manager = open();
         manager.menu_press(1, MenuHit::Outside, 100, 0);
         assert_eq!(manager.active_button(), Some(1));
-        manager.menu_motion(MenuHit::Row(1), 101);
+        manager.menu_motion(MenuHit::Row(4), 101);
         assert!(matches!(
             manager.state(),
             InteractionState::MenuOpen {
@@ -1393,10 +1468,10 @@ mod menu_tests {
             }
         ));
         assert_eq!(
-            manager.menu_release(1, MenuHit::Row(1), 102, 0),
+            manager.menu_release(1, MenuHit::Row(4), 102, 0),
             HostAction::CloseMenu {
                 time: 102,
-                quit: false
+                outcome: MenuOutcome::Dismiss
             }
         );
     }
@@ -1408,7 +1483,7 @@ mod menu_tests {
             manager.menu_release(3, MenuHit::Outside, 100, 0),
             HostAction::None
         );
-        manager.menu_press(3, MenuHit::Row(1), 110, 0);
+        manager.menu_press(3, MenuHit::Row(4), 110, 0);
         assert_eq!(
             manager.menu_release(3, MenuHit::Outside, 109, 0),
             HostAction::None
@@ -1417,7 +1492,7 @@ mod menu_tests {
             manager.menu_release(3, MenuHit::Outside, 111, 0),
             HostAction::CloseMenu {
                 time: 111,
-                quit: false
+                outcome: MenuOutcome::Dismiss
             }
         );
     }
@@ -1425,7 +1500,7 @@ mod menu_tests {
     #[test]
     fn middle_and_wheel_are_ignored_inside_and_outside_without_timer() {
         for button in [2, 4, 5] {
-            for hit in [MenuHit::Outside, MenuHit::Row(0), MenuHit::Row(1)] {
+            for hit in [MenuHit::Outside, MenuHit::Row(3), MenuHit::Row(4)] {
                 let mut manager = open();
                 manager.menu_press(button, hit, 100, 0);
                 assert_eq!(manager.active_button(), None);
@@ -1444,9 +1519,9 @@ mod menu_tests {
     #[test]
     fn menu_chords_cancel_actions_and_keep_capture_semantics_until_all_up() {
         for (button, hit) in [
-            (1, MenuHit::Row(1)),
+            (1, MenuHit::Row(4)),
             (1, MenuHit::Outside),
-            (3, MenuHit::Row(0)),
+            (3, MenuHit::Row(3)),
         ] {
             for other in [1, 2, 3, 4, 5] {
                 if other == button {
@@ -1468,12 +1543,12 @@ mod menu_tests {
                         ..
                     }
                 ));
-                manager.menu_press(1, MenuHit::Row(0), 104, 0);
+                manager.menu_press(1, MenuHit::Row(3), 104, 0);
                 assert_eq!(
-                    manager.menu_release(1, MenuHit::Row(0), 105, 0),
+                    manager.menu_release(1, MenuHit::Row(3), 105, 0),
                     HostAction::CloseMenu {
                         time: 105,
-                        quit: false
+                        outcome: MenuOutcome::Dismiss
                     }
                 );
             }
@@ -1483,14 +1558,14 @@ mod menu_tests {
     #[test]
     fn chord_detected_from_completion_mask_cannot_activate_or_release() {
         let mut manager = open();
-        manager.menu_press(1, MenuHit::Row(1), 100, 0);
+        manager.menu_press(1, MenuHit::Row(4), 100, 0);
         assert_eq!(
-            manager.menu_release(1, MenuHit::Row(1), 101, 2),
+            manager.menu_release(1, MenuHit::Row(4), 101, 2),
             HostAction::None
         );
         assert_eq!(manager.active_button(), Some(0));
         assert_eq!(
-            manager.menu_release(2, MenuHit::Row(1), 102, 0),
+            manager.menu_release(2, MenuHit::Row(4), 102, 0),
             HostAction::None
         );
         manager.menu_press(3, MenuHit::Outside, 103, 2);
@@ -1503,28 +1578,31 @@ mod menu_tests {
     #[test]
     fn menu_freshness_wrap_long_hold_and_cancellation() {
         let mut manager = open();
-        manager.menu_press(1, MenuHit::Row(1), u32::MAX - 10, 0);
+        manager.menu_press(1, MenuHit::Row(4), u32::MAX - 10, 0);
         assert_eq!(
-            manager.menu_release(1, MenuHit::Row(1), u32::MAX - 11, 0),
+            manager.menu_release(1, MenuHit::Row(4), u32::MAX - 11, 0),
             HostAction::None
         );
         assert_eq!(
-            manager.menu_release(1, MenuHit::Row(1), 5, 0),
+            manager.menu_release(1, MenuHit::Row(4), 5, 0),
             HostAction::CloseMenu {
                 time: 5,
-                quit: true
+                outcome: MenuOutcome::Quit
             }
         );
-        manager.menu_press(1, MenuHit::Row(1), 100, 0);
+        manager.menu_press(1, MenuHit::Row(4), 100, 0);
         manager.confirm_button_held();
         assert!(matches!(
-            manager.menu_release(1, MenuHit::Row(1), 0x80000100, 0),
-            HostAction::CloseMenu { quit: true, .. }
+            manager.menu_release(1, MenuHit::Row(4), 0x80000100, 0),
+            HostAction::CloseMenu {
+                outcome: MenuOutcome::Quit,
+                ..
+            }
         ));
-        manager.menu_press(1, MenuHit::Row(1), 100, 0);
+        manager.menu_press(1, MenuHit::Row(4), 100, 0);
         manager.cancel(101);
         assert_eq!(
-            manager.menu_release(1, MenuHit::Row(1), 102, 0),
+            manager.menu_release(1, MenuHit::Row(4), 102, 0),
             HostAction::None
         );
         assert!(manager.is_idle());
