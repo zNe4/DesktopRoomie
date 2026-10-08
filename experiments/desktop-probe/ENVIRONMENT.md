@@ -74,3 +74,9 @@ cargo run --manifest-path experiments/desktop-probe/Cargo.toml -- --duration 5
 # Run pure diagnostics without rendering (M01.1 mode)
 cargo run --manifest-path experiments/desktop-probe/Cargo.toml -- --diagnose
 ```
+
+## M02 environment reconciliation — recorded 2026-10-07
+
+The owner rediscovered the host during final M02 acceptance at frozen revision `d8dc1abef8b6a8d9395342b234f2f0beb912bc7b`: Archcraft rolling / Linux `7.2.8-arch1-1`, X11 (`DISPLAY=:0`), Openbox 3.6.1, Picom v13 revision `d87a5ba`, and Rust/Cargo 1.99.0. Openbox, Picom, and Polybar were active. The final snapshot had one active monitor, `eDP-2` primary, 1920×1080 at +0+0 (144 Hz), with root 1920×1080, 5 desktops (current 0), and `_NET_WORKAREA` / selected usable area x=10, y=48, w=1900, h=1022.
+
+A secondary monitor was temporarily available during the actual T09 cross-monitor release test, then disconnected before the final single-monitor snapshot. Earlier movement logs used a different desktop configuration/workarea; the final snapshot does not describe the entire acceptance session. The M01 observations above, including their monitor/root/workarea history, remain historical evidence. See [ACCEPTANCE-M02.md](ACCEPTANCE-M02.md) for the integrated results and limitations.
