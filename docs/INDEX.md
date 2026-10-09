@@ -27,7 +27,8 @@ DesktopRoomie is the reusable software; Project Vanilla is its private character
 - [D00-M01 documentation/context hygiene](DesktopRoomie-D00-M01-documentation-context-hygiene.md): **accepted** docs-only context layer, with independent review and owner approval recorded in the mission document.
 - [A00-M01 desktop probe](DesktopRoomie-A00-M01-desktop-probe.md): accepted foundation's original contract.
 - [A00-M02 dragging and release](DesktopRoomie-A00-M02-dragging-and-release.md): accepted foundation's original detailed contract.
-- [A00-M03 placement, recovery and host selection](DesktopRoomie-A00-M03-placement-recovery-host-selection.md): accepted M03.1 contract plus the client-approved 2026-10-09 split (M03.2 Bring Top; M03.3 Bring Here and composed Recover); later scope remains unimplemented. Read STATUS before interpreting historical next-action language.
+- [A00-M03 placement, recovery and host selection](DesktopRoomie-A00-M03-placement-recovery-host-selection.md): accepted M03.1 contract and approved recovery separation; M03.2 implementation remains unstarted.
+- [A00-M03.2 approved implementation design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md): full independently reviewed Codex read-only proposal, visibility/IPC/input protocols, tests, and host gates. **Design approved, staged coding assignments not yet authorized**.
 - [Openbox host integration](host/OPENBOX.md): optional user-managed shortcut/launcher/autostart guidance, distinct from correctness-critical executable behavior. Future CLI samples are not yet working commands.
 
 ## Acceptance and historical explanation

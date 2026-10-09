@@ -1,6 +1,6 @@
 # DesktopRoomie — A00-M03: Placement, Recovery and Host Selection
 
-Status: **M03.1 accepted** on the target Openbox/X11/Picom host. Client-approved recovery separation and host-integration policy were clarified 2026-10-09. M03.2 remains a read-only design gate; no M03.2 or M03.3 implementation is authorized.
+Status: **M03.1 accepted** on the target Openbox/X11/Picom host. The client-approved recovery separation was clarified 2026-10-09. The full [M03.2 read-only implementation design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md) subsequently passed independent review; staged implementation boundaries and authorization are still pending. M03.3 remains design-only.
 Prepared against main revision 614dfb22b944e5f9ec0d30a1dcfcf15e3ca41223 (2026-10-08).
 Owner authority: owner runs target-host acceptance and authorizes implementation, commits, pushes and merges. Codex may not silently advance.
 Roadmap mapping: A00-G3.1 (layers, fullscreen, hide/recovery); A00-G3.2 (workspaces); A00-G3.3 (final host decision).
@@ -107,6 +107,8 @@ Stop for ChatGPT/owner architecture review if Openbox cannot safely provide basi
 
 ## 5. M03.2 — preliminary design boundary (not yet implementation authority)
 
+**Design approval update (2026-10-09):** [The full revised M03.2 read-only plan](DesktopRoomie-A00-M03.2-approved-implementation-plan.md) is approved as the detailed technical baseline. The preliminary constraints below remain valid context, but further ad-hoc replanning is not required before choosing staged implementation boundaries. No executable changes are authorized by design approval alone.
+
 **Approved client semantics (2026-10-09): recovery has independent, composable operations.** M03.2 owns visibility, an independently addressable control channel and **Bring Top on the body's existing workspace**. M03.3 alone owns explicit placement on the user's current workspace (**Bring Here**) and their eventual combination. Do not smuggle workspace movement into M03.2 under a generic Recover name.
 
 Introduce managed iconification through `WM_CHANGE_STATE` / `IconicState`, followed by `MapWindow` restoration and actual-state confirmation. Cancel any gesture/popup and release ownership before hiding; never set `_NET_WM_STATE_HIDDEN` manually or withdraw the managed body as the default. Consider `SKIP_TASKBAR` / `SKIP_PAGER` only after real target-host observation.
@@ -151,11 +153,11 @@ Reuse all accepted M02 contracts and record the combined implementation's exact 
 
 A01-W1.1 differs from M03 global layers: it seeks relative z-order among selected managed ordinary windows and must establish compatibility with Openbox WM policy, re-raising/focus, window/group lifecycle and input isolation before any guarantee. If infeasible, explicitly fall back to proven Above/Normal/Below. Do not prebuild for it in M03.
 
-## 9. Next action after accepted M03.1 and D00-M01
+## 9. Next action after M03.2 design approval
 
-M03.1 planning, implementation, source review, CI and owner L01–L13 acceptance are complete. The D00-M01 documentation/context checkpoint is also accepted; follow `AGENTS.md` and `docs/STATUS.md` for current state, preserving earlier acceptance evidence and technical contracts.
+M03.1 source, CI and real-host acceptance and D00-M01 documentation acceptance are complete. The [full M03.2 revised read-only design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md) was independently reviewed and approved on 2026-10-09, with no executable changes. Use it with `AGENTS.md`, `docs/STATUS.md`, and the accepted invariants rather than repeating the completed research or design work.
 
-The next work is a **read-only M03.2 design and code-seam audit**, using a Codex-capable model with High reasoning effort. Review this document's approved client clarification, accepted invariants, existing layer and pointer ownership, the host study and the actual code. Propose only managed hide/show, independently addressable same-instance control and Bring Top **without workspace movement**. Resolve request/reply confirmation, duplicate/stale owner races, lifecycle/focus/pointer safety and real-host tests. Present the plan for independent review; do not implement M03.2 or M03.3 until explicitly authorized.
+**Next action:** agree on small, evidence-gated **M03.2-only** implementation stages; issue a bounded Codex assignment for the first stage, explicitly choosing model/reasoning level and branch/push permission. Later stages require separate review and authorization. Do not start M03.3 workspace movement or combined recovery.
 
 ## 10. Primary references
 
