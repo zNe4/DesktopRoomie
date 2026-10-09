@@ -1,3 +1,4 @@
+mod control;
 mod geometry;
 mod interaction;
 mod layer;
@@ -26,10 +27,24 @@ use crate::x11::state::{LayerAtoms, LayerSupport, PropertyResult};
 use crate::x11::visual::find_alpha_visual;
 use crate::x11::window::{ConfigureReconciliation, ManagedProbeWindow};
 
-struct Config {
-    diagnose: bool,
-    duration_secs: Option<u64>,
-    delay_secs: Option<u64>,
+#[derive(Debug, PartialEq, Eq)]
+enum CliMode {
+    Help,
+    Diagnose,
+    Owner {
+        delay_secs: Option<u64>,
+        duration_secs: Option<u64>,
+    },
+    Control(control::Command),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct UsageError(String);
+
+impl UsageError {
+    fn exit_code(&self) -> control::ExitCode {
+        control::ExitCode::Usage
+    }
 }
 
 #[repr(C)]
@@ -46,57 +61,77 @@ extern "C" {
     fn poll(fds: *mut PollFd, nfds: usize, timeout: std::os::raw::c_int) -> std::os::raw::c_int;
 }
 
-fn parse_args() -> Result<Config, String> {
+// Arguments exclude argv[0]. Parsing has no process, output, or host side effects.
+fn parse_args<I, S>(args: I) -> Result<CliMode, UsageError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut args = args.into_iter();
+    let mut help = false;
     let mut diagnose = false;
     let mut duration_secs = None;
     let mut delay_secs = None;
-
-    let args: Vec<String> = env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-h" | "--help" => {
-                print_help();
-                process::exit(0);
-            }
-            "--diagnose" => {
-                diagnose = true;
-            }
-            "--delay" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("Missing value for --delay <seconds>".to_string());
+    let mut command = None;
+    while let Some(arg) = args.next() {
+        match arg.as_ref() {
+            "-h" | "--help" => help = true,
+            "--diagnose" => diagnose = true,
+            flag @ ("--delay" | "--duration") => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| UsageError(format!("Missing value for {flag} <seconds>")))?;
+                let value = value.as_ref().parse::<u64>().map_err(|_| {
+                    UsageError(format!("Invalid value for {flag}: '{}'", value.as_ref()))
+                })?;
+                if flag == "--delay" {
+                    delay_secs = Some(value);
+                } else {
+                    duration_secs = Some(value);
                 }
-                let val: u64 = args[i]
-                    .parse()
-                    .map_err(|_| format!("Invalid delay value: '{}'", args[i]))?;
-                delay_secs = Some(val);
             }
-            "--duration" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("Missing value for --duration <seconds>".to_string());
+            flag @ ("--hide" | "--show" | "--bring-top") => {
+                let next = match flag {
+                    "--hide" => control::Command::Hide,
+                    "--show" => control::Command::Show,
+                    _ => control::Command::BringTop,
+                };
+                if command.replace(next).is_some() {
+                    return Err(UsageError("Control commands are mutually exclusive".into()));
                 }
-                let val: u64 = args[i]
-                    .parse()
-                    .map_err(|_| format!("Invalid duration value: '{}'", args[i]))?;
-                duration_secs = Some(val);
             }
             unknown => {
-                return Err(format!(
-                    "Unknown option: '{}'. Use --help for usage.",
-                    unknown
-                ));
+                return Err(UsageError(format!(
+                    "Unknown option: '{unknown}'. Use --help for usage."
+                )))
             }
         }
-        i += 1;
     }
+    if let Some(command) = command {
+        if diagnose || delay_secs.is_some() || duration_secs.is_some() {
+            return Err(UsageError(
+                "Control commands cannot combine with --diagnose, --delay, or --duration".into(),
+            ));
+        }
+        if !help {
+            return Ok(CliMode::Control(command));
+        }
+    }
+    if help {
+        Ok(CliMode::Help)
+    } else if diagnose {
+        Ok(CliMode::Diagnose)
+    } else {
+        Ok(CliMode::Owner {
+            delay_secs,
+            duration_secs,
+        })
+    }
+}
 
-    Ok(Config {
-        diagnose,
-        duration_secs,
-        delay_secs,
-    })
+// Replace this isolated stub with caller transport in Stage C.
+fn unsupported_control(command: control::Command) -> (control::ExitCode, String) {
+    (control::ExitCode::OperationFailed, format!("{command}: not implemented in this stage (M03.2-A); control transport is scheduled for Stage C"))
 }
 
 fn print_help() {
@@ -113,15 +148,32 @@ fn print_help() {
     println!("  --diagnose              Run pure X11 environment diagnostics and exit");
     println!("  --delay <SECONDS>       Delay in seconds before mapping window (for typing test)");
     println!("  --duration <SECONDS>    Run for a specified duration in seconds, then exit");
+    println!("  --hide | --show | --bring-top  Control commands (not operational yet; exit 7)");
 }
 
 fn main() {
-    let config = match parse_args() {
-        Ok(c) => c,
+    let mode = match parse_args(env::args().skip(1)) {
+        Ok(mode) => mode,
         Err(err) => {
-            eprintln!("[ERROR] {}", err);
-            process::exit(1);
+            eprintln!("[ERROR] {}", err.0);
+            process::exit(err.exit_code() as i32);
         }
+    };
+    let (diagnose, delay_secs, duration_secs) = match mode {
+        CliMode::Help => {
+            print_help();
+            return;
+        }
+        CliMode::Control(command) => {
+            let (exit, diagnostic) = unsupported_control(command);
+            eprintln!("[ERROR] {diagnostic}");
+            process::exit(exit as i32);
+        }
+        CliMode::Diagnose => (true, None, None),
+        CliMode::Owner {
+            delay_secs,
+            duration_secs,
+        } => (false, delay_secs, duration_secs),
     };
 
     println!("=== DesktopRoomie A00-M03.1: Desktop Probe ===");
@@ -175,7 +227,7 @@ fn main() {
         .name_atom;
 
     // If pure diagnosis requested, print diagnostics and exit cleanly (M01.1 mode)
-    if config.diagnose {
+    if diagnose {
         run_diagnostics(&conn, screen, &layout);
         println!("\n[Result]");
         println!("  M01.1: X11 connection established; diagnostics completed.");
@@ -252,7 +304,7 @@ fn main() {
     }
 
     // Optional startup delay (for testing focus behavior during mapping)
-    if let Some(delay) = config.delay_secs {
+    if let Some(delay) = delay_secs {
         println!("\n[Startup Delay]");
         println!(
             "  Waiting {} second(s) before creating and mapping probe window...",
@@ -309,7 +361,7 @@ fn main() {
     }
 
     println!("\n[Running Probe]");
-    if let Some(sec) = config.duration_secs {
+    if let Some(sec) = duration_secs {
         println!("  Probe running for {} seconds (or until closed)...", sec);
     } else {
         println!(
@@ -321,7 +373,7 @@ fn main() {
     let result = run_probe(
         &conn,
         screen,
-        &config,
+        duration_secs,
         &atoms,
         selected_monitor,
         &mut probe_window,
@@ -1055,7 +1107,7 @@ fn interrupts_pending_movement(
 fn run_probe(
     conn: &x11rb::rust_connection::RustConnection,
     screen: &x11rb::protocol::xproto::Screen,
-    config: &Config,
+    duration_secs: Option<u64>,
     atoms: &x11::monitors::LayoutAtoms,
     selected_monitor: u32,
     window: &mut ManagedProbeWindow,
@@ -1070,8 +1122,7 @@ fn run_probe(
     let mut bounds = initial_bounds;
     let mut buffered_event = None;
     let start = Instant::now();
-    let duration_deadline = config
-        .duration_secs
+    let duration_deadline = duration_secs
         .map(|sec| {
             start
                 .checked_add(Duration::from_secs(sec))
@@ -4078,5 +4129,107 @@ mod layer_runtime_tests {
             assert!(runtime.menu.is_none());
             assert!(runtime.interaction.is_idle());
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use crate::control::{Command, ExitCode};
+
+    #[test]
+    fn default_and_owner_invocations_remain_valid() {
+        assert_eq!(
+            parse_args(Vec::<String>::new()),
+            Ok(CliMode::Owner {
+                delay_secs: None,
+                duration_secs: None
+            })
+        );
+        assert_eq!(
+            parse_args(["--delay", "2", "--duration", "30"]),
+            Ok(CliMode::Owner {
+                delay_secs: Some(2),
+                duration_secs: Some(30)
+            })
+        );
+        assert_eq!(
+            parse_args(["--duration", "0", "--delay", "18446744073709551615"]),
+            Ok(CliMode::Owner {
+                delay_secs: Some(u64::MAX),
+                duration_secs: Some(0)
+            })
+        );
+        assert_eq!(
+            parse_args(["--delay", "1", "--delay", "2"]),
+            Ok(CliMode::Owner {
+                delay_secs: Some(2),
+                duration_secs: None
+            })
+        );
+        assert_eq!(
+            parse_args(["--duration", "5"]),
+            Ok(CliMode::Owner {
+                delay_secs: None,
+                duration_secs: Some(5)
+            })
+        );
+    }
+    #[test]
+    fn help_and_diagnose_remain_separate_modes() {
+        for flag in ["--help", "-h"] {
+            assert_eq!(parse_args([flag]), Ok(CliMode::Help));
+        }
+        assert_eq!(parse_args(["--diagnose"]), Ok(CliMode::Diagnose));
+        assert_eq!(
+            parse_args(["--delay", "2", "--diagnose", "--duration", "5"]),
+            Ok(CliMode::Diagnose)
+        );
+        assert_eq!(parse_args(["--diagnose", "--help"]), Ok(CliMode::Help));
+    }
+    #[test]
+    fn control_commands_parse_but_runtime_stub_fails_without_host_work() {
+        for (flag, command, label) in [
+            ("--hide", Command::Hide, "hide:"),
+            ("--show", Command::Show, "show:"),
+            ("--bring-top", Command::BringTop, "bring-top:"),
+        ] {
+            assert_eq!(parse_args([flag]), Ok(CliMode::Control(command)));
+            let (exit, diagnostic) = unsupported_control(command);
+            assert_eq!(exit, ExitCode::OperationFailed);
+            assert_eq!(exit as i32, 7);
+            assert!(diagnostic.starts_with(label));
+            assert!(diagnostic.contains("not implemented in this stage"));
+        }
+    }
+    #[test]
+    fn control_conflicts_in_either_order_are_usage_errors() {
+        for a in ["--hide", "--show", "--bring-top"] {
+            for b in ["--hide", "--show", "--bring-top", "--diagnose"] {
+                for args in [[a, b], [b, a]] {
+                    assert_eq!(parse_args(args).unwrap_err().exit_code(), ExitCode::Usage);
+                }
+            }
+            for option in ["--delay", "--duration"] {
+                for args in [[a, option, "0"], [option, "0", a]] {
+                    assert_eq!(parse_args(args).unwrap_err().exit_code() as u32, 2);
+                }
+            }
+        }
+    }
+    #[test]
+    fn invalid_missing_overflowing_and_unknown_arguments_are_meaningful() {
+        for flag in ["--delay", "--duration"] {
+            assert!(parse_args([flag]).unwrap_err().0.contains("Missing value"));
+            for value in ["-1", "1.5", "abc", "18446744073709551616", "--diagnose"] {
+                let error = parse_args([flag, value]).unwrap_err();
+                assert!(error.0.contains(flag));
+                assert!(error.0.contains(value));
+                assert_eq!(error.exit_code(), ExitCode::Usage);
+            }
+        }
+        let error = parse_args(["--unknown"]).unwrap_err();
+        assert!(error.0.contains("Unknown option: '--unknown'"));
+        assert_eq!(error.exit_code() as i32, 2);
     }
 }
