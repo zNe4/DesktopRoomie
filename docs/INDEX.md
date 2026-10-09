@@ -28,7 +28,8 @@ DesktopRoomie is the reusable software; Project Vanilla is its private character
 - [A00-M01 desktop probe](DesktopRoomie-A00-M01-desktop-probe.md): accepted foundation's original contract.
 - [A00-M02 dragging and release](DesktopRoomie-A00-M02-dragging-and-release.md): accepted foundation's original detailed contract.
 - [A00-M03 placement, recovery and host selection](DesktopRoomie-A00-M03-placement-recovery-host-selection.md): accepted M03.1 contract and approved recovery separation; M03.2 implementation remains unstarted.
-- [A00-M03.2 approved implementation design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md): full independently reviewed Codex read-only proposal, visibility/IPC/input protocols, tests, and host gates. **Design approved, staged coding assignments not yet authorized**.
+- [A00-M03.2 approved implementation design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md): authoritative independently reviewed visibility/IPC/input protocols, tests, host gates, and stop conditions. **Design approved; no coding assignment automatically authorized**.
+- [A00-M03.2 approved staged implementation roadmap](DesktopRoomie-A00-M03.2-staged-implementation-roadmap.md): owner-approved A–H checkpoint boundaries, dependencies, test/host gates, publication rules, and Codex effort guidance. **Stage A has not been authorized or implemented**.
 - [Openbox host integration](host/OPENBOX.md): optional user-managed shortcut/launcher/autostart guidance, distinct from correctness-critical executable behavior. Future CLI samples are not yet working commands.
 
 ## Acceptance and historical explanation

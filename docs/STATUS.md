@@ -1,6 +1,6 @@
 # Current checkpoint
 
-Updated 2026-10-09 after independent approval of the [A00-M03.2 read-only design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md). This is a context checkpoint, not permission to implement a next mission.
+Updated 2026-10-09 after approval of the [A00-M03.2 design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md) and its [eight-stage implementation roadmap](DesktopRoomie-A00-M03.2-staged-implementation-roadmap.md). This is a context checkpoint, not permission to implement a next mission.
 
 ## Accepted foundation
 
@@ -21,7 +21,7 @@ Host focus/click-through/stacking/fullscreen observations come from the owner. A
 ## Active work and next gate
 
 - **D00-M01 ACCEPTED:** documentation/context hygiene completed. The independent review of docs-only implementation `e3266aeee5a4757f465b90376bcf97838e225888` passed scope, document authority, source ownership, invariants, link/reference checks, cold-start recovery, and matching GitHub CI [run 37807374691](https://github.com/zNe4/DesktopRoomie/actions/runs/37807374691). The owner approved acceptance on 2026-10-08. The final documentation-status commit is separate from the reviewed executable revision.
-- **A00-M03.2 DESIGN APPROVED (2026-10-09):** the complete [revised Codex read-only plan](DesktopRoomie-A00-M03.2-approved-implementation-plan.md) passed independent architecture review. It specifies managed Hide/Show, same-instance X11 control, and **Bring Top** on the existing workspace; no M03.2 implementation has begun or been accepted. The next gate is to **agree on small, reviewable implementation stages and authorize each separately**. The client-approved separation reserves **Bring Here** and composed **Recover** for M03.3. Optional Openbox launch/keybindings remain user-managed and unimplemented.
+- **A00-M03.2 DESIGN + A–H STAGED ROADMAP APPROVED (2026-10-09):** the [revised Codex design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md) passed independent architecture review; the owner then approved the [eight bounded implementation stages](DesktopRoomie-A00-M03.2-staged-implementation-roadmap.md) with separately reviewed/tested/accepted checkpoints. M03.2 specifies managed Hide/Show, same-instance X11 control, and **Bring Top** on the existing workspace. **No M03.2 executable work has begun and M03.2-A is not yet authorized.** The next gate is a separate explicit, SHA-pinned stage-A Codex assignment. **Bring Here** and composed **Recover** remain reserved for M03.3. Optional Openbox launch/keybindings remain user-managed and unimplemented.
 - **Deferred:** M03.3 same-instance Bring Here / workspace placement plus composed Recover; M03.4 integrated A00 acceptance/host decision; A01 relative-window stacking and companion presentation/behavior. The [completed host study](research/studies/R00-M01-nekoai-linux-host-a00-g3.md) informs A00-G3; additional [R00 studies](research/ProjectVanilla-R00-external-projects-research-roadmap.md) are just-in-time design dependencies, not automatic work or blockers for unrelated missions.
 
 ## Meaningful limitations
