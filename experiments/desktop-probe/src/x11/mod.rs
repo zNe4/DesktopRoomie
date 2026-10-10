@@ -6,5 +6,6 @@ pub mod render;
 pub mod resource;
 pub mod shape;
 pub mod state;
+pub mod visibility;
 pub mod visual;
 pub mod window;
