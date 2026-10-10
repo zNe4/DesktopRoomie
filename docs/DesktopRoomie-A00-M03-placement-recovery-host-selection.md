@@ -1,6 +1,6 @@
 # DesktopRoomie — A00-M03: Placement, Recovery and Host Selection
 
-Status: **M03.1 accepted** on the target Openbox/X11/Picom host. The client-approved recovery separation was clarified 2026-10-09. The full [M03.2 read-only implementation design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md) subsequently passed independent review; staged implementation boundaries and authorization are still pending. M03.3 remains design-only.
+Status: **M03.1 accepted** on the target Openbox/X11/Picom host. The client-approved recovery separation was clarified 2026-10-09. The full [M03.2 read-only implementation design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md) subsequently passed independent review; the approved [A–H staged roadmap](DesktopRoomie-A00-M03.2-staged-implementation-roadmap.md) now has accepted A–D checkpoints. See [STATUS](STATUS.md) for exact executable/CI/owner evidence. Stage E is next and has not started; remaining stages require separate authorization. M03.3 remains design-only.
 Prepared against main revision 614dfb22b944e5f9ec0d30a1dcfcf15e3ca41223 (2026-10-08).
 Owner authority: owner runs target-host acceptance and authorizes implementation, commits, pushes and merges. Codex may not silently advance.
 Roadmap mapping: A00-G3.1 (layers, fullscreen, hide/recovery); A00-G3.2 (workspaces); A00-G3.3 (final host decision).
@@ -138,7 +138,7 @@ The read-only plan must also resolve iconification/restore ordering relative to 
 
 **Approved policy (2026-10-09): prefer reliable host facilities over reimplementing them.** DesktopRoomie owns correctness-critical lifecycle/state, second-instance request handling and truthful result reporting; the desktop environment may own optional keyboard shortcuts, launchers, menus and autostart. Do not implement global key capture, a custom shortcut daemon, a tray manager or silent edits to a user's dotfiles just to make A00 recovery convenient. Command-line control must work independently of any optional shortcut setup.
 
-The target-specific guide is [Openbox host integration](host/OPENBOX.md). It distinguishes required configuration from optional conveniences and describes user-controlled edits under `~/.config/openbox/`. No user configuration is changed by this documentation decision; all proposed shortcut commands are future candidates until implemented and accepted. Other hosts can have separate integration guides later.
+The target-specific guide is [Openbox host integration](host/OPENBOX.md). It distinguishes required configuration from optional conveniences and describes user-controlled edits under `~/.config/openbox/`. No user configuration is changed by this documentation decision; Hide/Show/Bring Top now parse and use independent transport, but their Ready-owner operations still return Unsupported (exit 7). Optional shortcuts remain user-managed future recovery conveniences until the actual operations are implemented and accepted. Other hosts can have separate integration guides later.
 
 ## 7. M03.4 — integrated evidence and exit gates
 
@@ -157,7 +157,7 @@ A01-W1.1 differs from M03 global layers: it seeks relative z-order among selecte
 
 M03.1 source, CI and real-host acceptance and D00-M01 documentation acceptance are complete. The [full M03.2 revised read-only design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md) was independently reviewed and approved on 2026-10-09, with no executable changes. Use it with `AGENTS.md`, `docs/STATUS.md`, and the accepted invariants rather than repeating the completed research or design work.
 
-**Next action:** agree on small, evidence-gated **M03.2-only** implementation stages; issue a bounded Codex assignment for the first stage, explicitly choosing model/reasoning level and branch/push permission. Later stages require separate review and authorization. Do not start M03.3 workspace movement or combined recovery.
+**Current execution checkpoint (2026-10-10):** the approved A–H roadmap has accepted stages A–D; [STATUS](STATUS.md) records the exact evidence and Stage D correction. **Next action:** issue a separately bounded Stage E (Show first) assignment, explicitly choosing model/reasoning level and branch/push permission. E has not started. Later stages require separate review and authorization. Do not start M03.3 workspace movement or combined recovery.
 
 ## 10. Primary references
 

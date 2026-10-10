@@ -27,10 +27,10 @@ DesktopRoomie is the reusable software; Project Vanilla is its private character
 - [D00-M01 documentation/context hygiene](DesktopRoomie-D00-M01-documentation-context-hygiene.md): **accepted** docs-only context layer, with independent review and owner approval recorded in the mission document.
 - [A00-M01 desktop probe](DesktopRoomie-A00-M01-desktop-probe.md): accepted foundation's original contract.
 - [A00-M02 dragging and release](DesktopRoomie-A00-M02-dragging-and-release.md): accepted foundation's original detailed contract.
-- [A00-M03 placement, recovery and host selection](DesktopRoomie-A00-M03-placement-recovery-host-selection.md): accepted M03.1 contract and approved recovery separation; M03.2 implementation remains unstarted.
-- [A00-M03.2 approved implementation design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md): authoritative independently reviewed visibility/IPC/input protocols, tests, host gates, and stop conditions. **Design approved; no coding assignment automatically authorized**.
-- [A00-M03.2 approved staged implementation roadmap](DesktopRoomie-A00-M03.2-staged-implementation-roadmap.md): owner-approved A–H checkpoint boundaries, dependencies, test/host gates, publication rules, and Codex effort guidance. **Stage A has not been authorized or implemented**.
-- [Openbox host integration](host/OPENBOX.md): optional user-managed shortcut/launcher/autostart guidance, distinct from correctness-critical executable behavior. Future CLI samples are not yet working commands.
+- [A00-M03 placement, recovery and host selection](DesktopRoomie-A00-M03-placement-recovery-host-selection.md): accepted M03.1 contract and approved recovery separation; M03.2 stages A–D are accepted; [STATUS](STATUS.md) records their executable/CI/owner evidence and the next separate Stage E assignment.
+- [A00-M03.2 approved implementation design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md): authoritative independently reviewed visibility/IPC/input protocols, tests, host gates, and stop conditions. **Approved technical design remains authoritative; A–D accepted, E not started. No coding assignment automatically authorized**.
+- [A00-M03.2 approved staged implementation roadmap](DesktopRoomie-A00-M03.2-staged-implementation-roadmap.md): owner-approved A–H checkpoint boundaries, dependencies, test/host gates, publication rules, and Codex effort guidance. **A–D accepted; E is the next separate assignment.** The current execution checkpoint is [STATUS](STATUS.md); no remaining stage is automatically authorized.
+- [Openbox host integration](host/OPENBOX.md): optional user-managed shortcut/launcher/autostart guidance, distinct from correctness-critical executable behavior. Independent CLI transport exists; Hide/Show/Bring Top still return Unsupported on a Ready owner, so samples are not working recovery shortcuts.
 
 ## Acceptance and historical explanation
 
