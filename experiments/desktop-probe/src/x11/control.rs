@@ -512,7 +512,7 @@ impl ControlWindow {
                 != self.descriptor.control_xid
         {
             self.owns_selection = false;
-            return Err("Control selection ownership lost during Show".into());
+            return Err("Control selection ownership lost during visibility operation".into());
         }
         Ok(())
     }
@@ -964,10 +964,14 @@ fn route_request_with(
         Admission::Reply(status, reason, stage) => {
             (status, control::preflight_detail(reason, stage))
         }
-        Admission::Admitted if request.command == Command::Show => {
+        Admission::Admitted if matches!(request.command, Command::Show | Command::Hide) => {
             let operation = active.as_mut().unwrap();
-            operation.stage = Stage::Show;
-            operation.detail = control::preflight_detail(Reason::None, Stage::Show);
+            operation.stage = if request.command == Command::Hide {
+                Stage::Hide
+            } else {
+                Stage::Show
+            };
+            operation.detail = control::preflight_detail(Reason::None, operation.stage);
             return Ok(true);
         }
         Admission::Admitted => (Status::Failed, active.as_ref().unwrap().detail),
@@ -1009,6 +1013,11 @@ impl CallerOutcome {
             Self::NoInstance => "no running instance".into(),
             Self::Protocol => "incompatible, stale, or malformed owner endpoint".into(),
             Self::Lifecycle(lifecycle) => format!("owner is {lifecycle:?}"),
+            Self::Terminal(response)
+                if command == Command::Hide && response.status == Status::Success =>
+            {
+                "confirmed minimized; existing instance remains running".into()
+            }
             Self::Terminal(response)
                 if command == Command::Show && response.status == Status::Success =>
             {
@@ -2538,32 +2547,201 @@ mod transport_tests {
         }
     }
     #[test]
-    fn hide_and_bring_top_have_one_truthful_unsupported_reply_and_clear_active() {
-        for command in [Command::Hide, Command::BringTop] {
+    fn bring_top_has_one_truthful_unsupported_reply_and_clears_active() {
+        let command = Command::BringTop;
+        let mut host = Fake::new();
+        host.evidence
+            .push_back(Some(evidence(&marker(command).encode().unwrap())));
+        let event = request_event(atoms(), CONTROL, request(command)).unwrap();
+        let mut active = None;
+        host.route(&mut active, Lifecycle::Ready, false, &event)
+            .unwrap();
+        assert!(active.is_none());
+        assert_eq!(host.sent.len(), 1);
+        let reply = host.sent[0];
+        assert_eq!(
+            (reply.window, reply.type_, reply.format),
+            (REPLY_WINDOW, atoms().reply, 32)
+        );
+        assert_eq!(
+            TerminalResponse::decode(&reply.data.as_data32()).unwrap(),
+            response()
+        );
+        assert_eq!(
+            reply.data.as_data32(),
+            [(1 << 16) | 1, ID as u32, (ID >> 32) as u32, CONTROL, 11]
+        );
+        assert_eq!(host.log, ["owner", "evidence", "owner", "send"]);
+    }
+
+    #[test]
+    fn hide_is_deferred_with_one_terminal_duplicate_suppression_and_competitor_busy() {
+        let mut host = Fake::new();
+        let mut active = None;
+        let req = request(Command::Hide);
+        for _ in 0..2 {
+            host.evidence
+                .push_back(Some(evidence(&marker(Command::Hide).encode().unwrap())));
+            host.route(
+                &mut active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, req).unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(host.sent.is_empty());
+        let original = active.unwrap();
+        assert_eq!(original.request, req);
+        assert_eq!(original.stage, Stage::Hide);
+        assert_eq!(original.deadline, host.now + Duration::from_millis(1000));
+        host.route(
+            &mut active,
+            Lifecycle::Ready,
+            false,
+            &request_event(atoms(), CONTROL, request(Command::Show)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(active, Some(original));
+        assert_eq!(
+            TerminalResponse::decode(&host.sent[0].data.as_data32())
+                .unwrap()
+                .status,
+            Status::Busy
+        );
+        finish_active(&mut host, atoms(), &mut active, response()).unwrap();
+        assert!(active.is_none());
+        assert_eq!(host.sent.len(), 2);
+        assert!(finish_active(&mut host, atoms(), &mut active, response()).is_err());
+        assert_eq!(host.sent.len(), 2);
+    }
+    #[test]
+    fn hide_during_starting_closing_or_local_layer_operation_has_no_admission() {
+        for (lifecycle, busy, status) in [
+            (Lifecycle::Starting, false, Status::Starting),
+            (Lifecycle::Closing, false, Status::Closing),
+            (Lifecycle::Ready, true, Status::Busy),
+        ] {
             let mut host = Fake::new();
             host.evidence
-                .push_back(Some(evidence(&marker(command).encode().unwrap())));
-            let event = request_event(atoms(), CONTROL, request(command)).unwrap();
+                .push_back(Some(evidence(&marker(Command::Hide).encode().unwrap())));
             let mut active = None;
-            host.route(&mut active, Lifecycle::Ready, false, &event)
-                .unwrap();
+            host.route(
+                &mut active,
+                lifecycle,
+                busy,
+                &request_event(atoms(), CONTROL, request(Command::Hide)).unwrap(),
+            )
+            .unwrap();
             assert!(active.is_none());
             assert_eq!(host.sent.len(), 1);
-            let reply = host.sent[0];
-            assert_eq!(
-                (reply.window, reply.type_, reply.format),
-                (REPLY_WINDOW, atoms().reply, 32)
-            );
-            assert_eq!(
-                TerminalResponse::decode(&reply.data.as_data32()).unwrap(),
-                response()
-            );
-            assert_eq!(
-                reply.data.as_data32(),
-                [(1 << 16) | 1, ID as u32, (ID >> 32) as u32, CONTROL, 11]
-            );
-            assert_eq!(host.log, ["owner", "evidence", "owner", "send"]);
+            let reply = TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap();
+            assert_eq!(reply.status, status);
+            assert_eq!(reply.status.exit_code(), ExitCode::Busy);
+            assert!(!reply.detail.progress.host_mutation_dispatched);
         }
+    }
+    #[test]
+    fn hide_shutdown_at_each_phase_preserves_progress_and_ready_owner_until_closing() {
+        for phase in [
+            control::HidePhase::Fence,
+            control::HidePhase::Fenced,
+            control::HidePhase::IconifyAttempted,
+            control::HidePhase::IconifyRequested,
+        ] {
+            let mut host = Fake::new();
+            let mut endpoint = ControlWindow::candidate(0, CONTROL, 11, 50, 51, 52);
+            endpoint.transport = atoms();
+            endpoint.descriptor = owner();
+            host.evidence
+                .push_back(Some(evidence(&marker(Command::Hide).encode().unwrap())));
+            host.route(
+                &mut endpoint.active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, request(Command::Hide)).unwrap(),
+            )
+            .unwrap();
+            let active = endpoint.active_mut().unwrap();
+            active.hide.phase = phase;
+            active.detail.progress.host_mutation_dispatched = matches!(
+                phase,
+                control::HidePhase::IconifyAttempted | control::HidePhase::IconifyRequested
+            );
+            let progress = active.detail.progress;
+            assert_eq!(endpoint.descriptor.lifecycle, Lifecycle::Ready);
+            assert_eq!(endpoint.descriptor.body_xid, owner().body_xid);
+            endpoint.finish_remote_with(&mut host).unwrap();
+            endpoint.finish_remote_with(&mut host).unwrap();
+            assert!(endpoint.active().is_none());
+            assert_eq!(host.sent.len(), 1);
+            let reply = TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap();
+            assert_eq!(reply.status, Status::Closing);
+            assert_eq!(reply.detail.progress, progress);
+            assert_eq!(reply.request_id, ID);
+        }
+    }
+    #[test]
+    fn hide_owner_loss_during_validation_is_fatal_without_admission_or_reply() {
+        let mut host = Fake::new();
+        host.owners = VecDeque::from([CONTROL, 999]);
+        host.evidence
+            .push_back(Some(evidence(&marker(Command::Hide).encode().unwrap())));
+        let mut active = None;
+        assert!(host
+            .route(
+                &mut active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, request(Command::Hide)).unwrap()
+            )
+            .is_err());
+        assert!(active.is_none());
+        assert!(host.sent.is_empty());
+    }
+    #[test]
+    fn hide_noop_terminal_leaves_same_ready_endpoint_available_for_show() {
+        let mut host = Fake::new();
+        let mut endpoint = ControlWindow::candidate(0, CONTROL, 11, 50, 51, 52);
+        endpoint.transport = atoms();
+        endpoint.descriptor = owner();
+        let descriptor = endpoint.descriptor;
+        host.evidence
+            .push_back(Some(evidence(&marker(Command::Hide).encode().unwrap())));
+        host.route(
+            &mut endpoint.active,
+            Lifecycle::Ready,
+            false,
+            &request_event(atoms(), CONTROL, request(Command::Hide)).unwrap(),
+        )
+        .unwrap();
+        let mut terminal = response();
+        terminal.status = Status::Success;
+        terminal.detail = control::preflight_detail(Reason::None, Stage::Hide);
+        terminal.detail.visibility = control::Visibility::Minimized;
+        terminal.detail.workspace = control::Workspace::Current;
+        assert_eq!(
+            CallerOutcome::Terminal(terminal).diagnostic(Command::Hide),
+            "hide: confirmed minimized; existing instance remains running"
+        );
+        finish_active(&mut host, atoms(), &mut endpoint.active, terminal).unwrap();
+        assert_eq!(endpoint.descriptor, descriptor);
+        host.route(
+            &mut endpoint.active,
+            Lifecycle::Ready,
+            false,
+            &request_event(atoms(), CONTROL, request(Command::Show)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(endpoint.active().unwrap().request.command, Command::Show);
+        assert_eq!(host.sent.len(), 1);
+        assert!(
+            !TerminalResponse::decode(&host.sent[0].data.as_data32())
+                .unwrap()
+                .detail
+                .progress
+                .host_mutation_dispatched
+        );
     }
 
     #[test]

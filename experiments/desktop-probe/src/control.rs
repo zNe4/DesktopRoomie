@@ -358,6 +358,27 @@ pub struct ActiveOperation {
     pub deadline: std::time::Instant,
     pub detail: Detail,
     pub show: ShowProgress,
+    pub hide: HideProgress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HidePhase {
+    #[default]
+    Fence,
+    Fenced,
+    /// Consumed before dispatch, including a failed checked send. Never retry.
+    IconifyAttempted,
+    IconifyRequested,
+}
+
+/// Only the progress matching `request.command` is serviced. Both commands share
+/// the single admission identity, deadline and terminal-response owner above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HideProgress {
+    pub phase: HidePhase,
+    pub baseline: Option<VisibilityBaseline>,
+    pub observe: bool,
+    pub layout_interrupted: bool,
 }
 
 /// Owner-only progression, kept in the transport's single authoritative record.
@@ -376,7 +397,7 @@ pub enum ShowPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ShowBaseline {
+pub struct VisibilityBaseline {
     pub desktop: u32,
     pub current_desktop: u32,
     pub layer: LayerObservation,
@@ -385,7 +406,7 @@ pub struct ShowBaseline {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ShowProgress {
     pub phase: ShowPhase,
-    pub baseline: Option<ShowBaseline>,
+    pub baseline: Option<VisibilityBaseline>,
     pub area: Option<crate::geometry::Rect>,
     pub correction: Option<(crate::geometry::Point, std::time::Instant)>,
     pub correction_sent: bool,
@@ -449,6 +470,10 @@ pub fn admit(
         show: ShowProgress {
             observe: true,
             ..ShowProgress::default()
+        },
+        hide: HideProgress {
+            observe: true,
+            ..HideProgress::default()
         },
     });
     Admission::Admitted

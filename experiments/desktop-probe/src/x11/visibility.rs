@@ -321,6 +321,46 @@ fn checked_request_marked(
 }
 
 impl VisibilityAtoms {
+    pub fn request_iconify_before(
+        &self,
+        conn: &impl Connection,
+        root: Window,
+        body: Window,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+    ) -> Result<bool, HostError> {
+        self.iconify_before_with(
+            root,
+            body,
+            deadline,
+            dispatched,
+            std::time::Instant::now,
+            |request, sent| checked_request_marked(conn, request, sent),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn iconify_before_with(
+        &self,
+        root: Window,
+        body: Window,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+        now: impl FnOnce() -> std::time::Instant,
+        checked: impl FnOnce(VisibilityRequest, &mut bool) -> Result<(), HostError>,
+    ) -> Result<bool, HostError> {
+        if now() >= deadline {
+            return Ok(false);
+        }
+        // Reuse the Stage-D envelope. Mark actual transport dispatch before its
+        // check; acknowledgement alone establishes no visibility confirmation.
+        let mut sent = false;
+        let result = self.iconify_with(root, body, |request| checked(request, &mut sent));
+        *dispatched |= sent;
+        result?;
+        Ok(sent)
+    }
+
     /// One shared deadline, checked separately before both native mutations.
     /// A checked acknowledgement is not WM confirmation. Mark dispatch before
     /// checking, since a failed check cannot establish that the request had no effect.
@@ -408,6 +448,59 @@ impl VisibilityAtoms {
 mod tests {
     use super::*;
     use crate::control::{Reason, Visibility};
+
+    #[test]
+    fn iconification_deadline_and_dispatch_errors_keep_exact_envelope_and_no_retry() {
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(1000);
+        for case in 0..4 {
+            let mut sent = false;
+            let mut calls = 0;
+            let result = atoms().iconify_before_with(
+                100,
+                200,
+                deadline,
+                &mut sent,
+                || if case == 0 { deadline } else { start },
+                |request, dispatched| {
+                    calls += 1;
+                    let VisibilityRequest::Iconify {
+                        destination,
+                        propagate,
+                        mask,
+                        event,
+                    } = request
+                    else {
+                        panic!("unrelated mutation")
+                    };
+                    assert_eq!(destination, 100);
+                    assert!(!propagate);
+                    assert_eq!(
+                        mask,
+                        EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT
+                    );
+                    assert_eq!((event.window, event.type_, event.format), (200, 11, 32));
+                    assert_eq!(event.data.as_data32(), [3, 0, 0, 0, 0]);
+                    if case == 1 {
+                        return Err("unsent".into());
+                    }
+                    *dispatched = true;
+                    if case == 2 {
+                        return Err("checked error".into());
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(calls, usize::from(case != 0));
+            assert_eq!(sent, case >= 2);
+            assert_eq!(result.is_err(), case == 1 || case == 2);
+            if case == 0 {
+                assert!(!result.unwrap());
+            } else if case == 3 {
+                assert!(result.unwrap());
+            }
+        }
+    }
 
     #[test]
     fn fixed_restore_deadline_is_checked_before_each_native_request() {
