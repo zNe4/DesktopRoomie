@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::render::ConnectionExt as RenderExt;
 use x11rb::protocol::shape::ConnectionExt as ShapeExt;
-use x11rb::protocol::xproto::{GrabStatus, VisualClass};
+use x11rb::protocol::xproto::{GrabStatus, MapNotifyEvent, VisualClass};
 use x11rb::protocol::Event;
 
 use crate::geometry::{calculate_centered_origin, compute_valid_origin_bounds, Point, Size};
@@ -434,12 +434,10 @@ fn start_body(
     }
 
     // Save each successful resource immediately so all later failures reach ordered cleanup.
-    *body_resource = Some(ManagedProbeWindow::create(
-        conn,
-        screen.root,
-        alpha_vis.visual_id,
-        requested_origin,
-    )?);
+    let (body, map_sequence) =
+        ManagedProbeWindow::create(conn, screen.root, alpha_vis.visual_id, requested_origin)?;
+    *body_resource = Some(body);
+    runtime.arm_map_input_sync(map_sequence);
     let probe_window = body_resource.as_mut().unwrap();
     owner.publish_body(conn, probe_window.window)?;
 
@@ -657,6 +655,7 @@ struct ProbeRuntime {
     menu_generation: u64,
     layers: LayerController,
     input_fence: InputFence,
+    pending_map_input: Option<u64>,
 }
 impl ProbeRuntime {
     fn new() -> Self {
@@ -673,7 +672,41 @@ impl ProbeRuntime {
             menu_generation: 0,
             layers: LayerController::default(),
             input_fence: InputFence::default(),
+            pending_map_input: None,
         }
+    }
+
+    /// One allowance per deliberate mapping request, never rearmed by notifications.
+    /// A future restoration can arm a new full sequence, but must still use the
+    /// readiness-checked visibility restore path while input is fenced.
+    fn arm_map_input_sync(&mut self, map_sequence: u64) {
+        self.pending_map_input = Some(map_sequence);
+    }
+
+    fn synchronize_map_input_with(
+        &mut self,
+        event: &MapNotifyEvent,
+        body: u32,
+        sequence: u64,
+        restore: impl FnOnce() -> Result<u64, HostError>,
+    ) -> Result<(), HostError> {
+        if self.input_fence.blocked
+            || event.window != body
+            || event.event != body
+            || event.response_type & 0x80 != 0
+            || event.override_redirect
+            || !self
+                .pending_map_input
+                .is_some_and(|after| sequence >= after)
+        {
+            return Ok(());
+        }
+        // Consume before sending: a failed check is fatal, not permission to retry
+        // on duplicate notifications. Only success establishes the freshness gate.
+        self.pending_map_input = None;
+        let sequence = restore()?;
+        self.input_fence.enabled_after = Some(sequence);
+        Ok(())
     }
 
     /// Inert Stage D entry point. Future Show/Bring Top must reject pending local
@@ -1068,6 +1101,147 @@ impl ProbeRuntime {
             BodyAvailability::Validating
         };
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod map_input_tests {
+    use super::*;
+
+    const BODY: u32 = 100;
+    const MAP: u64 = 2 * 65536 + 100;
+    const SHAPE: u64 = MAP + 20;
+
+    fn mapped() -> MapNotifyEvent {
+        MapNotifyEvent {
+            response_type: x11rb::protocol::xproto::MAP_NOTIFY_EVENT,
+            sequence: MAP as u16,
+            event: BODY,
+            window: BODY,
+            override_redirect: false,
+        }
+    }
+
+    #[test]
+    fn one_map_synchronizes_once_and_retains_full_shape_sequence_without_readiness() {
+        let mut runtime = ProbeRuntime::new();
+        runtime.arm_map_input_sync(MAP);
+        runtime
+            .synchronize_map_input_with(&mapped(), BODY, MAP, || Ok(SHAPE))
+            .unwrap();
+        assert_eq!(runtime.input_fence.enabled_after, Some(SHAPE));
+        assert_eq!(runtime.body, BodyAvailability::AwaitingMap);
+        assert!(!runtime.accepts_input());
+        for sequence in MAP..MAP + 1000 {
+            runtime
+                .synchronize_map_input_with(&mapped(), BODY, sequence, || panic!("duplicate"))
+                .unwrap();
+        }
+        assert_eq!(runtime.input_fence.enabled_after, Some(SHAPE));
+    }
+
+    #[test]
+    fn unrelated_synthetic_and_stale_maps_do_not_consume_sync_allowance() {
+        let mut unrelated = mapped();
+        unrelated.window += 1;
+        let mut parent = mapped();
+        parent.event += 1;
+        let mut synthetic = mapped();
+        synthetic.response_type |= 0x80;
+        let mut unmanaged = mapped();
+        unmanaged.override_redirect = true;
+        for (event, sequence) in [
+            (unrelated, MAP),
+            (parent, MAP),
+            (synthetic, MAP),
+            (unmanaged, MAP),
+            (mapped(), MAP - 1),
+            (mapped(), MAP - 65536),
+            (mapped(), MAP - 2 * 65536),
+        ] {
+            let mut runtime = ProbeRuntime::new();
+            runtime.arm_map_input_sync(MAP);
+            runtime
+                .synchronize_map_input_with(&event, BODY, sequence, || panic!("invalid map"))
+                .unwrap();
+            assert_eq!(runtime.pending_map_input, Some(MAP));
+            assert_eq!(runtime.input_fence.enabled_after, None);
+            runtime
+                .synchronize_map_input_with(&mapped(), BODY, MAP, || Ok(SHAPE))
+                .unwrap();
+            assert_eq!(runtime.input_fence.enabled_after, Some(SHAPE));
+        }
+    }
+
+    #[test]
+    fn failed_map_shape_check_is_fatal_unsynchronized_and_not_retried() {
+        let mut runtime = ProbeRuntime::new();
+        runtime.arm_map_input_sync(MAP);
+        let error = runtime
+            .synchronize_map_input_with(&mapped(), BODY, MAP, || Err("SHAPE check failed".into()))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "SHAPE check failed");
+        assert_eq!(runtime.input_fence.enabled_after, None);
+        assert_eq!(runtime.pending_map_input, None);
+        assert!(!runtime.accepts_input());
+        runtime
+            .synchronize_map_input_with(&mapped(), BODY, MAP + 1, || panic!("blind retry"))
+            .unwrap();
+    }
+
+    #[test]
+    fn future_remap_needs_explicit_new_request_boundary_and_rejects_old_maps() {
+        let mut runtime = ProbeRuntime::new();
+        runtime
+            .synchronize_map_input_with(&mapped(), BODY, MAP, || panic!("not armed"))
+            .unwrap();
+        runtime.arm_map_input_sync(MAP);
+        runtime
+            .synchronize_map_input_with(&mapped(), BODY, MAP, || Ok(SHAPE))
+            .unwrap();
+        runtime.unavailable(false);
+        runtime
+            .synchronize_map_input_with(&mapped(), BODY, SHAPE, || panic!("not rearmed"))
+            .unwrap();
+        let remap = MAP + 65536;
+        runtime.arm_map_input_sync(remap);
+        runtime
+            .synchronize_map_input_with(&mapped(), BODY, MAP, || panic!("previous mapping"))
+            .unwrap();
+        assert_eq!(runtime.pending_map_input, Some(remap));
+        assert_eq!(runtime.input_fence.enabled_after, Some(SHAPE));
+        runtime
+            .synchronize_map_input_with(&mapped(), BODY, remap, || Ok(remap + 20))
+            .unwrap();
+        assert_eq!(runtime.input_fence.enabled_after, Some(remap + 20));
+        assert_eq!(runtime.body, BodyAvailability::Unavailable);
+        runtime
+            .synchronize_map_input_with(&mapped(), BODY, remap + 21, || panic!("duplicate remap"))
+            .unwrap();
+    }
+
+    #[test]
+    fn post_map_sync_cannot_bypass_visibility_fence_or_placement_safety() {
+        for availability in [
+            BodyAvailability::AwaitingMap,
+            BodyAvailability::Validating,
+            BodyAvailability::Ready,
+        ] {
+            let mut runtime = ProbeRuntime::new();
+            let mut window = tests::test_window();
+            runtime.arm_map_input_sync(MAP);
+            runtime
+                .fence_visibility_input_with(&mut window, || Ok(MAP), |_, _| Ok(()), |_| Ok(()))
+                .unwrap();
+            runtime.body = availability;
+            runtime
+                .synchronize_map_input_with(&mapped(), BODY, MAP, || panic!("input fenced"))
+                .unwrap();
+            assert!(runtime.input_fence.blocked);
+            assert!(runtime.input_fence.empty_confirmed);
+            assert_eq!(runtime.input_fence.enabled_after, None);
+            assert!(!runtime.accepts_input());
+        }
     }
 }
 
@@ -2074,6 +2248,17 @@ fn run_probe(
                     usable_area = layout.usable_area;
                     bounds = checked_probe_bounds(usable_area)?;
                     if window.verified_visible(conn, layout.current_desktop, atoms.wm_desktop)? {
+                        // Openbox may not propagate the pre-map input shape to its
+                        // managed frame. Reassert the identical SK::INPUT silhouette
+                        // once after a genuine map, before existing placement checks.
+                        runtime.synchronize_map_input_with(&ev, window.window, sequence, || {
+                            x11::shape::restore_body_input_shape(
+                                conn,
+                                window.window,
+                                window.width,
+                                window.height,
+                            )
+                        })?;
                         runtime.body = BodyAvailability::Validating;
                         runtime.placement(conn, root, window, &bounds)?;
                         println!("[PLACEMENT] Verified map at {}", window.confirmed_origin());

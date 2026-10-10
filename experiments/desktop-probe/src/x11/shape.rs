@@ -8,9 +8,8 @@ use x11rb::protocol::xproto::{ClipOrdering, Rectangle, Window};
 /// (the circular body silhouette and the translucent test patch), while excluding
 /// all transparent padding.
 ///
-/// Clicks within the shaped region generate X11 pointer events on this window;
-/// clicks in the transparent padding pass straight through to whatever window or
-/// desktop surface is underneath.
+/// Clicks in the transparent padding must pass through. Managed hosts may need
+/// the same checked shape reasserted after mapping to propagate it to the frame.
 pub fn apply_body_input_shape(
     conn: &impl Connection,
     window: Window,
@@ -27,9 +26,16 @@ pub fn restore_body_input_shape(
     width: u16,
     height: u16,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    set_input_with(window, silhouette_rectangles(width, height), |request| {
-        request.send(conn)
-    })
+    restore_body_input_shape_with(window, width, height, |request| request.send(conn))
+}
+
+fn restore_body_input_shape_with(
+    window: Window,
+    width: u16,
+    height: u16,
+    checked: impl FnOnce(InputShapeRequest) -> Result<u64, Box<dyn std::error::Error>>,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    set_input_with(window, silhouette_rectangles(width, height), checked)
 }
 
 #[allow(dead_code)] // Stage D foundation; production transitions start in E.
@@ -121,6 +127,57 @@ fn set_input_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_map_uses_the_same_checked_input_silhouette_as_initial_setup() {
+        let mut initial = None;
+        restore_body_input_shape_with(200, 160, 160, |request| {
+            initial = Some(request);
+            Ok(70000)
+        })
+        .unwrap();
+        let initial = initial.unwrap();
+        for fail in [false, true] {
+            let mut runtime = crate::ProbeRuntime::new();
+            runtime.arm_map_input_sync(70001);
+            let event = x11rb::protocol::xproto::MapNotifyEvent {
+                response_type: x11rb::protocol::xproto::MAP_NOTIFY_EVENT,
+                sequence: 70001u64 as u16,
+                event: 200,
+                window: 200,
+                override_redirect: false,
+            };
+            let result = runtime.synchronize_map_input_with(&event, 200, 70001, || {
+                restore_body_input_shape_with(200, 160, 160, |request| {
+                    assert_eq!(request.operation, SO::SET);
+                    assert_eq!(request.kind, SK::INPUT);
+                    assert_eq!(request.ordering, ClipOrdering::UNSORTED);
+                    assert_eq!((request.window, request.x, request.y), (200, 0, 0));
+                    let fields = |r: &Rectangle| (r.x, r.y, r.width, r.height);
+                    assert_eq!(
+                        request.rectangles.iter().map(fields).collect::<Vec<_>>(),
+                        initial.rectangles.iter().map(fields).collect::<Vec<_>>()
+                    );
+                    if fail {
+                        Err("checked post-map SHAPE failure".into())
+                    } else {
+                        Ok(140000)
+                    }
+                })
+            });
+            if fail {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "checked post-map SHAPE failure"
+                );
+                assert_eq!(runtime.input_fence.enabled_after, None);
+            } else {
+                result.unwrap();
+                assert_eq!(runtime.input_fence.enabled_after, Some(140000));
+            }
+        }
+    }
+
     #[test]
     fn restored_shape_matches_every_original_silhouette_pixel_including_patch_and_padding() {
         let rects = silhouette_rectangles(160, 160);
@@ -139,6 +196,15 @@ mod tests {
                     hits,
                     usize::from(crate::geometry::is_in_interactive_silhouette(x, y)),
                     "{x},{y}"
+                );
+                let dx = i32::from(x) - 80;
+                let dy = i32::from(y) - 80;
+                let accepted = dx * dx + dy * dy <= 45 * 45
+                    || ((15..=65).contains(&x) && (15..=65).contains(&y));
+                assert_eq!(
+                    hits,
+                    usize::from(accepted),
+                    "accepted silhouette at {x},{y}"
                 );
             }
         }

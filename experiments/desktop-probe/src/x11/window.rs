@@ -65,12 +65,13 @@ pub struct ManagedProbeWindow {
 }
 
 impl ManagedProbeWindow {
+    /// Returns the owned body and full checked MapWindow sequence for post-map input sync.
     pub fn create(
         conn: &impl Connection,
         root: Window,
         visual_id: Visualid,
         initial_origin: Point,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<(Self, u64), Box<dyn std::error::Error>> {
         let wire_x =
             i16::try_from(initial_origin.x).map_err(|_| "Unsupported X11 startup x coordinate")?;
         let wire_y =
@@ -143,7 +144,7 @@ impl ManagedProbeWindow {
             width,
             height,
         };
-        let initialization: Result<u32, Box<dyn std::error::Error>> = (|| {
+        let initialization: Result<(u32, u64), Box<dyn std::error::Error>> = (|| {
             // Set WM_NORMAL_HINTS (UserSpecified position and size) to direct Openbox placement
             let mut size_hints = x11rb::properties::WmSizeHints::new();
             size_hints.position = Some((
@@ -241,16 +242,21 @@ impl ManagedProbeWindow {
             apply_body_input_shape(conn, window, width, height)?;
 
             // 9. Map window to screen
-            conn.map_window(window)?.check()?;
+            let map = conn.map_window(window)?;
+            let map_sequence = map.sequence_number();
+            map.check()?;
             conn.flush()?;
 
-            Ok(wm_delete_window)
+            Ok((wm_delete_window, map_sequence))
         })();
         match initialization {
-            Ok(wm_delete_window) => Ok(Self {
-                wm_delete_window,
-                ..probe
-            }),
+            Ok((wm_delete_window, map_sequence)) => Ok((
+                Self {
+                    wm_delete_window,
+                    ..probe
+                },
+                map_sequence,
+            )),
             Err(error) => {
                 eprintln!("[ERROR] Window initialization failed: {error}");
                 if let Err(cleanup) = probe.destroy(conn) {
