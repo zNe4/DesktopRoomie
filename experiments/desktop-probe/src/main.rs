@@ -129,11 +129,6 @@ where
     }
 }
 
-// Replace this isolated stub with caller transport in Stage C.
-fn unsupported_control(command: control::Command) -> (control::ExitCode, String) {
-    (control::ExitCode::OperationFailed, format!("{command}: not implemented in this stage (M03.2-B); control transport is scheduled for Stage C"))
-}
-
 fn print_help() {
     println!("DesktopRoomie - A00-M03.1: Desktop Probe");
     println!();
@@ -148,7 +143,9 @@ fn print_help() {
     println!("  --diagnose              Run pure X11 environment diagnostics and exit");
     println!("  --delay <SECONDS>       Delay in seconds before mapping window (for typing test)");
     println!("  --duration <SECONDS>    Run for a specified duration in seconds, then exit");
-    println!("  --hide | --show | --bring-top  Control commands (not operational yet; exit 7)");
+    println!(
+        "  --hide | --show | --bring-top  Same-instance transport (Ready: Unsupported, exit 7)"
+    );
 }
 
 fn main() {
@@ -165,8 +162,16 @@ fn main() {
             return;
         }
         CliMode::Control(command) => {
-            let (exit, diagnostic) = unsupported_control(command);
-            eprintln!("[ERROR] {diagnostic}");
+            let exit = match x11::control::invoke(command) {
+                Ok(outcome) => {
+                    eprintln!("{}", outcome.diagnostic(command));
+                    outcome.exit_code()
+                }
+                Err(error) => {
+                    eprintln!("{command}: local transport/resource failure — {error}");
+                    control::ExitCode::LocalFailure
+                }
+            };
             process::exit(exit as i32);
         }
         CliMode::Diagnose => (true, None, None),
@@ -282,9 +287,20 @@ fn run_owner(
     }
     let result = startup.map(|_| ());
     let outcome = finish_probe_with(result, || {
+        let closing_popup = runtime.menu.as_ref().map(|popup| popup.window);
         let cleanup = owner_cleanup_with(
             &mut owner,
-            |owner| owner.closing(conn),
+            |owner| {
+                let closing = owner.closing(conn);
+                x11::resource::cleanup_all([
+                    Box::new(|| closing),
+                    Box::new(|| {
+                        let remote = owner.finish_remote(conn);
+                        let incoming = owner.reply_while_closing(conn, closing_popup);
+                        x11::resource::cleanup_all([Box::new(|| remote), Box::new(|| incoming)])
+                    }),
+                ])
+            },
             || {
                 abort_layer(&mut runtime.layers, "shutdown");
                 runtime.correction = None;
@@ -1287,6 +1303,14 @@ fn run_probe(
             if owner.handle_event(conn, &event)? {
                 return probe_termination_result(ProbeTermination::ControlEndpointLost);
             }
+            if owner.route_request(
+                conn,
+                &event,
+                runtime.menu.as_ref().map(|popup| popup.window),
+                runtime.layers.pending().is_some(),
+            )? {
+                continue;
+            }
             // Preserve the original fatal diagnostic even if release/cleanup also fails.
             if let Event::Error(error) = &event {
                 return Err(format!("Asynchronous X11 error: {error:?}").into());
@@ -1694,6 +1718,14 @@ fn run_probe(
         if let Some((event, sequence)) = conn.poll_for_event_with_sequence()? {
             if owner.handle_event(conn, &event)? {
                 return probe_termination_result(ProbeTermination::ControlEndpointLost);
+            }
+            if owner.route_request(
+                conn,
+                &event,
+                runtime.menu.as_ref().map(|popup| popup.window),
+                runtime.layers.pending().is_some(),
+            )? {
+                continue;
             }
             if runtime.apply_safety(Instant::now(), Some(sequence)) {
                 runtime.cancel(
@@ -4316,18 +4348,13 @@ mod cli_tests {
         assert_eq!(parse_args(["--diagnose", "--help"]), Ok(CliMode::Help));
     }
     #[test]
-    fn control_commands_parse_but_runtime_stub_fails_without_host_work() {
-        for (flag, command, label) in [
-            ("--hide", Command::Hide, "hide:"),
-            ("--show", Command::Show, "show:"),
-            ("--bring-top", Command::BringTop, "bring-top:"),
+    fn control_commands_parse_into_independent_caller_role() {
+        for (flag, command) in [
+            ("--hide", Command::Hide),
+            ("--show", Command::Show),
+            ("--bring-top", Command::BringTop),
         ] {
             assert_eq!(parse_args([flag]), Ok(CliMode::Control(command)));
-            let (exit, diagnostic) = unsupported_control(command);
-            assert_eq!(exit, ExitCode::OperationFailed);
-            assert_eq!(exit as i32, 7);
-            assert!(diagnostic.starts_with(label));
-            assert!(diagnostic.contains("not implemented in this stage"));
         }
     }
     #[test]

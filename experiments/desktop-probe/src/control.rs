@@ -1,5 +1,5 @@
 //! Pure M03.2 wire values and observations. No X11 resources or operations.
-// These foundations are intentionally inert until the later integration stages.
+// Visibility foundations remain inert until the later integration stages.
 #![allow(dead_code)]
 
 use std::fmt;
@@ -349,6 +349,70 @@ impl ReplyCorrelation {
             && response.control_xid == self.control_xid
             && response.request_id == self.request_id
     }
+}
+
+/// One admitted operation, with no queue or completed-request history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveOperation {
+    pub request: Request,
+    pub stage: Stage,
+    pub deadline: std::time::Instant,
+    pub detail: Detail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    Admitted,
+    Duplicate,
+    Reply(Status, Reason, Stage),
+}
+
+pub fn preflight_detail(reason: Reason, stage: Stage) -> Detail {
+    Detail {
+        reason,
+        stage,
+        visibility: Visibility::Unknown,
+        layer: LayerObservation::Unknown,
+        workspace: Workspace::Unknown,
+        progress: Progress::default(),
+    }
+}
+
+pub fn admit(
+    active: &mut Option<ActiveOperation>,
+    request: Request,
+    lifecycle: Lifecycle,
+    local_layer_busy: bool,
+    now: std::time::Instant,
+) -> Admission {
+    if let Some(current) = active {
+        if current.request == request {
+            return Admission::Duplicate;
+        }
+    }
+    match lifecycle {
+        Lifecycle::Starting => {
+            return Admission::Reply(Status::Starting, Reason::Starting, Stage::Preflight)
+        }
+        Lifecycle::Closing => {
+            return Admission::Reply(Status::Closing, Reason::Closing, Stage::Shutdown)
+        }
+        Lifecycle::Ready => {}
+    }
+    if active.is_some() || local_layer_busy {
+        return Admission::Reply(Status::Busy, Reason::Busy, Stage::Preflight);
+    }
+    *active = Some(ActiveOperation {
+        request,
+        stage: Stage::Preflight,
+        deadline: now
+            + std::time::Duration::from_secs(match request.command {
+                Command::Hide | Command::Show => 1,
+                Command::BringTop => 2,
+            }),
+        detail: preflight_detail(Reason::Unsupported, Stage::Preflight),
+    });
+    Admission::Admitted
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

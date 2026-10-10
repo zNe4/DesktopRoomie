@@ -1,19 +1,25 @@
-//! Stage B ownership only. No caller windows or request/reply transport.
+//! Selection ownership and bounded same-instance request/terminal-reply transport.
 use std::fs::File;
 use std::io::Read;
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
+use x11rb::errors::ReplyError;
 use x11rb::protocol::xproto::{
-    AtomEnum, ConnectionExt, CreateWindowAux, CreateWindowRequest, EventMask, PropMode, Property,
-    PropertyNotifyEvent, Screen, WindowClass,
+    AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConnectionExt, CreateWindowAux,
+    CreateWindowRequest, EventMask, GetPropertyReply, MapState, PropMode, Property,
+    PropertyNotifyEvent, Screen, SendEventRequest, WindowClass,
 };
-use x11rb::protocol::Event;
+use x11rb::protocol::{ErrorKind, Event};
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as WrapperExt;
 
-use crate::control::{selection_name, Lifecycle, OwnerDescriptor, INSTANCE, TIMESTAMP};
+use crate::control::{
+    self, selection_name, ActiveOperation, Admission, CallerMarker, Command, ExitCode, Lifecycle,
+    OwnerDescriptor, Reason, ReplyCorrelation, Request, Stage, Status, TerminalResponse, INSTANCE,
+    TIMESTAMP,
+};
 use crate::x11::resource::{cleanup_all, OwnedResource};
 use crate::HostError;
 
@@ -183,6 +189,9 @@ pub struct ControlWindow {
     exists: bool,
     owns_selection: bool,
     acquired_timestamp: Option<u32>,
+    root: u32,
+    transport: TransportAtoms,
+    active: Option<ActiveOperation>,
 }
 
 impl ControlWindow {
@@ -195,6 +204,7 @@ impl ControlWindow {
             .atom;
         let instance_atom = conn.intern_atom(false, INSTANCE.as_bytes())?.reply()?.atom;
         let timestamp_atom = conn.intern_atom(false, TIMESTAMP.as_bytes())?.reply()?.atom;
+        let transport = TransportAtoms::intern(conn)?;
         let window = conn.generate_id()?;
         let request = control_request(window, screen);
         conn.create_window(
@@ -211,7 +221,7 @@ impl ControlWindow {
             &request.value_list,
         )?
         .check()?;
-        let endpoint = Self::candidate(
+        let mut endpoint = Self::candidate(
             screen_num,
             window,
             epoch,
@@ -219,6 +229,8 @@ impl ControlWindow {
             instance_atom,
             timestamp_atom,
         );
+        endpoint.root = screen.root;
+        endpoint.transport = transport;
         let prepared = (|| {
             endpoint.write_descriptor(conn, endpoint.descriptor)?;
             conn.change_property32(
@@ -261,6 +273,9 @@ impl ControlWindow {
             exists: true,
             owns_selection: false,
             acquired_timestamp: None,
+            root: 0,
+            transport: TransportAtoms::default(),
+            active: None,
         }
     }
 
@@ -449,10 +464,78 @@ impl ControlWindow {
                 if self.handle_event(conn, &event)? {
                     return Err("Control endpoint lost during startup delay".into());
                 }
+                self.route_request(conn, &event, None, false)?;
                 Ok(None)
             },
         )?;
         Ok(())
+    }
+
+    /// Control messages are consumed before body/popup routing and movement flushing.
+    pub fn route_request(
+        &mut self,
+        conn: &impl Connection,
+        event: &Event,
+        popup: Option<u32>,
+        local_layer_busy: bool,
+    ) -> Result<bool> {
+        let Event::ClientMessage(message) = event else {
+            return Ok(false);
+        };
+        let mut host = NativePeer {
+            conn,
+            selection: self.selection,
+        };
+        route_request_with(
+            &mut host,
+            self.descriptor,
+            self.root,
+            self.transport,
+            popup,
+            local_layer_busy,
+            &mut self.active,
+            message,
+        )
+    }
+
+    /// Stage C completes within route_request. Keep shutdown completion explicit for
+    /// an admitted record, without waiting, retrying, or skipping ordered cleanup.
+    pub fn finish_remote(&mut self, conn: &impl Connection) -> Result<()> {
+        let Some(operation) = self.active.as_ref() else {
+            return Ok(());
+        };
+        let response = TerminalResponse {
+            status: Status::Closing,
+            request_id: operation.request.request_id,
+            control_xid: self.descriptor.control_xid,
+            detail: control::preflight_detail(Reason::Closing, Stage::Shutdown),
+        };
+        let mut host = NativePeer {
+            conn,
+            selection: self.selection,
+        };
+        finish_active(&mut host, self.transport, &mut self.active, response)
+    }
+
+    /// One existing-size batch at the Closing boundary; never wait for callers or
+    /// prolong teardown with an unbounded stream. Later callers observe destruction.
+    pub fn reply_while_closing(&mut self, conn: &RustConnection, popup: Option<u32>) -> Result<()> {
+        if !self.exists || !self.owns_selection || self.descriptor.lifecycle != Lifecycle::Closing {
+            return Ok(());
+        }
+        closing_events_with(
+            || Ok(conn.poll_for_event()?),
+            |event| {
+                if self.handle_event(conn, &event)? {
+                    return Ok(true);
+                }
+                if let Event::Error(error) = &event {
+                    return Err(format!("Asynchronous X11 error: {error:?}").into());
+                }
+                self.route_request(conn, &event, popup, false)?;
+                Ok(false)
+            },
+        )
     }
 
     pub fn destroy(&self, conn: &impl Connection) -> Result<()> {
@@ -530,6 +613,654 @@ impl AcquisitionHost for NativeAcquisition<'_> {
         self.conn.ungrab_server()?.check()?;
         Ok(())
     }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct TransportAtoms {
+    request: u32,
+    reply: u32,
+    caller: u32,
+}
+impl TransportAtoms {
+    fn intern(conn: &impl Connection) -> Result<Self> {
+        Ok(Self {
+            request: conn
+                .intern_atom(false, control::REQUEST.as_bytes())?
+                .reply()?
+                .atom,
+            reply: conn
+                .intern_atom(false, control::REPLY.as_bytes())?
+                .reply()?
+                .atom,
+            caller: conn
+                .intern_atom(false, control::CALLER.as_bytes())?
+                .reply()?
+                .atom,
+        })
+    }
+}
+
+/// Only this peer's BadWindow is recoverable; unrelated protocol/connection errors
+/// retain their typed error and remain fatal. No string matching.
+fn peer_result<T>(result: std::result::Result<T, ReplyError>, peer: u32) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(ReplyError::X11Error(error))
+            if error.error_kind == ErrorKind::Window && error.bad_value == peer =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+struct EndpointEvidence {
+    root: u32,
+    parent: u32,
+    class: WindowClass,
+    map_state: MapState,
+    property: GetPropertyReply,
+}
+impl EndpointEvidence {
+    fn endpoint_matches(&self, root: u32) -> bool {
+        self.root == root
+            && self.parent == root
+            && self.class == WindowClass::INPUT_ONLY
+            && self.map_state == MapState::UNMAPPED
+    }
+    fn words(&self) -> Option<Vec<u32>> {
+        let p = &self.property;
+        if p.type_ != u32::from(AtomEnum::CARDINAL)
+            || p.format != 32
+            || p.value_len != 7
+            || p.bytes_after != 0
+            || p.value.len() != 28
+        {
+            return None;
+        }
+        Some(p.value32()?.collect())
+    }
+}
+
+/// Narrow native peer seam; it deliberately exposes no body/WM/input operations.
+trait PeerHost {
+    fn now(&self) -> Instant;
+    fn owner(&mut self) -> Result<u32>;
+    fn evidence(&mut self, window: u32, property: u32) -> Result<Option<EndpointEvidence>>;
+    fn send(&mut self, event: ClientMessageEvent) -> Result<bool>;
+}
+struct NativePeer<'a, C> {
+    conn: &'a C,
+    selection: u32,
+}
+impl<C: Connection> PeerHost for NativePeer<'_, C> {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn owner(&mut self) -> Result<u32> {
+        Ok(self
+            .conn
+            .get_selection_owner(self.selection)?
+            .reply()?
+            .owner)
+    }
+    fn evidence(&mut self, window: u32, property: u32) -> Result<Option<EndpointEvidence>> {
+        let Some(tree) = peer_result(self.conn.query_tree(window)?.reply(), window)? else {
+            return Ok(None);
+        };
+        let Some(attributes) =
+            peer_result(self.conn.get_window_attributes(window)?.reply(), window)?
+        else {
+            return Ok(None);
+        };
+        // ANY lets validation distinguish wrong types from missing/truncated data.
+        let Some(property) = peer_result(
+            self.conn
+                .get_property(false, window, property, AtomEnum::ANY, 0, 7)?
+                .reply(),
+            window,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(EndpointEvidence {
+            root: tree.root,
+            parent: tree.parent,
+            class: attributes.class,
+            map_state: attributes.map_state,
+            property,
+        }))
+    }
+    fn send(&mut self, event: ClientMessageEvent) -> Result<bool> {
+        let request = direct_message(event);
+        Ok(peer_result(
+            self.conn
+                .send_event(
+                    request.propagate,
+                    request.destination,
+                    request.event_mask,
+                    *request.event,
+                )?
+                .check(),
+            request.destination,
+        )?
+        .is_some())
+    }
+}
+
+fn closing_events_with(
+    next: impl FnMut() -> Result<Option<Event>>,
+    mut inspect: impl FnMut(Event) -> Result<bool>,
+) -> Result<()> {
+    for event in crate::drain_events_bounded(&mut None, 64, next)? {
+        if inspect(event)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn direct_message(event: ClientMessageEvent) -> SendEventRequest<'static> {
+    SendEventRequest {
+        propagate: false,
+        destination: event.window,
+        event_mask: EventMask::NO_EVENT,
+        event: std::borrow::Cow::Owned(event.into()),
+    }
+}
+
+fn reply_event(
+    atoms: TransportAtoms,
+    reply: u32,
+    response: TerminalResponse,
+) -> Result<ClientMessageEvent> {
+    Ok(ClientMessageEvent::new(
+        32,
+        reply,
+        atoms.reply,
+        response
+            .encode()
+            .map_err(|e| format!("Invalid terminal response: {e:?}"))?,
+    ))
+}
+fn request_event(
+    atoms: TransportAtoms,
+    owner: u32,
+    request: Request,
+) -> Result<ClientMessageEvent> {
+    Ok(ClientMessageEvent::new(
+        32,
+        owner,
+        atoms.request,
+        request
+            .encode()
+            .map_err(|e| format!("Invalid request: {e:?}"))?,
+    ))
+}
+
+fn validated_route(
+    evidence: &EndpointEvidence,
+    root: u32,
+    owner: OwnerDescriptor,
+    popup: Option<u32>,
+    reply: u32,
+    words: [u32; 5],
+) -> Option<(Request, Option<Reason>)> {
+    if reply == 0
+        || reply == root
+        || reply == owner.control_xid
+        || Some(reply) == owner.body_xid
+        || Some(reply) == popup
+        || !evidence.endpoint_matches(root)
+    {
+        return None;
+    }
+    let marker = CallerMarker::decode(&evidence.words()?).ok()?;
+    let id = u64::from(words[1]) | (u64::from(words[2]) << 32);
+    if marker.control_xid != owner.control_xid
+        || marker.epoch != owner.epoch
+        || words[4] != owner.epoch
+        || marker.request_id != id
+    {
+        return None;
+    }
+    // A v1 marker supplies the safe identity for an incompatible header. Known
+    // commands must still match; an unknown wire command cannot decode as v1.
+    let command = Command::try_from(words[0] & 0xffff);
+    if command.is_ok_and(|command| command != marker.command) {
+        return None;
+    }
+    let error = if words[0] >> 16 != control::VERSION {
+        Some(Reason::WrongVersion)
+    } else if command.is_err() {
+        Some(Reason::UnknownCommand)
+    } else {
+        None
+    };
+    let request = if error.is_some() {
+        Request {
+            command: marker.command,
+            request_id: id,
+            reply_xid: reply,
+            epoch: words[4],
+        }
+    } else {
+        Request::decode(&words).ok()?
+    };
+    marker
+        .matches(owner.control_xid, request)
+        .then_some((request, error))
+}
+
+fn finish_active(
+    host: &mut impl PeerHost,
+    atoms: TransportAtoms,
+    active: &mut Option<ActiveOperation>,
+    response: TerminalResponse,
+) -> Result<()> {
+    let operation = active.as_ref().ok_or("Missing admitted operation")?;
+    let result = reply_event(atoms, operation.request.reply_xid, response)
+        .and_then(|event| host.send(event).map(|_| ()));
+    // Clear after the one attempt, including BadWindow and unrelated failures.
+    *active = None;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_request_with(
+    host: &mut impl PeerHost,
+    owner: OwnerDescriptor,
+    root: u32,
+    atoms: TransportAtoms,
+    popup: Option<u32>,
+    local_layer_busy: bool,
+    active: &mut Option<ActiveOperation>,
+    event: &ClientMessageEvent,
+) -> Result<bool> {
+    if event.window != owner.control_xid || event.type_ != atoms.request {
+        return Ok(false);
+    }
+    if event.format != 32 {
+        return Ok(true);
+    }
+    let words = event.data.as_data32();
+    if words[4] != owner.epoch || (words[1] == 0 && words[2] == 0) {
+        return Ok(true);
+    }
+    if host.owner()? != owner.control_xid {
+        return Err("Control selection ownership lost before admission".into());
+    }
+    let Some(evidence) = host.evidence(words[3], atoms.caller)? else {
+        return Ok(true);
+    };
+    let Some((request, protocol_error)) =
+        validated_route(&evidence, root, owner, popup, words[3], words)
+    else {
+        return Ok(true);
+    };
+    // Synchronous validation may have overlapped owner loss; admission requires
+    // current ownership, not just the lookup before reading the caller marker.
+    if host.owner()? != owner.control_xid {
+        return Err("Control selection ownership lost during validation".into());
+    }
+    let admission = match protocol_error {
+        Some(reason) => Admission::Reply(Status::ProtocolError, reason, Stage::Preflight),
+        None => control::admit(
+            active,
+            request,
+            owner.lifecycle,
+            local_layer_busy,
+            host.now(),
+        ),
+    };
+    let (status, detail) = match admission {
+        Admission::Duplicate => return Ok(true),
+        Admission::Reply(status, reason, stage) => {
+            (status, control::preflight_detail(reason, stage))
+        }
+        Admission::Admitted => (Status::Failed, active.as_ref().unwrap().detail),
+    };
+    let response = TerminalResponse {
+        status,
+        request_id: request.request_id,
+        control_xid: owner.control_xid,
+        detail,
+    };
+    if admission == Admission::Admitted {
+        finish_active(host, atoms, active, response)?;
+    } else {
+        host.send(reply_event(atoms, request.reply_xid, response)?)?;
+    }
+    Ok(true)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallerOutcome {
+    NoInstance,
+    Protocol,
+    Lifecycle(Lifecycle),
+    Terminal(TerminalResponse),
+    Unknown(&'static str),
+}
+impl CallerOutcome {
+    pub fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::NoInstance => ExitCode::NoInstance,
+            Self::Protocol => ExitCode::Protocol,
+            Self::Lifecycle(_) => ExitCode::Busy,
+            Self::Terminal(response) => response.status.exit_code(),
+            Self::Unknown(_) => ExitCode::OutcomeUnknown,
+        }
+    }
+    pub fn diagnostic(&self, command: Command) -> String {
+        let message = match self {
+            Self::NoInstance => "no running instance".into(),
+            Self::Protocol => "incompatible, stale, or malformed owner endpoint".into(),
+            Self::Lifecycle(lifecycle) => format!("owner is {lifecycle:?}"),
+            Self::Terminal(response) => format!(
+                "{:?} — {:?} ({:?})",
+                response.status, response.detail.reason, response.detail.stage
+            ),
+            Self::Unknown(reason) => format!("outcome unknown — {reason}"),
+        };
+        format!("{command}: {message}")
+    }
+}
+
+fn discover(
+    host: &mut impl PeerHost,
+    root: u32,
+    screen_num: u32,
+    instance: u32,
+) -> Result<std::result::Result<OwnerDescriptor, CallerOutcome>> {
+    let owner = host.owner()?;
+    if owner == 0 {
+        return Ok(Err(CallerOutcome::NoInstance));
+    }
+    let Some(evidence) = host.evidence(owner, instance)? else {
+        return Ok(Err(CallerOutcome::Protocol));
+    };
+    let descriptor = evidence
+        .words()
+        .and_then(|words| OwnerDescriptor::decode(&words).ok());
+    let Some(descriptor) = descriptor else {
+        return Ok(Err(CallerOutcome::Protocol));
+    };
+    if !evidence.endpoint_matches(root)
+        || descriptor.screen_num != screen_num
+        || descriptor.control_xid != owner
+        || host.owner()? != owner
+    {
+        return Ok(Err(CallerOutcome::Protocol));
+    }
+    Ok(Ok(descriptor))
+}
+
+fn fresh_request_id(random: &mut impl Read) -> Result<u64> {
+    loop {
+        let mut bytes = [0; 8];
+        random.read_exact(&mut bytes)?;
+        let id = u64::from_ne_bytes(bytes);
+        if id != 0 {
+            return Ok(id);
+        }
+    }
+}
+fn caller_request(window: u32, screen: &Screen) -> CreateWindowRequest<'static> {
+    let mut request = control_request(window, screen);
+    request.value_list = std::borrow::Cow::Owned(CreateWindowAux::new());
+    request
+}
+
+trait CallerHost: PeerHost {
+    fn atoms(&mut self, screen_num: u32) -> Result<(u32, TransportAtoms)>;
+    fn watch(&mut self, owner: u32) -> Result<bool>;
+    fn create_reply(&mut self, marker: CallerMarker) -> Result<u32>;
+    fn next(&mut self) -> Result<Option<Event>>;
+    fn wait(&mut self, deadline: Instant) -> Result<()>;
+    fn cleanup(&mut self) -> Result<()>;
+}
+struct NativeCaller<'a> {
+    peer: NativePeer<'a, RustConnection>,
+    screen: &'a Screen,
+    atoms: TransportAtoms,
+    reply: Option<(u32, OwnedResource)>,
+}
+impl PeerHost for NativeCaller<'_> {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn owner(&mut self) -> Result<u32> {
+        self.peer.owner()
+    }
+    fn evidence(&mut self, window: u32, property: u32) -> Result<Option<EndpointEvidence>> {
+        self.peer.evidence(window, property)
+    }
+    fn send(&mut self, event: ClientMessageEvent) -> Result<bool> {
+        self.peer.send(event)
+    }
+}
+impl CallerHost for NativeCaller<'_> {
+    fn atoms(&mut self, screen_num: u32) -> Result<(u32, TransportAtoms)> {
+        let conn = self.peer.conn;
+        self.peer.selection = conn
+            .intern_atom(false, selection_name(screen_num).as_bytes())?
+            .reply()?
+            .atom;
+        let instance = conn.intern_atom(false, INSTANCE.as_bytes())?.reply()?.atom;
+        self.atoms = TransportAtoms::intern(conn)?;
+        Ok((instance, self.atoms))
+    }
+    fn watch(&mut self, owner: u32) -> Result<bool> {
+        Ok(peer_result(
+            self.peer
+                .conn
+                .change_window_attributes(
+                    owner,
+                    &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+                )?
+                .check(),
+            owner,
+        )?
+        .is_some())
+    }
+    fn create_reply(&mut self, marker: CallerMarker) -> Result<u32> {
+        let conn = self.peer.conn;
+        let window = conn.generate_id()?;
+        let request = caller_request(window, self.screen);
+        conn.create_window(
+            request.depth,
+            request.wid,
+            request.parent,
+            request.x,
+            request.y,
+            request.width,
+            request.height,
+            request.border_width,
+            request.class,
+            request.visual,
+            &request.value_list,
+        )?
+        .check()?;
+        self.reply = Some((window, OwnedResource::default()));
+        let words = marker
+            .encode()
+            .map_err(|e| format!("Invalid caller marker: {e:?}"))?;
+        // The sole marker write for this invocation. Neither peer updates it.
+        conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            self.atoms.caller,
+            AtomEnum::CARDINAL,
+            &words,
+        )?
+        .check()?;
+        Ok(window)
+    }
+    fn next(&mut self) -> Result<Option<Event>> {
+        Ok(self.peer.conn.poll_for_event()?)
+    }
+    fn wait(&mut self, deadline: Instant) -> Result<()> {
+        self.peer.conn.flush()?;
+        crate::wait_x11(self.peer.conn, Some(deadline))
+    }
+    fn cleanup(&mut self) -> Result<()> {
+        if let Some((window, resource)) = &self.reply {
+            resource.release_with(|| {
+                self.peer.conn.destroy_window(*window)?.check()?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn correlated_reply(
+    event: &Event,
+    atoms: TransportAtoms,
+    owner: OwnerDescriptor,
+    correlation: ReplyCorrelation,
+) -> Option<TerminalResponse> {
+    let Event::ClientMessage(event) = event else {
+        return None;
+    };
+    if event.type_ != atoms.reply || event.format != 32 {
+        return None;
+    }
+    let response = TerminalResponse::decode(&event.data.as_data32()).ok()?;
+    correlation
+        .matches(owner, event.window, response)
+        .then_some(response)
+}
+
+fn caller_with(
+    host: &mut impl CallerHost,
+    root: u32,
+    screen_num: u32,
+    command: Command,
+    id: impl FnOnce() -> Result<u64>,
+) -> Result<CallerOutcome> {
+    // This begins before atom/selection discovery and never changes.
+    let deadline = host.now() + Duration::from_secs(4);
+    let operation = (|| {
+        let (instance, atoms) = host.atoms(screen_num)?;
+        let owner = match discover(host, root, screen_num, instance)? {
+            Ok(owner) => owner,
+            Err(outcome) => return Ok(outcome),
+        };
+        if host.now() >= deadline {
+            return Ok(CallerOutcome::Unknown(
+                "caller deadline expired before send",
+            ));
+        }
+        if owner.lifecycle != Lifecycle::Ready {
+            return Ok(CallerOutcome::Lifecycle(owner.lifecycle));
+        }
+        if !host.watch(owner.control_xid)? {
+            return Ok(CallerOutcome::Protocol);
+        }
+        let marker = CallerMarker {
+            control_xid: owner.control_xid,
+            epoch: owner.epoch,
+            request_id: id()?,
+            command,
+        };
+        let reply = host.create_reply(marker)?;
+        // Revalidate endpoint, identity and lifecycle at the send boundary. Never
+        // redirect to a replacement owner or send with a stale epoch.
+        let current = match discover(host, root, screen_num, instance)? {
+            Ok(owner) => owner,
+            Err(outcome) => return Ok(outcome),
+        };
+        if current.control_xid != owner.control_xid || current.epoch != owner.epoch {
+            return Ok(CallerOutcome::Protocol);
+        }
+        if current.lifecycle != Lifecycle::Ready {
+            return Ok(CallerOutcome::Lifecycle(current.lifecycle));
+        }
+        if host.now() >= deadline {
+            return Ok(CallerOutcome::Unknown(
+                "caller deadline expired before send",
+            ));
+        }
+        let request = Request {
+            command,
+            request_id: marker.request_id,
+            reply_xid: reply,
+            epoch: owner.epoch,
+        };
+        // The only send site. No timeout, stale event, or peer loss returns here.
+        if !host.send(request_event(atoms, owner.control_xid, request)?)? {
+            return Ok(CallerOutcome::Unknown("owner disappeared at request send"));
+        }
+        let correlation = ReplyCorrelation {
+            control_xid: owner.control_xid,
+            epoch: owner.epoch,
+            request_id: marker.request_id,
+            reply_xid: reply,
+        };
+        let mut owner_gone = false;
+        loop {
+            if host.now() >= deadline {
+                return Ok(CallerOutcome::Unknown("caller deadline expired"));
+            }
+            match host.next()? {
+                Some(event) => {
+                    if let Some(response) = correlated_reply(&event, atoms, owner, correlation) {
+                        return Ok(CallerOutcome::Terminal(response));
+                    }
+                    if matches!(event, Event::DestroyNotify(ev) if ev.window == owner.control_xid && ev.response_type & 0x80 == 0)
+                    {
+                        owner_gone = true;
+                    }
+                    if let Event::Error(error) = event {
+                        return Err(format!("Asynchronous X11 error: {error:?}").into());
+                    }
+                }
+                None if owner_gone => {
+                    return Ok(CallerOutcome::Unknown(
+                        "owner disappeared before terminal response",
+                    ))
+                }
+                None => host.wait(deadline)?,
+            }
+            // After destruction, keep draining available replies before deciding
+            // loss. The same deadline bounds even malicious continuous traffic.
+        }
+    })();
+    let cleanup = host.cleanup();
+    if let Err(error) = &cleanup {
+        eprintln!("[ERROR] Caller cleanup unconfirmed: {error}");
+    }
+    match (operation, cleanup) {
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(outcome), Ok(())) => Ok(outcome),
+    }
+}
+
+pub fn invoke(command: Command) -> Result<CallerOutcome> {
+    let (conn, screen_num) = x11rb::connect(None)?;
+    let screen = conn
+        .setup()
+        .roots
+        .get(screen_num)
+        .ok_or("Invalid X11 screen")?;
+    let mut host = NativeCaller {
+        peer: NativePeer {
+            conn: &conn,
+            selection: 0,
+        },
+        screen,
+        atoms: TransportAtoms::default(),
+        reply: None,
+    };
+    caller_with(
+        &mut host,
+        screen.root,
+        u32::try_from(screen_num)?,
+        command,
+        || fresh_request_id(&mut File::open("/dev/urandom")?),
+    )
 }
 
 #[cfg(test)]
@@ -1215,6 +1946,997 @@ mod tests {
                 .handle_event_with(&event, || panic!("unrelated owner query"))
                 .unwrap());
             assert!(endpoint.owns_selection);
+        }
+    }
+}
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use x11rb::protocol::xproto::DestroyNotifyEvent;
+
+    const ROOT: u32 = 55;
+    const CONTROL: u32 = 10;
+    const REPLY_WINDOW: u32 = 90;
+    const ID: u64 = 0x1234_5678_9abc_def0;
+    fn atoms() -> TransportAtoms {
+        TransportAtoms {
+            request: 40,
+            reply: 41,
+            caller: 42,
+        }
+    }
+    fn owner() -> OwnerDescriptor {
+        OwnerDescriptor {
+            screen_num: 0,
+            control_xid: CONTROL,
+            epoch: 77,
+            lifecycle: Lifecycle::Ready,
+            body_xid: Some(88),
+        }
+    }
+    fn request(command: Command) -> Request {
+        Request {
+            command,
+            request_id: ID,
+            reply_xid: REPLY_WINDOW,
+            epoch: 77,
+        }
+    }
+    fn marker(command: Command) -> CallerMarker {
+        CallerMarker {
+            control_xid: CONTROL,
+            epoch: 77,
+            request_id: ID,
+            command,
+        }
+    }
+    fn evidence(words: &[u32]) -> EndpointEvidence {
+        EndpointEvidence {
+            root: ROOT,
+            parent: ROOT,
+            class: WindowClass::INPUT_ONLY,
+            map_state: MapState::UNMAPPED,
+            property: GetPropertyReply {
+                format: 32,
+                type_: AtomEnum::CARDINAL.into(),
+                value_len: words.len() as u32,
+                value: words.iter().flat_map(|word| word.to_ne_bytes()).collect(),
+                ..GetPropertyReply::default()
+            },
+        }
+    }
+    fn response() -> TerminalResponse {
+        TerminalResponse {
+            status: Status::Failed,
+            request_id: ID,
+            control_xid: CONTROL,
+            detail: control::preflight_detail(Reason::Unsupported, Stage::Preflight),
+        }
+    }
+    fn terminal() -> Event {
+        Event::ClientMessage(reply_event(atoms(), REPLY_WINDOW, response()).unwrap())
+    }
+    fn destroyed(synthetic: bool) -> Event {
+        Event::DestroyNotify(DestroyNotifyEvent {
+            response_type: 17 | if synthetic { 0x80 } else { 0 },
+            sequence: 0,
+            event: CONTROL,
+            window: CONTROL,
+        })
+    }
+    struct Fake {
+        now: Instant,
+        owner: u32,
+        owners: VecDeque<u32>,
+        evidence: VecDeque<Option<EndpointEvidence>>,
+        events: VecDeque<Event>,
+        sent: Vec<ClientMessageEvent>,
+        marker: Option<CallerMarker>,
+        log: Vec<&'static str>,
+        waits: Vec<Instant>,
+        cost: Option<(&'static str, Duration)>,
+        endless_events: bool,
+        watch_ok: bool,
+        send_ok: bool,
+        failure: Option<&'static str>,
+    }
+    impl Fake {
+        fn new() -> Self {
+            Self {
+                now: Instant::now(),
+                owner: CONTROL,
+                owners: VecDeque::new(),
+                evidence: VecDeque::new(),
+                events: VecDeque::new(),
+                sent: vec![],
+                marker: None,
+                log: vec![],
+                waits: vec![],
+                cost: None,
+                endless_events: false,
+                watch_ok: true,
+                send_ok: true,
+                failure: None,
+            }
+        }
+        fn call(&mut self, name: &'static str) -> Result<()> {
+            self.log.push(name);
+            if let Some((target, cost)) = self.cost {
+                if target == name {
+                    self.now += cost;
+                }
+            }
+            if self.failure == Some(name) {
+                Err(name.into())
+            } else {
+                Ok(())
+            }
+        }
+        fn route(
+            &mut self,
+            active: &mut Option<ActiveOperation>,
+            lifecycle: Lifecycle,
+            busy: bool,
+            event: &ClientMessageEvent,
+        ) -> Result<bool> {
+            route_request_with(
+                self,
+                OwnerDescriptor {
+                    lifecycle,
+                    ..owner()
+                },
+                ROOT,
+                atoms(),
+                Some(99),
+                busy,
+                active,
+                event,
+            )
+        }
+        fn call_command(&mut self) -> Result<CallerOutcome> {
+            caller_with(self, ROOT, 0, Command::Show, || Ok(ID))
+        }
+    }
+    impl PeerHost for Fake {
+        fn now(&self) -> Instant {
+            self.now
+        }
+        fn owner(&mut self) -> Result<u32> {
+            self.call("owner")?;
+            Ok(self.owners.pop_front().unwrap_or(self.owner))
+        }
+        fn evidence(&mut self, window: u32, property: u32) -> Result<Option<EndpointEvidence>> {
+            self.call("evidence")?;
+            if let Some(evidence) = self.evidence.pop_front() {
+                return Ok(evidence);
+            }
+            Ok(Some(if window == CONTROL {
+                evidence(&owner().encode().unwrap())
+            } else {
+                assert_eq!(property, atoms().caller);
+                evidence(&marker(Command::Show).encode().unwrap())
+            }))
+        }
+        fn send(&mut self, event: ClientMessageEvent) -> Result<bool> {
+            self.sent.push(event);
+            self.call("send")?;
+            Ok(self.send_ok)
+        }
+    }
+    impl CallerHost for Fake {
+        fn atoms(&mut self, _: u32) -> Result<(u32, TransportAtoms)> {
+            self.call("atoms")?;
+            Ok((30, atoms()))
+        }
+        fn watch(&mut self, _: u32) -> Result<bool> {
+            self.call("watch")?;
+            Ok(self.watch_ok)
+        }
+        fn create_reply(&mut self, marker: CallerMarker) -> Result<u32> {
+            self.call("create reply")?;
+            assert!(
+                self.marker.replace(marker).is_none(),
+                "one immutable marker only"
+            );
+            Ok(REPLY_WINDOW)
+        }
+        fn next(&mut self) -> Result<Option<Event>> {
+            self.call("next")?;
+            Ok(self.events.pop_front().or_else(|| {
+                self.endless_events.then(|| {
+                    let mut event = reply_event(atoms(), REPLY_WINDOW, response()).unwrap();
+                    event.type_ += 1;
+                    Event::ClientMessage(event)
+                })
+            }))
+        }
+        fn wait(&mut self, deadline: Instant) -> Result<()> {
+            self.call("wait")?;
+            self.waits.push(deadline);
+            self.now = deadline;
+            Ok(())
+        }
+        fn cleanup(&mut self) -> Result<()> {
+            self.call("cleanup")
+        }
+    }
+
+    #[test]
+    fn discovery_lifecycle_and_absence_never_create_or_send() {
+        for lifecycle in [Lifecycle::Starting, Lifecycle::Closing] {
+            let mut host = Fake::new();
+            host.evidence.push_back(Some(evidence(
+                &OwnerDescriptor {
+                    lifecycle,
+                    ..owner()
+                }
+                .encode()
+                .unwrap(),
+            )));
+            assert_eq!(
+                host.call_command().unwrap(),
+                CallerOutcome::Lifecycle(lifecycle)
+            );
+            assert!(host.sent.is_empty());
+            assert!(host.marker.is_none());
+            assert_eq!(host.log.last(), Some(&"cleanup"));
+        }
+        let mut host = Fake::new();
+        host.owner = 0;
+        assert_eq!(host.call_command().unwrap(), CallerOutcome::NoInstance);
+        assert!(host.marker.is_none());
+        assert!(host.sent.is_empty());
+        assert_eq!(CallerOutcome::NoInstance.exit_code(), ExitCode::NoInstance);
+    }
+    #[test]
+    fn discovery_rejects_every_malformed_descriptor_and_native_endpoint() {
+        let valid = owner().encode().unwrap();
+        let mut variants = vec![];
+        for (index, word) in [(0, 0), (1, 2), (2, 1), (3, 11), (4, 0), (5, 99), (6, 0)] {
+            let mut words = valid;
+            words[index] = word;
+            variants.push(Some(evidence(&words)));
+        }
+        variants.push(None);
+        for case in 0..10 {
+            let mut e = evidence(&valid);
+            match case {
+                0 => e.root += 1,
+                1 => e.parent += 1,
+                2 => e.class = WindowClass::INPUT_OUTPUT,
+                3 => e.map_state = MapState::VIEWABLE,
+                4 => e.property.type_ = AtomEnum::STRING.into(),
+                5 => e.property.format = 8,
+                6 => e.property.value_len = 6,
+                7 => e.property.bytes_after = 4,
+                8 => e.property.value.push(0),
+                9 => e.property.value.clear(),
+                _ => unreachable!(),
+            }
+            variants.push(Some(e));
+        }
+        for e in variants {
+            let mut host = Fake::new();
+            host.evidence.push_back(e);
+            assert_eq!(host.call_command().unwrap(), CallerOutcome::Protocol);
+            assert!(host.sent.is_empty());
+            assert!(host.marker.is_none());
+        }
+        for replacement in [0, 11] {
+            let mut host = Fake::new();
+            host.owners = VecDeque::from([CONTROL, replacement]);
+            assert_eq!(host.call_command().unwrap(), CallerOutcome::Protocol);
+            assert!(host.sent.is_empty());
+        }
+    }
+    #[test]
+    fn ready_caller_sends_exactly_once_and_accepts_real_correlated_terminal() {
+        let mut host = Fake::new();
+        host.events.push_back(terminal());
+        assert_eq!(
+            host.call_command().unwrap(),
+            CallerOutcome::Terminal(response())
+        );
+        assert_eq!(host.marker, Some(marker(Command::Show)));
+        assert_eq!(host.sent.len(), 1);
+        let event = host.sent[0];
+        assert_eq!(
+            (event.window, event.type_, event.format),
+            (CONTROL, atoms().request, 32)
+        );
+        assert_eq!(
+            event.data.as_data32(),
+            [
+                (1 << 16) | 2,
+                ID as u32,
+                (ID >> 32) as u32,
+                REPLY_WINDOW,
+                77
+            ]
+        );
+        assert_eq!(host.log.iter().filter(|&&x| x == "create reply").count(), 1);
+        assert_eq!(host.log.last(), Some(&"cleanup"));
+        assert_eq!(
+            CallerOutcome::Terminal(response()).exit_code(),
+            ExitCode::OperationFailed
+        );
+    }
+    #[test]
+    fn caller_window_is_exact_unmapped_input_only_without_input_subscriptions() {
+        let screen = Screen {
+            root: ROOT,
+            root_visual: 66,
+            ..Screen::default()
+        };
+        let r = caller_request(REPLY_WINDOW, &screen);
+        assert_eq!((r.wid, r.parent, r.visual), (REPLY_WINDOW, ROOT, 66));
+        assert_eq!((r.depth, r.border_width, r.width, r.height), (0, 0, 1, 1));
+        assert_eq!(r.class, WindowClass::INPUT_ONLY);
+        assert_eq!(r.value_list.event_mask, None);
+        assert_eq!(
+            marker(Command::Show).encode().unwrap(),
+            [
+                control::MAGIC,
+                1,
+                CONTROL,
+                77,
+                ID as u32,
+                (ID >> 32) as u32,
+                2
+            ]
+        );
+        // CreateWindow has no mapped flag; neither CallerHost nor PeerHost offers MapWindow,
+        // selection acquisition, alpha visual, body, renderer, focus, or keyboard work.
+    }
+    #[test]
+    fn random_ids_regenerate_zero_and_use_all_64_bits_with_io_errors_preserved() {
+        let mut bytes = Vec::from(0u64.to_ne_bytes());
+        bytes.extend(ID.to_ne_bytes());
+        bytes.extend((ID + 1).to_ne_bytes());
+        let mut bytes = bytes.as_slice();
+        assert_eq!(fresh_request_id(&mut bytes).unwrap(), ID);
+        assert_eq!(fresh_request_id(&mut bytes).unwrap(), ID + 1);
+        assert!(fresh_request_id(&mut bytes).is_err());
+    }
+    #[test]
+    fn caller_cleanup_runs_on_setup_send_and_wait_failure_and_retains_original_error() {
+        for failure in [
+            "atoms",
+            "owner",
+            "evidence",
+            "watch",
+            "create reply",
+            "send",
+            "next",
+            "wait",
+            "cleanup",
+        ] {
+            let mut host = Fake::new();
+            host.failure = Some(failure);
+            let error = host.call_command().unwrap_err();
+            assert_eq!(error.to_string(), failure);
+            assert_eq!(host.log.last(), Some(&"cleanup"));
+            assert!(host.sent.len() <= 1);
+        }
+    }
+    #[test]
+    fn request_envelope_garbage_and_stale_identity_cannot_admit_or_reply() {
+        let good = request_event(atoms(), CONTROL, request(Command::Show)).unwrap();
+        for case in 0..6 {
+            let mut event = good;
+            match case {
+                0 => event.window += 1,
+                1 => event.type_ += 1,
+                2 => event.format = 8,
+                3 => {
+                    let mut w = event.data.as_data32();
+                    w[4] += 1;
+                    event.data = w.into();
+                }
+                4 => {
+                    let mut w = event.data.as_data32();
+                    w[1] = 0;
+                    w[2] = 0;
+                    event.data = w.into();
+                }
+                5 => {
+                    let mut w = event.data.as_data32();
+                    w[3] = 0;
+                    event.data = w.into();
+                }
+                _ => unreachable!(),
+            }
+            let mut host = Fake::new();
+            let mut active = None;
+            host.route(&mut active, Lifecycle::Ready, false, &event)
+                .unwrap();
+            assert!(active.is_none());
+            assert!(host.sent.is_empty());
+        }
+    }
+    #[test]
+    fn reply_route_requires_exact_native_evidence_and_immutable_identity() {
+        let req = request(Command::Show);
+        let words = req.encode().unwrap();
+        let valid = marker(Command::Show).encode().unwrap();
+        let mut variants = vec![None];
+        for (index, word) in [
+            (0, 0),
+            (1, 2),
+            (2, CONTROL + 1),
+            (3, 78),
+            (4, 0),
+            (5, 0),
+            (6, 1),
+        ] {
+            let mut w = valid;
+            w[index] = word;
+            variants.push(Some(evidence(&w)));
+        }
+        for case in 0..11 {
+            let mut e = evidence(&valid);
+            match case {
+                0 => e.root += 1,
+                1 => e.parent += 1,
+                2 => e.class = WindowClass::INPUT_OUTPUT,
+                3 => e.map_state = MapState::UNVIEWABLE,
+                4 => e.property.type_ = 0,
+                5 => e.property.type_ = AtomEnum::STRING.into(),
+                6 => e.property.format = 16,
+                7 => e.property.value_len = 8,
+                8 => e.property.bytes_after = 4,
+                9 => e.property.value.truncate(24),
+                10 => e.property.value.extend([0; 4]),
+                _ => unreachable!(),
+            }
+            variants.push(Some(e));
+        }
+        for e in variants {
+            let mut host = Fake::new();
+            host.evidence.push_back(e);
+            let mut active = None;
+            host.route(
+                &mut active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, req).unwrap(),
+            )
+            .unwrap();
+            assert!(active.is_none());
+            assert!(host.sent.is_empty());
+        }
+        for forbidden in [0, ROOT, CONTROL, 88, 99] {
+            assert!(
+                validated_route(&evidence(&valid), ROOT, owner(), Some(99), forbidden, words)
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            validated_route(
+                &evidence(&valid),
+                ROOT,
+                owner(),
+                Some(99),
+                REPLY_WINDOW,
+                words
+            ),
+            Some((req, None))
+        );
+    }
+    #[test]
+    fn incompatible_headers_get_protocol_error_only_via_valid_v1_route() {
+        for (header, reason) in [
+            ((2 << 16) | 2, Reason::WrongVersion),
+            ((1 << 16) | 99, Reason::UnknownCommand),
+        ] {
+            for safe in [true, false] {
+                let mut host = Fake::new();
+                if !safe {
+                    host.evidence.push_back(None);
+                }
+                let mut event = request_event(atoms(), CONTROL, request(Command::Show)).unwrap();
+                let mut words = event.data.as_data32();
+                words[0] = header;
+                event.data = words.into();
+                let mut active = None;
+                host.route(&mut active, Lifecycle::Ready, false, &event)
+                    .unwrap();
+                assert!(active.is_none());
+                assert_eq!(host.sent.len(), usize::from(safe));
+                if safe {
+                    let reply = TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap();
+                    assert_eq!(
+                        (reply.status, reply.detail.reason),
+                        (Status::ProtocolError, reason)
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn all_ready_commands_have_one_truthful_unsupported_reply_and_clear_active() {
+        for command in [Command::Hide, Command::Show, Command::BringTop] {
+            let mut host = Fake::new();
+            host.evidence
+                .push_back(Some(evidence(&marker(command).encode().unwrap())));
+            let event = request_event(atoms(), CONTROL, request(command)).unwrap();
+            let mut active = None;
+            host.route(&mut active, Lifecycle::Ready, false, &event)
+                .unwrap();
+            assert!(active.is_none());
+            assert_eq!(host.sent.len(), 1);
+            let reply = host.sent[0];
+            assert_eq!(
+                (reply.window, reply.type_, reply.format),
+                (REPLY_WINDOW, atoms().reply, 32)
+            );
+            assert_eq!(
+                TerminalResponse::decode(&reply.data.as_data32()).unwrap(),
+                response()
+            );
+            assert_eq!(
+                reply.data.as_data32(),
+                [(1 << 16) | 1, ID as u32, (ID >> 32) as u32, CONTROL, 11]
+            );
+            assert_eq!(host.log, ["owner", "evidence", "owner", "send"]);
+        }
+    }
+    #[test]
+    fn starting_closing_and_local_layer_busy_reply_without_admission() {
+        for (lifecycle, busy, status, reason, stage) in [
+            (
+                Lifecycle::Starting,
+                false,
+                Status::Starting,
+                Reason::Starting,
+                Stage::Preflight,
+            ),
+            (
+                Lifecycle::Closing,
+                false,
+                Status::Closing,
+                Reason::Closing,
+                Stage::Shutdown,
+            ),
+            (
+                Lifecycle::Ready,
+                true,
+                Status::Busy,
+                Reason::Busy,
+                Stage::Preflight,
+            ),
+        ] {
+            let mut host = Fake::new();
+            let before = host.now;
+            let mut active = None;
+            host.route(
+                &mut active,
+                lifecycle,
+                busy,
+                &request_event(atoms(), CONTROL, request(Command::Show)).unwrap(),
+            )
+            .unwrap();
+            let reply = TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap();
+            assert_eq!(
+                (reply.status, reply.detail.reason, reply.detail.stage),
+                (status, reason, stage)
+            );
+            assert!(active.is_none());
+            assert_eq!(host.now, before);
+            assert_eq!(reply.detail.progress, control::Progress::default());
+        }
+    }
+    #[test]
+    fn active_duplicate_is_ignored_competitor_busy_and_completed_replay_is_new() {
+        let mut host = Fake::new();
+        let req = request(Command::Show);
+        let mut active = None;
+        assert_eq!(
+            control::admit(&mut active, req, Lifecycle::Ready, false, host.now),
+            Admission::Admitted
+        );
+        let original = active;
+        host.route(
+            &mut active,
+            Lifecycle::Ready,
+            false,
+            &request_event(atoms(), CONTROL, req).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(active, original);
+        assert!(host.sent.is_empty());
+        let other = Request {
+            request_id: ID + 1,
+            ..req
+        };
+        host.evidence.push_back(Some(evidence(
+            &CallerMarker {
+                request_id: ID + 1,
+                ..marker(Command::Show)
+            }
+            .encode()
+            .unwrap(),
+        )));
+        host.route(
+            &mut active,
+            Lifecycle::Ready,
+            false,
+            &request_event(atoms(), CONTROL, other).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(active, original);
+        assert_eq!(host.sent.len(), 1);
+        assert_eq!(
+            TerminalResponse::decode(&host.sent[0].data.as_data32())
+                .unwrap()
+                .status,
+            Status::Busy
+        );
+        finish_active(&mut host, atoms(), &mut active, response()).unwrap();
+        assert!(active.is_none());
+        host.route(
+            &mut active,
+            Lifecycle::Ready,
+            false,
+            &request_event(atoms(), CONTROL, req).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(host.sent.len(), 3);
+        assert!(active.is_none());
+    }
+    #[test]
+    fn admission_deadline_is_fixed_at_admission_and_not_extended_by_duplicates() {
+        for (command, seconds) in [
+            (Command::Hide, 1),
+            (Command::Show, 1),
+            (Command::BringTop, 2),
+        ] {
+            let now = Instant::now();
+            let req = request(command);
+            let mut active = None;
+            assert_eq!(
+                control::admit(&mut active, req, Lifecycle::Ready, false, now),
+                Admission::Admitted
+            );
+            assert_eq!(active.unwrap().deadline, now + Duration::from_secs(seconds));
+            assert_eq!(active.unwrap().stage, Stage::Preflight);
+            assert_eq!(
+                control::admit(
+                    &mut active,
+                    req,
+                    Lifecycle::Ready,
+                    false,
+                    now + Duration::from_millis(500)
+                ),
+                Admission::Duplicate
+            );
+            assert_eq!(active.unwrap().deadline, now + Duration::from_secs(seconds));
+        }
+    }
+    #[test]
+    fn ownership_loss_before_or_during_validation_never_admits() {
+        for owners in [[0, 0], [CONTROL, 0], [CONTROL, 11]] {
+            let mut host = Fake::new();
+            host.owners = VecDeque::from(owners);
+            let mut active = None;
+            assert!(host
+                .route(
+                    &mut active,
+                    Lifecycle::Ready,
+                    false,
+                    &request_event(atoms(), CONTROL, request(Command::Show)).unwrap()
+                )
+                .is_err());
+            assert!(active.is_none());
+            assert!(host.sent.is_empty());
+        }
+    }
+    #[test]
+    fn vanished_caller_after_admission_is_nonfatal_but_other_send_failure_is_fatal() {
+        for failure in [false, true] {
+            let mut host = Fake::new();
+            host.send_ok = false;
+            if failure {
+                host.failure = Some("send");
+            }
+            let mut active = None;
+            let result = host.route(
+                &mut active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, request(Command::Show)).unwrap(),
+            );
+            assert_eq!(result.is_err(), failure);
+            assert!(active.is_none());
+            assert_eq!(host.sent.len(), 1);
+            assert_eq!(
+                TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap(),
+                response()
+            );
+        }
+    }
+    #[test]
+    fn only_typed_badwindow_for_the_expected_peer_is_recoverable() {
+        for (kind, bad_value, recoverable) in [
+            (ErrorKind::Window, REPLY_WINDOW, true),
+            (ErrorKind::Window, CONTROL, false),
+            (ErrorKind::Atom, REPLY_WINDOW, false),
+        ] {
+            let error = x11rb::x11_utils::X11Error {
+                error_kind: kind,
+                error_code: 3,
+                sequence: 1,
+                bad_value,
+                minor_opcode: 0,
+                major_opcode: 25,
+                extension_name: None,
+                request_name: None,
+            };
+            let result = peer_result::<()>(Err(ReplyError::X11Error(error)), REPLY_WINDOW);
+            if recoverable {
+                assert_eq!(result.unwrap(), None);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        assert!(peer_result::<()>(
+            Err(ReplyError::ConnectionError(
+                x11rb::errors::ConnectionError::UnknownError
+            )),
+            REPLY_WINDOW
+        )
+        .is_err());
+    }
+    #[test]
+    fn correlation_ignores_all_unrelated_envelopes_and_stops_at_first_valid_reply() {
+        let good = reply_event(atoms(), REPLY_WINDOW, response()).unwrap();
+        let mut host = Fake::new();
+        for case in 0..7 {
+            let mut event = good;
+            match case {
+                0 => event.window += 1,
+                1 => event.type_ += 1,
+                2 => event.format = 8,
+                3 => {
+                    let mut w = event.data.as_data32();
+                    w[0] = (2 << 16) | 1;
+                    event.data = w.into();
+                }
+                4 => {
+                    let mut w = event.data.as_data32();
+                    w[1] += 1;
+                    event.data = w.into();
+                }
+                5 => {
+                    let mut w = event.data.as_data32();
+                    w[3] += 1;
+                    event.data = w.into();
+                }
+                6 => {
+                    let mut w = event.data.as_data32();
+                    w[4] |= 1 << 31;
+                    event.data = w.into();
+                }
+                _ => unreachable!(),
+            }
+            host.events.push_back(Event::ClientMessage(event));
+        }
+        host.events.extend([terminal(), terminal()]);
+        assert_eq!(
+            host.call_command().unwrap(),
+            CallerOutcome::Terminal(response())
+        );
+        assert_eq!(host.events.len(), 1);
+        assert_eq!(host.sent.len(), 1);
+        let correlation = ReplyCorrelation {
+            control_xid: CONTROL,
+            epoch: 78,
+            request_id: ID,
+            reply_xid: REPLY_WINDOW,
+        };
+        assert!(correlated_reply(&terminal(), atoms(), owner(), correlation).is_none());
+    }
+    #[test]
+    fn one_four_second_budget_includes_discovery_setup_send_and_unrelated_traffic() {
+        for step in ["atoms", "owner", "evidence", "watch", "create reply"] {
+            let mut host = Fake::new();
+            host.cost = Some((step, Duration::from_secs(4)));
+            assert!(matches!(
+                host.call_command().unwrap(),
+                CallerOutcome::Unknown(_)
+            ));
+            assert!(host.sent.is_empty(), "no send after budget used by {step}");
+        }
+        let mut host = Fake::new();
+        let start = host.now;
+        host.cost = Some(("create reply", Duration::from_secs(3)));
+        assert!(matches!(
+            host.call_command().unwrap(),
+            CallerOutcome::Unknown(_)
+        ));
+        assert_eq!(host.waits, [start + Duration::from_secs(4)]);
+        assert_eq!(host.sent.len(), 1);
+        let mut host = Fake::new();
+        let start = host.now;
+        host.cost = Some(("next", Duration::from_millis(10)));
+        host.endless_events = true;
+        assert!(matches!(
+            host.call_command().unwrap(),
+            CallerOutcome::Unknown(_)
+        ));
+        assert_eq!(host.now, start + Duration::from_secs(4));
+        assert_eq!(host.sent.len(), 1);
+        assert!(host.waits.is_empty());
+    }
+    #[test]
+    fn owner_disappearance_before_send_never_sends_to_stale_or_replacement_owner() {
+        let mut host = Fake::new();
+        host.watch_ok = false;
+        assert_eq!(host.call_command().unwrap(), CallerOutcome::Protocol);
+        assert!(host.sent.is_empty());
+        let mut host = Fake::new();
+        host.owners = VecDeque::from([CONTROL, CONTROL, 0]);
+        assert_eq!(host.call_command().unwrap(), CallerOutcome::NoInstance);
+        assert!(host.sent.is_empty());
+        let mut host = Fake::new();
+        host.evidence = VecDeque::from([Some(evidence(&owner().encode().unwrap())), None]);
+        assert_eq!(host.call_command().unwrap(), CallerOutcome::Protocol);
+        assert!(host.sent.is_empty());
+        let mut host = Fake::new();
+        host.evidence = VecDeque::from([
+            Some(evidence(&owner().encode().unwrap())),
+            Some(evidence(
+                &OwnerDescriptor {
+                    epoch: 78,
+                    ..owner()
+                }
+                .encode()
+                .unwrap(),
+            )),
+        ]);
+        assert_eq!(host.call_command().unwrap(), CallerOutcome::Protocol);
+        assert!(host.sent.is_empty());
+    }
+    #[test]
+    fn owner_death_drains_buffered_terminal_first_without_resend() {
+        for events in [
+            vec![terminal(), destroyed(false)],
+            vec![destroyed(false), terminal()],
+            vec![destroyed(true), terminal()],
+        ] {
+            let mut host = Fake::new();
+            host.events = events.into();
+            assert_eq!(
+                host.call_command().unwrap(),
+                CallerOutcome::Terminal(response())
+            );
+            assert_eq!(host.sent.len(), 1);
+        }
+        let mut host = Fake::new();
+        host.events.push_back(destroyed(false));
+        assert_eq!(
+            host.call_command().unwrap(),
+            CallerOutcome::Unknown("owner disappeared before terminal response")
+        );
+        assert!(host.waits.is_empty());
+        assert_eq!(host.sent.len(), 1);
+        let mut host = Fake::new();
+        host.send_ok = false;
+        assert!(matches!(
+            host.call_command().unwrap(),
+            CallerOutcome::Unknown(_)
+        ));
+        assert_eq!(host.sent.len(), 1);
+    }
+    #[test]
+    fn shutdown_completes_active_once_and_clears_even_on_reply_failure() {
+        for fails in [false, true] {
+            let mut host = Fake::new();
+            if fails {
+                host.failure = Some("send");
+            }
+            let mut active = None;
+            control::admit(
+                &mut active,
+                request(Command::Show),
+                Lifecycle::Ready,
+                false,
+                host.now,
+            );
+            let closing = TerminalResponse {
+                status: Status::Closing,
+                detail: control::preflight_detail(Reason::Closing, Stage::Shutdown),
+                ..response()
+            };
+            assert_eq!(
+                finish_active(&mut host, atoms(), &mut active, closing).is_err(),
+                fails
+            );
+            assert!(active.is_none());
+            assert_eq!(host.sent.len(), 1);
+        }
+    }
+    #[test]
+    fn direct_native_request_and_reply_use_no_propagation_or_event_mask() {
+        for event in [
+            request_event(atoms(), CONTROL, request(Command::Show)).unwrap(),
+            reply_event(atoms(), REPLY_WINDOW, response()).unwrap(),
+        ] {
+            let native = direct_message(event);
+            assert!(!native.propagate);
+            assert_eq!(native.destination, event.window);
+            assert_eq!(native.event_mask, EventMask::NO_EVENT);
+            let bytes: [u8; 32] = event.into();
+            assert_eq!(*native.event, bytes);
+        }
+    }
+
+    #[test]
+    fn direct_starting_requests_do_not_extend_the_startup_wait() {
+        use std::cell::{Cell, RefCell};
+        let host = RefCell::new(Fake::new());
+        let start = host.borrow().now;
+        let now = Cell::new(start);
+        let deadline = start + Duration::from_secs(2);
+        let event = request_event(atoms(), CONTROL, request(Command::Show)).unwrap();
+        let mut active = None;
+        let result = wait_events_with::<()>(
+            deadline,
+            || now.get(),
+            || {
+                now.set(now.get() + Duration::from_millis(100));
+                Ok(Some((Event::ClientMessage(event), 1)))
+            },
+            |_| panic!("continuous event traffic"),
+            |event, _| {
+                let Event::ClientMessage(event) = event else {
+                    unreachable!()
+                };
+                host.borrow_mut()
+                    .route(&mut active, Lifecycle::Starting, false, &event)?;
+                Ok(None)
+            },
+        )
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(now.get(), deadline);
+        assert!(active.is_none());
+        assert_eq!(host.borrow().sent.len(), 20);
+        for reply in &host.borrow().sent {
+            assert_eq!(
+                TerminalResponse::decode(&reply.data.as_data32())
+                    .unwrap()
+                    .status,
+                Status::Starting
+            );
+        }
+    }
+    #[test]
+    fn closing_boundary_drains_only_one_bounded_batch_without_admitting() {
+        let event =
+            Event::ClientMessage(request_event(atoms(), CONTROL, request(Command::Show)).unwrap());
+        let mut queue = VecDeque::from(vec![event; 100]);
+        let mut host = Fake::new();
+        let mut active = None;
+        closing_events_with(
+            || Ok(queue.pop_front()),
+            |event| {
+                let Event::ClientMessage(event) = event else {
+                    unreachable!()
+                };
+                host.route(&mut active, Lifecycle::Closing, false, &event)?;
+                Ok(false)
+            },
+        )
+        .unwrap();
+        assert_eq!(queue.len(), 36);
+        assert!(active.is_none());
+        assert_eq!(host.sent.len(), 64);
+        for reply in host.sent {
+            let reply = TerminalResponse::decode(&reply.data.as_data32()).unwrap();
+            assert_eq!(reply.status, Status::Closing);
+            assert_eq!(reply.detail.stage, Stage::Shutdown);
         }
     }
 }
