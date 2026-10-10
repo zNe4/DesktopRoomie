@@ -2582,7 +2582,7 @@ mod transport_tests {
         let operation = active.unwrap();
         assert_eq!(operation.request, req);
         assert_eq!(operation.stage, Stage::Show);
-        assert_eq!(operation.deadline, host.now + Duration::from_secs(1));
+        assert_eq!(operation.deadline, host.now + Duration::from_millis(2500));
         assert_eq!(operation.detail.reason, Reason::None);
         finish_active(&mut host, atoms(), &mut active, response()).unwrap();
         assert!(active.is_none());
@@ -2600,6 +2600,7 @@ mod transport_tests {
         for phase in [
             control::ShowPhase::Observe,
             control::ShowPhase::Fenced,
+            control::ShowPhase::RestoreAttempted,
             control::ShowPhase::RestoreRequested,
             control::ShowPhase::EnablingInput,
         ] {
@@ -2618,7 +2619,9 @@ mod transport_tests {
             active.show.phase = phase;
             active.detail.progress.host_mutation_dispatched = matches!(
                 phase,
-                control::ShowPhase::RestoreRequested | control::ShowPhase::EnablingInput
+                control::ShowPhase::RestoreAttempted
+                    | control::ShowPhase::RestoreRequested
+                    | control::ShowPhase::EnablingInput
             );
             let progress = active.detail.progress;
             endpoint.finish_remote_with(&mut host).unwrap();
@@ -2788,10 +2791,10 @@ mod transport_tests {
     }
     #[test]
     fn admission_deadline_is_fixed_at_admission_and_not_extended_by_duplicates() {
-        for (command, seconds) in [
-            (Command::Hide, 1),
-            (Command::Show, 1),
-            (Command::BringTop, 2),
+        for (command, millis) in [
+            (Command::Hide, 1000),
+            (Command::Show, 2500),
+            (Command::BringTop, 2000),
         ] {
             let now = Instant::now();
             let req = request(command);
@@ -2800,19 +2803,27 @@ mod transport_tests {
                 control::admit(&mut active, req, Lifecycle::Ready, false, now),
                 Admission::Admitted
             );
-            assert_eq!(active.unwrap().deadline, now + Duration::from_secs(seconds));
-            assert_eq!(active.unwrap().stage, Stage::Preflight);
             assert_eq!(
-                control::admit(
-                    &mut active,
-                    req,
-                    Lifecycle::Ready,
-                    false,
-                    now + Duration::from_millis(500)
-                ),
-                Admission::Duplicate
+                active.unwrap().deadline,
+                now + Duration::from_millis(millis)
             );
-            assert_eq!(active.unwrap().deadline, now + Duration::from_secs(seconds));
+            assert_eq!(active.unwrap().stage, Stage::Preflight);
+            for elapsed in [500, 2499, 2500, 5000] {
+                assert_eq!(
+                    control::admit(
+                        &mut active,
+                        req,
+                        Lifecycle::Ready,
+                        false,
+                        now + Duration::from_millis(elapsed)
+                    ),
+                    Admission::Duplicate
+                );
+                assert_eq!(
+                    active.unwrap().deadline,
+                    now + Duration::from_millis(millis)
+                );
+            }
         }
     }
     #[test]

@@ -324,6 +324,7 @@ impl VisibilityAtoms {
     /// One shared deadline, checked separately before both native mutations.
     /// A checked acknowledgement is not WM confirmation. Mark dispatch before
     /// checking, since a failed check cannot establish that the request had no effect.
+    /// Returns true only if MapWindow itself was dispatched and checked.
     pub fn request_restore_before(
         &self,
         conn: &impl Connection,
@@ -353,8 +354,12 @@ impl VisibilityAtoms {
             if now() >= deadline {
                 return Ok(());
             }
-            mapped |= matches!(request, VisibilityRequest::Map { .. });
-            checked(request, dispatched)
+            let is_map = matches!(request, VisibilityRequest::Map { .. });
+            let mut request_dispatched = false;
+            let result = checked(request, &mut request_dispatched);
+            *dispatched |= request_dispatched;
+            mapped |= is_map && request_dispatched;
+            result
         })?;
         Ok(mapped)
     }
@@ -478,6 +483,80 @@ mod tests {
             .is_err());
         assert_eq!(calls, 1);
         assert!(!dispatched);
+    }
+
+    #[test]
+    fn restore_dispatch_marks_survive_checked_errors_without_retry() {
+        use std::time::{Duration, Instant};
+        for fail_map in [false, true] {
+            for sent_before_error in [false, true] {
+                let now = Instant::now();
+                let mut dispatched = false;
+                let mut attempts = vec![];
+                let mut sent = vec![];
+                let result = atoms().restore_before_with(
+                    100,
+                    now + Duration::from_millis(2500),
+                    &mut dispatched,
+                    || now,
+                    |request, mark| {
+                        let is_map = matches!(request, VisibilityRequest::Map { .. });
+                        attempts.push(is_map);
+                        if is_map == fail_map && !sent_before_error {
+                            return Err("send failed before native cookie".into());
+                        }
+                        *mark = true; // native cookie obtained, before check
+                        sent.push(is_map);
+                        if is_map == fail_map {
+                            return Err("injected cookie check failure".into());
+                        }
+                        Ok(())
+                    },
+                );
+                assert!(result.is_err());
+                assert_eq!(
+                    attempts,
+                    if fail_map {
+                        vec![false, true]
+                    } else {
+                        vec![false]
+                    }
+                );
+                assert_eq!(
+                    sent.len(),
+                    usize::from(fail_map) + usize::from(sent_before_error)
+                );
+                assert_eq!(sent.contains(&true), fail_map && sent_before_error);
+                assert_eq!(dispatched, fail_map || sent_before_error);
+            }
+        }
+    }
+
+    #[test]
+    fn user_time_dispatch_mark_alone_never_counts_as_map_dispatch() {
+        let now = std::time::Instant::now();
+        let mut dispatched = false;
+        let mut calls = 0;
+        let mapped = atoms()
+            .restore_before_with(
+                100,
+                now + std::time::Duration::from_millis(2500),
+                &mut dispatched,
+                || now,
+                |request, mark| {
+                    calls += 1;
+                    assert!(
+                        !*mark,
+                        "each native request needs its own dispatch evidence"
+                    );
+                    *mark = matches!(request, VisibilityRequest::UserTime { .. });
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(dispatched);
+        assert!(!mapped);
+        assert_eq!(calls, 2);
     }
 
     fn atoms() -> VisibilityAtoms {

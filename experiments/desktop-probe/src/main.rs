@@ -1971,6 +1971,8 @@ trait ShowHost {
     fn fence_settled(&self) -> bool;
     fn deferred_placement(&mut self, placement: &ShowPlacement) -> Result<bool, HostError>;
     fn fence(&mut self) -> Result<(), HostError>;
+    /// True only after MapWindow dispatch/check; `dispatched` also retains any
+    /// earlier user-time mutation, including on expiry or a native error.
     fn restore(&mut self, deadline: Instant, dispatched: &mut bool) -> Result<bool, HostError>;
     fn placement(&mut self) -> Result<ShowPlacement, HostError>;
     fn correct(
@@ -2210,12 +2212,15 @@ fn service_show_with(
             if operation.show.phase == ShowPhase::Fenced {
                 operation.detail.reason = Reason::X11Failure;
                 // Never retry, including on a checked native failure.
-                operation.show.phase = ShowPhase::RestoreRequested;
-                host.restore(
+                operation.show.phase = ShowPhase::RestoreAttempted;
+                let mapped = host.restore(
                     operation.deadline,
                     &mut operation.detail.progress.host_mutation_dispatched,
                 )?;
-                if host.now() >= operation.deadline {
+                if mapped {
+                    operation.show.phase = ShowPhase::RestoreRequested;
+                }
+                if !mapped || host.now() >= operation.deadline {
                     return service_show_final(operation, host);
                 }
                 // Checked requests may have buffered WM events. Let the loop drain
@@ -6882,12 +6887,17 @@ mod show_tests {
             h.fail = Some(failure);
             let mut op = h.operation();
             assert!(service_show_with(&mut op, &mut h).is_err());
-            assert_eq!(op.show.phase, ShowPhase::RestoreRequested);
+            assert_eq!(op.show.phase, ShowPhase::RestoreAttempted);
+            assert_eq!(op.detail.reason, Reason::X11Failure);
             assert!(!op.detail.progress.not_minimized_confirmed);
             assert!(op.detail.progress.host_mutation_dispatched);
+            assert_eq!(h.count("user_time_zero"), 1);
+            assert_eq!(h.count("map"), usize::from(failure == "map"));
+            assert_eq!(h.count("enable"), 0);
             h.fail = None;
             assert!(h.run(&mut op).is_none());
-            assert_eq!(h.count(failure), 1);
+            assert_eq!(h.count("user_time_zero"), 1);
+            assert_eq!(h.count("map"), usize::from(failure == "map"));
         }
     }
     #[test]
@@ -6993,8 +7003,9 @@ mod show_tests {
         let mut op = h.operation();
         let deadline = op.deadline;
         assert!(h.run(&mut op).is_none());
-        for _ in 0..20 {
+        for _ in 0..62 {
             h.now += Duration::from_millis(40);
+            op.show.observe = true;
             assert!(h.run(&mut op).is_none());
             assert_eq!(op.deadline, deadline);
         }
@@ -7007,6 +7018,124 @@ mod show_tests {
         assert_eq!(h.count("map"), 1);
     }
     #[test]
+    fn expiry_before_restore_admission_effects_is_observation_only() {
+        let mut h = minimized();
+        let mut op = h.operation();
+        h.now = op.deadline;
+        let result = h.run(&mut op).unwrap();
+        assert_eq!(result.status(), Status::Failed);
+        assert_eq!(result.detail().reason, Reason::ConfirmationTimeout);
+        assert!(!result.detail().progress.host_mutation_dispatched);
+        assert_eq!(op.show.phase, ShowPhase::Observe);
+        assert_eq!(h.log, ["observe"]);
+        assert_eq!(h.count("user_time_zero"), 0);
+        assert_eq!(h.count("map"), 0);
+    }
+    #[test]
+    fn expiry_between_user_time_and_map_never_claims_restore_request() {
+        let mut h = minimized();
+        let mut op = h.operation();
+        h.advance = Some(("user_time_zero", op.deadline - h.now));
+        let result = h.run(&mut op).unwrap();
+        assert_eq!(result.status(), Status::Failed);
+        assert_eq!(result.detail().reason, Reason::ConfirmationTimeout);
+        assert!(result.detail().progress.host_mutation_dispatched);
+        assert_eq!(op.show.phase, ShowPhase::RestoreAttempted);
+        assert_eq!(h.count("user_time_zero"), 1);
+        assert_eq!(h.count("map"), 0);
+        assert_eq!(
+            h.log,
+            [
+                "observe",
+                "fence",
+                "empty",
+                "release",
+                "observe",
+                "user_time_zero",
+                "observe"
+            ]
+        );
+        assert!(h.runtime.input_fence.blocked);
+        let before = h.log.len();
+        op.show.observe = true;
+        assert_eq!(h.run(&mut op).unwrap().status(), Status::Failed);
+        assert_eq!(&h.log[before..], ["observe"]);
+    }
+    #[test]
+    fn expiry_after_user_time_can_only_succeed_from_stronger_fresh_elsewhere_evidence() {
+        let mut h = Fake::new(reading(Visibility::Minimized, L::Below, 7, 2));
+        let mut op = h.operation();
+        h.advance = Some(("user_time_zero", op.deadline - h.now));
+        h.reads = VecDeque::from([
+            h.current,
+            h.current,
+            reading(Visibility::NotMinimizedElsewhere, L::Below, 7, 2),
+        ]);
+        assert_success(h.run(&mut op).unwrap(), false, true);
+        assert_eq!(op.show.phase, ShowPhase::RestoreAttempted);
+        assert_eq!(h.count("user_time_zero"), 1);
+        assert_eq!(h.count("map"), 0);
+        assert_eq!(h.count("enable"), 0);
+        assert_eq!(h.count("geometry"), 0);
+    }
+    #[test]
+    fn slower_host_completes_map_correction_and_input_within_fixed_2500_ms() {
+        assert_eq!(CONFIRMATION_TIMEOUT, Duration::from_millis(150));
+        let mut h = minimized();
+        let start = h.now;
+        let mut op = h.operation();
+        let deadline = start + Duration::from_millis(2500);
+        assert_eq!(op.deadline, deadline);
+        h.advance = Some(("user_time_zero", Duration::from_millis(1200)));
+        assert!(h.run(&mut op).is_none());
+        assert_eq!(h.now - start, Duration::from_millis(1200));
+        assert_eq!(op.show.phase, ShowPhase::RestoreRequested);
+        assert_eq!(h.count("map"), 1);
+        h.now += Duration::from_millis(300); // WM response
+        h.current = visible();
+        h.bounds = ValidOriginBounds::new(200, 500, 200, 500);
+        h.advance = Some(("geometry", Duration::from_millis(300)));
+        assert!(h.run(&mut op).is_none());
+        let confirmation = op.show.correction.unwrap().1;
+        assert_eq!(confirmation, start + Duration::from_millis(1950));
+        h.now = confirmation;
+        h.advance = Some(("enable", Duration::from_millis(300)));
+        assert_success(h.run(&mut op).unwrap(), true, true);
+        assert_eq!(h.now - start, Duration::from_millis(2250));
+        assert_eq!(op.deadline, deadline);
+        assert_eq!(op.show.phase, ShowPhase::InputRestored);
+        assert_eq!(h.count("user_time_zero"), 1);
+        assert_eq!(h.count("map"), 1);
+        assert_eq!(h.count("correct"), 1);
+        assert_eq!(h.count("enable"), 1);
+        assert_eq!(h.log.last(), Some(&"observe"));
+        assert!(h.runtime.accepts_input());
+    }
+    #[test]
+    fn just_over_2500_ms_never_dispatches_map_correction_or_input_late() {
+        for step in ["user_time_zero", "geometry"] {
+            let mut h = minimized();
+            let start = h.now;
+            let mut op = h.operation();
+            if step == "geometry" {
+                assert!(h.run(&mut op).is_none());
+                h.current = visible();
+                h.bounds = ValidOriginBounds::new(200, 500, 200, 500);
+            }
+            h.advance = Some((step, Duration::from_millis(2501)));
+            let result = h.run(&mut op).unwrap();
+            assert_eq!(h.now - start, Duration::from_millis(2501));
+            assert_eq!(op.deadline, start + Duration::from_millis(2500));
+            assert_eq!(result.status(), Status::Failed);
+            assert_eq!(result.detail().reason, Reason::ConfirmationTimeout);
+            assert!(result.detail().progress.host_mutation_dispatched);
+            assert_eq!(h.count("map"), usize::from(step == "geometry"));
+            assert_eq!(h.count("correct"), 0);
+            assert_eq!(h.count("enable"), 0);
+            assert_eq!(h.log.last(), Some(&"observe"));
+        }
+    }
+    #[test]
     fn expiry_during_user_time_or_geometry_uses_final_read_without_new_mutations() {
         for step in ["user_time_zero", "geometry"] {
             let mut h = minimized();
@@ -7015,7 +7144,7 @@ mod show_tests {
                 assert!(h.run(&mut op).is_none());
                 h.current = visible();
             }
-            h.advance = Some((step, Duration::from_secs(1)));
+            h.advance = Some((step, op.deadline - h.now));
             let result = h.run(&mut op).unwrap();
             assert_eq!(result.status(), Status::Failed);
             assert_eq!(result.detail().reason, Reason::ConfirmationTimeout);
@@ -7046,7 +7175,7 @@ mod show_tests {
         let mut h = minimized();
         let mut op = h.operation();
         assert!(h.run(&mut op).is_none());
-        let mut events = VecDeque::from(vec![(); 200]);
+        let mut events = VecDeque::from(vec![(); 400]);
         let mut count = 0;
         let mut final_result = None;
         while !events.is_empty() {
@@ -7065,7 +7194,7 @@ mod show_tests {
                 break;
             }
         }
-        assert_eq!(count, 100);
+        assert_eq!(count, 250);
         assert!(!events.is_empty());
         assert_eq!(final_result.unwrap().status(), Status::Failed);
         assert_eq!(h.count("map"), 1);

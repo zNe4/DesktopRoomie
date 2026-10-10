@@ -367,6 +367,9 @@ pub enum ShowPhase {
     #[default]
     Observe,
     Fenced,
+    /// Attempt consumed, even if only user-time zero was sent. Never retry.
+    RestoreAttempted,
+    /// MapWindow was dispatched and its check succeeded; WM readiness is pending.
     RestoreRequested,
     EnablingInput,
     InputRestored,
@@ -436,9 +439,11 @@ pub fn admit(
         request,
         stage: Stage::Preflight,
         deadline: now
-            + std::time::Duration::from_secs(match request.command {
-                Command::Hide | Command::Show => 1,
-                Command::BringTop => 2,
+            + std::time::Duration::from_millis(match request.command {
+                Command::Hide => 1000,
+                // Owner-approved Stage-E budget, including slower-host margin.
+                Command::Show => 2500,
+                Command::BringTop => 2000,
             }),
         detail: preflight_detail(Reason::Unsupported, Stage::Preflight),
         show: ShowProgress {
