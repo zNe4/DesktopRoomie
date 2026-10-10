@@ -7,7 +7,6 @@ mod x11;
 use std::env;
 use std::os::unix::io::AsRawFd;
 use std::process;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
@@ -19,6 +18,7 @@ use x11rb::protocol::Event;
 use crate::geometry::{calculate_centered_origin, compute_valid_origin_bounds, Point, Size};
 use crate::interaction::{HostAction, InteractionManager, InteractionState, MenuOutcome};
 use crate::layer::{Layer, LayerController, Mutation, ObservedLayer, Step};
+use crate::x11::control::{Acquisition, ControlWindow};
 use crate::x11::menu::{MenuPopup, PopupInputGate};
 use crate::x11::monitors::query_desktop_layout;
 use crate::x11::pointer::{grab_pointer, CaptureOwner, PointerCaptureTracker};
@@ -131,7 +131,7 @@ where
 
 // Replace this isolated stub with caller transport in Stage C.
 fn unsupported_control(command: control::Command) -> (control::ExitCode, String) {
-    (control::ExitCode::OperationFailed, format!("{command}: not implemented in this stage (M03.2-A); control transport is scheduled for Stage C"))
+    (control::ExitCode::OperationFailed, format!("{command}: not implemented in this stage (M03.2-B); control transport is scheduled for Stage C"))
 }
 
 fn print_help() {
@@ -206,45 +206,172 @@ fn main() {
         }
     };
 
-    let atoms = match x11::monitors::LayoutAtoms::subscribe(&conn, screen.root) {
-        Ok(atoms) => atoms,
-        Err(error) => {
-            eprintln!("[ERROR] Geometry subscription failed: {error}");
-            process::exit(1);
-        }
-    };
-    let layout = match query_desktop_layout(&conn, screen.root, &atoms, None) {
-        Ok(layout) => layout,
-        Err(error) => {
-            eprintln!("[ERROR] Desktop geometry query failed: {error}");
-            process::exit(1);
-        }
-    };
-    let selected_monitor = layout
-        .primary_monitor
-        .as_ref()
-        .expect("validated monitor")
-        .name_atom;
-
-    // If pure diagnosis requested, print diagnostics and exit cleanly (M01.1 mode)
     if diagnose {
+        let atoms = match x11::monitors::LayoutAtoms::subscribe(&conn, screen.root) {
+            Ok(atoms) => atoms,
+            Err(error) => {
+                eprintln!("[ERROR] Geometry subscription failed: {error}");
+                process::exit(1);
+            }
+        };
+        let layout = match query_desktop_layout(&conn, screen.root, &atoms, None) {
+            Ok(layout) => layout,
+            Err(error) => {
+                eprintln!("[ERROR] Desktop geometry query failed: {error}");
+                process::exit(1);
+            }
+        };
+
         run_diagnostics(&conn, screen, &layout);
         println!("\n[Result]");
         println!("  M01.1: X11 connection established; diagnostics completed.");
         return;
     }
 
+    let exit = run_owner(&conn, screen, screen_num, delay_secs, duration_secs);
+    if exit != control::ExitCode::Success {
+        process::exit(exit as i32);
+    }
+    println!("  Probe exited cleanly.");
+}
+
+fn run_owner(
+    conn: &x11rb::rust_connection::RustConnection,
+    screen: &x11rb::protocol::xproto::Screen,
+    screen_num: usize,
+    delay_secs: Option<u64>,
+    duration_secs: Option<u64>,
+) -> control::ExitCode {
+    let mut owner = match ControlWindow::create(conn, screen, screen_num) {
+        Ok(owner) => owner,
+        Err(error) => {
+            eprintln!("[ERROR] Control endpoint creation failed: {error}");
+            return control::ExitCode::LocalFailure;
+        }
+    };
+    let mut body = None;
+    let mut renderer = None;
+    let mut runtime = ProbeRuntime::new();
+    let startup = owner_startup_with(
+        &mut owner,
+        |owner| owner.acquire(conn),
+        |owner| {
+            if let Some(delay) = delay_secs {
+                println!("[Startup Delay] Waiting {delay} second(s) before creating and mapping probe window...");
+                owner.delay(conn, delay)?;
+            }
+            Ok(())
+        },
+        |owner| {
+            start_body(
+                conn,
+                screen,
+                duration_secs,
+                owner,
+                &mut body,
+                &mut renderer,
+                &mut runtime,
+            )
+        },
+    );
+    let duplicate = matches!(startup, Ok(Acquisition::Duplicate));
+    if duplicate {
+        eprintln!(
+            "[INSTANCE] Another owner exists on screen {screen_num}; refusing duplicate launch"
+        );
+    }
+    let result = startup.map(|_| ());
+    let outcome = finish_probe_with(result, || {
+        let cleanup = owner_cleanup_with(
+            &mut owner,
+            |owner| owner.closing(conn),
+            || {
+                abort_layer(&mut runtime.layers, "shutdown");
+                runtime.correction = None;
+                let cancellation = body
+                    .as_mut()
+                    .map_or(Ok(()), |body| runtime.cancel(conn, body, "shutdown"));
+                x11::resource::cleanup_all([
+                    Box::new(|| cancellation),
+                    Box::new(|| {
+                        renderer
+                            .as_ref()
+                            .map_or(Ok(()), |renderer| renderer.destroy(conn))
+                    }),
+                    Box::new(|| body.as_ref().map_or(Ok(()), |body| body.destroy(conn))),
+                ])
+            },
+            |owner| owner.destroy(conn),
+            || Ok(conn.flush()?),
+        );
+        if runtime.pointer.is_grabbed() {
+            eprintln!("[ERROR] Pointer release remains unconfirmed; connection teardown is best effort only");
+        }
+        cleanup
+    });
+    if outcome.is_err() {
+        control::ExitCode::LocalFailure
+    } else if duplicate {
+        control::ExitCode::DuplicateLaunch
+    } else {
+        control::ExitCode::Success
+    }
+}
+
+/// Only a confirmed owner can enter the delay or construct a body.
+fn owner_startup_with<T>(
+    owner: &mut T,
+    acquire: impl FnOnce(&mut T) -> Result<Acquisition, HostError>,
+    delay: impl FnOnce(&mut T) -> Result<(), HostError>,
+    body: impl FnOnce(&mut T) -> Result<(), HostError>,
+) -> Result<Acquisition, HostError> {
+    let outcome = acquire(owner)?;
+    if outcome == Acquisition::Owned {
+        delay(owner)?;
+        body(owner)?;
+    }
+    Ok(outcome)
+}
+
+fn owner_cleanup_with<T>(
+    owner: &mut T,
+    closing: impl FnOnce(&mut T) -> Result<(), HostError>,
+    body_cleanup: impl FnOnce() -> Result<(), HostError>,
+    control_cleanup: impl FnOnce(&mut T) -> Result<(), HostError>,
+    flush: impl FnOnce() -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    // Evaluate Closing first, then continue ALL teardown obligations despite failures.
+    let closing = closing(owner);
+    x11::resource::cleanup_all([
+        Box::new(|| closing),
+        Box::new(body_cleanup),
+        Box::new(|| control_cleanup(owner)),
+        Box::new(flush),
+    ])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_body(
+    conn: &x11rb::rust_connection::RustConnection,
+    screen: &x11rb::protocol::xproto::Screen,
+    duration_secs: Option<u64>,
+    owner: &mut ControlWindow,
+    body_resource: &mut Option<ManagedProbeWindow>,
+    renderer_resource: &mut Option<Renderer>,
+    runtime: &mut ProbeRuntime,
+) -> Result<(), HostError> {
+    let atoms = x11::monitors::LayoutAtoms::subscribe(conn, screen.root)?;
+    let layout = query_desktop_layout(conn, screen.root, &atoms, None)?;
+    let selected_monitor = layout
+        .primary_monitor
+        .as_ref()
+        .expect("validated monitor")
+        .name_atom;
     // M02.5 retains bounded dragging and adds interruption recovery.
     println!("Mission M03.1: managed layers and mouse-only controls...");
 
     // 1. Discover 32-bit alpha Render visual
-    let alpha_vis = match find_alpha_visual(&conn) {
-        Ok(vis) => vis,
-        Err(err) => {
-            eprintln!("\n[ERROR] Alpha visual discovery failed: {}", err);
-            process::exit(1);
-        }
-    };
+    let alpha_vis = find_alpha_visual(conn)?;
 
     println!("\n[Visual Selection]");
     println!(
@@ -265,21 +392,8 @@ fn main() {
 
     // 2. Validate geometry & bounds
     let body_size = Size::new(WINDOW_WIDTH as u32, WINDOW_HEIGHT as u32);
-    let valid_bounds = match checked_probe_bounds(layout.usable_area) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("\n[ERROR] Bounded placement validation failed: {}", e);
-            process::exit(1);
-        }
-    };
-
-    let requested_origin = match calculate_centered_origin(layout.usable_area, body_size) {
-        Ok(pt) => pt,
-        Err(e) => {
-            eprintln!("\n[ERROR] Failed to calculate centered origin: {}", e);
-            process::exit(1);
-        }
-    };
+    let valid_bounds = checked_probe_bounds(layout.usable_area)?;
+    let requested_origin = calculate_centered_origin(layout.usable_area, body_size)?;
 
     if let Some(ref pm) = layout.primary_monitor {
         println!(
@@ -303,26 +417,15 @@ fn main() {
         );
     }
 
-    // Optional startup delay (for testing focus behavior during mapping)
-    if let Some(delay) = delay_secs {
-        println!("\n[Startup Delay]");
-        println!(
-            "  Waiting {} second(s) before creating and mapping probe window...",
-            delay
-        );
-        thread::sleep(Duration::from_secs(delay));
-    }
-
-    // 3. Create managed borderless window
-    let mut probe_window =
-        match ManagedProbeWindow::create(&conn, screen.root, alpha_vis.visual_id, requested_origin)
-        {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("[ERROR] Failed to create managed probe window: {}", e);
-                process::exit(1);
-            }
-        };
+    // Save each successful resource immediately so all later failures reach ordered cleanup.
+    *body_resource = Some(ManagedProbeWindow::create(
+        conn,
+        screen.root,
+        alpha_vis.visual_id,
+        requested_origin,
+    )?);
+    let probe_window = body_resource.as_mut().unwrap();
+    owner.publish_body(conn, probe_window.window)?;
 
     println!("\n[Window Creation]");
     println!(
@@ -338,27 +441,13 @@ fn main() {
     println!("  Input shape: X11 Shape extension applied to body silhouette and test patch");
     println!("  Awaiting MapNotify confirmation from window manager...");
 
-    // 4. Initialize double-buffered renderer
-    let mut renderer = match Renderer::new(&conn, probe_window.window, probe_window.colormap) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[ERROR] Failed to initialize renderer: {}", e);
-            if let Err(cleanup) = probe_window.destroy(&conn) {
-                eprintln!("[ERROR] Window cleanup failed: {cleanup}");
-            }
-            process::exit(1);
-        }
-    };
-
-    // Perform initial paint (fatal on failure)
-    if let Err(e) = renderer.paint(&conn, probe_window.window) {
-        eprintln!("[ERROR] Initial paint failed: {}", e);
-        let _ = x11::resource::cleanup_all([
-            Box::new(|| renderer.destroy(&conn)),
-            Box::new(|| probe_window.destroy(&conn)),
-        ]);
-        process::exit(1);
-    }
+    *renderer_resource = Some(Renderer::new(
+        conn,
+        probe_window.window,
+        probe_window.colormap,
+    )?);
+    let renderer = renderer_resource.as_mut().unwrap();
+    renderer.paint(conn, probe_window.window)?;
 
     println!("\n[Running Probe]");
     if let Some(sec) = duration_secs {
@@ -369,37 +458,19 @@ fn main() {
         );
     }
 
-    let mut runtime = ProbeRuntime::new();
-    let result = run_probe(
-        &conn,
+    run_probe(
+        conn,
         screen,
         duration_secs,
         &atoms,
         selected_monitor,
-        &mut probe_window,
-        &mut renderer,
-        &mut runtime,
+        probe_window,
+        renderer,
+        runtime,
+        owner,
         valid_bounds,
         layout.usable_area,
-    );
-    let outcome = finish_probe_with(result, || {
-        abort_layer(&mut runtime.layers, "shutdown");
-        runtime.correction = None;
-        let cancellation = runtime.cancel(&conn, &mut probe_window, "shutdown");
-        let cleanup = x11::resource::cleanup_all([
-            Box::new(|| cancellation),
-            Box::new(|| renderer.destroy(&conn)),
-            Box::new(|| probe_window.destroy(&conn)),
-        ]);
-        if runtime.pointer.is_grabbed() {
-            eprintln!("[ERROR] Pointer release remains unconfirmed; connection teardown is best effort only");
-        }
-        cleanup
-    });
-    if outcome.is_err() {
-        process::exit(1);
-    }
-    println!("  Probe exited cleanly.");
+    )
 }
 
 /// Cleanup always runs; a fatal host error retains diagnostic priority over cleanup failures.
@@ -1113,6 +1184,7 @@ fn run_probe(
     window: &mut ManagedProbeWindow,
     renderer: &mut Renderer,
     runtime: &mut ProbeRuntime,
+    owner: &mut ControlWindow,
     initial_bounds: crate::geometry::ValidOriginBounds,
     initial_area: crate::geometry::Rect,
 ) -> Result<(), HostError> {
@@ -1121,19 +1193,11 @@ fn run_probe(
     let mut usable_area = initial_area;
     let mut bounds = initial_bounds;
     let mut buffered_event = None;
-    let start = Instant::now();
-    let duration_deadline = duration_secs
-        .map(|sec| {
-            start
-                .checked_add(Duration::from_secs(sec))
-                .ok_or("Duration exceeds supported monotonic deadline")
-        })
-        .transpose()?;
+    let duration_deadline = probe_duration_deadline(Instant::now(), duration_secs)?;
     loop {
         let now = Instant::now();
         if duration_deadline.is_some_and(|dl| now >= dl) {
-            abort_layer(&mut runtime.layers, "duration expiry");
-            runtime.cancel(conn, window, "duration expiry")?;
+            // Ordered owner cleanup publishes Closing before layer/input teardown.
             return Ok(());
         }
         if runtime
@@ -1215,10 +1279,15 @@ fn run_probe(
             );
         }
 
+        publish_ready_if(runtime.body, || owner.publish_ready(conn))?;
         let batch = drain_events_bounded(&mut buffered_event, 64, || {
             conn.poll_for_event_with_sequence()
         })?;
         for (event, sequence) in batch {
+            if owner.handle_event(conn, &event)? {
+                println!("[LIFECYCLE] Control endpoint lost; shutting down without reacquisition");
+                return Ok(());
+            }
             // Preserve the original fatal diagnostic even if release/cleanup also fails.
             if let Event::Error(error) = &event {
                 return Err(format!("Asynchronous X11 error: {error:?}").into());
@@ -1617,12 +1686,17 @@ fn run_probe(
             }
         }
 
+        publish_ready_if(runtime.body, || owner.publish_ready(conn))?;
         if let Some(popup) = runtime.menu.as_mut() {
             popup.repaint_if_changed(conn, runtime.interaction.state())?;
         }
         // Look one event ahead before the batch-end flush. An interruption at the
         // batch boundary must discard the coalesced move just like one within a batch.
         if let Some((event, sequence)) = conn.poll_for_event_with_sequence()? {
+            if owner.handle_event(conn, &event)? {
+                println!("[LIFECYCLE] Control endpoint lost; shutting down without reacquisition");
+                return Ok(());
+            }
             if runtime.apply_safety(Instant::now(), Some(sequence)) {
                 runtime.cancel(
                     conn,
@@ -1630,7 +1704,8 @@ fn run_probe(
                     "QueryPointer confirmed initiating button released",
                 )?;
             }
-            let interrupted = interrupts_pending_movement(&event, root, window.window, atoms);
+            let interrupted = owner.is_lifecycle_event(&event)
+                || interrupts_pending_movement(&event, root, window.window, atoms);
             buffered_event = Some((event, sequence));
             if !interrupted {
                 runtime.flush_move(conn, window)?;
@@ -1653,38 +1728,75 @@ fn run_probe(
             buffered_event = Some(event);
             continue;
         }
-        let now = Instant::now();
-        let timeout = [
-            duration_deadline,
-            runtime.confirmation_deadline,
-            runtime.correction.map(|(_, dl)| dl),
-            runtime.safety.deadline,
-            runtime.layers.deadline(),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|dl| dl.saturating_duration_since(now))
-        .min();
-        let timeout_ms = timeout.map_or(-1, |duration| {
-            duration.as_millis().min(i32::MAX as u128) as i32
-        });
-        let mut pfd = PollFd {
-            fd: conn.stream().as_raw_fd(),
-            events: POLLIN,
-            revents: 0,
-        };
-        let result = unsafe { poll(&mut pfd, 1, timeout_ms) };
-        if result < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error.into());
-            }
-        } else if pfd.revents & (0x0008 | 0x0010 | 0x0020) != 0 {
-            return Err(
-                format!("X11 socket unavailable (poll revents=0x{:x})", pfd.revents).into(),
-            );
-        }
+        let timeout = probe_deadline(runtime, duration_deadline);
+        wait_x11(conn, timeout)?;
     }
+}
+
+fn probe_duration_deadline(
+    start: Instant,
+    seconds: Option<u64>,
+) -> Result<Option<Instant>, HostError> {
+    seconds
+        .map(|sec| {
+            start
+                .checked_add(Duration::from_secs(sec))
+                .ok_or_else(|| "Duration exceeds supported monotonic deadline".into())
+        })
+        .transpose()
+}
+
+fn probe_deadline(runtime: &ProbeRuntime, duration: Option<Instant>) -> Option<Instant> {
+    [
+        duration,
+        runtime.confirmation_deadline,
+        runtime.correction.map(|(_, dl)| dl),
+        runtime.safety.deadline,
+        runtime.layers.deadline(),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+fn publish_ready_if(
+    body: BodyAvailability,
+    publish: impl FnOnce() -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    if body == BodyAvailability::Ready {
+        publish()?;
+    }
+    Ok(())
+}
+
+fn wait_x11(
+    conn: &x11rb::rust_connection::RustConnection,
+    deadline: Option<Instant>,
+) -> Result<(), HostError> {
+    conn.flush()?;
+    let timeout_ms = deadline.map_or(-1, |deadline| {
+        // Round up: a sub-millisecond remaining interval should not spin on poll(0).
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as i32
+    });
+    let mut pfd = PollFd {
+        fd: conn.stream().as_raw_fd(),
+        events: POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { poll(&mut pfd, 1, timeout_ms) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    } else if pfd.revents & (0x0008 | 0x0010 | 0x0020) != 0 {
+        return Err(format!("X11 socket unavailable (poll revents=0x{:x})", pfd.revents).into());
+    }
+    Ok(())
 }
 
 /// Drains available X11 events into a bounded batch, prepending any previously buffered event.
@@ -4231,5 +4343,228 @@ mod cli_tests {
         let error = parse_args(["--unknown"]).unwrap_err();
         assert!(error.0.contains("Unknown option: '--unknown'"));
         assert_eq!(error.exit_code() as i32, 2);
+    }
+}
+
+#[cfg(test)]
+mod ownership_integration_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn ownership_then_delay_without_body_then_initialization_and_duration() {
+        let start = Instant::now();
+        let mut state = (Vec::new(), start, false);
+        let outcome = owner_startup_with(
+            &mut state,
+            |state| {
+                state.0.push("acquire");
+                Ok(Acquisition::Owned)
+            },
+            |state| {
+                assert_eq!(state.0, ["acquire"]);
+                assert!(!state.2, "no body during delay");
+                state.0.push("delay");
+                state.1 += Duration::from_secs(20);
+                Ok(())
+            },
+            |state| {
+                assert_eq!(state.0, ["acquire", "delay"]);
+                state.2 = true;
+                state.0.push("body/renderer");
+                state.1 += Duration::from_secs(2); // ordinary initialization precedes run_probe
+                let deadline = probe_duration_deadline(state.1, Some(5))?.unwrap();
+                assert_eq!(deadline, start + Duration::from_secs(27));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, Acquisition::Owned);
+        assert!(state.2);
+    }
+
+    #[test]
+    fn duplicate_and_acquisition_failure_cannot_delay_or_create_body() {
+        assert_eq!(
+            owner_startup_with(
+                &mut (),
+                |_| Ok(Acquisition::Duplicate),
+                |_| panic!("duplicate delay"),
+                |_| panic!("duplicate body")
+            )
+            .unwrap(),
+            Acquisition::Duplicate
+        );
+        let error = owner_startup_with(
+            &mut (),
+            |_| Err("ungrab failed".into()),
+            |_| panic!("failed acquisition delay"),
+            |_| panic!("failed acquisition body"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "ungrab failed");
+    }
+
+    #[test]
+    fn loss_during_delay_blocks_body_and_reaches_cleanup() {
+        let calls = RefCell::new(Vec::new());
+        let result = owner_startup_with(
+            &mut (),
+            |_| Ok(Acquisition::Owned),
+            |_| Err("selection lost during delay".into()),
+            |_| panic!("body after loss"),
+        );
+        let error = finish_probe_with(result.map(|_| ()), || {
+            owner_cleanup_with(
+                &mut (),
+                |_| {
+                    calls.borrow_mut().push("closing check");
+                    Ok(())
+                },
+                || {
+                    calls.borrow_mut().push("empty body cleanup");
+                    Ok(())
+                },
+                |_| {
+                    calls.borrow_mut().push("control destroy");
+                    Ok(())
+                },
+                || {
+                    calls.borrow_mut().push("flush");
+                    Ok(())
+                },
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "selection lost during delay");
+        assert_eq!(
+            *calls.borrow(),
+            [
+                "closing check",
+                "empty body cleanup",
+                "control destroy",
+                "flush"
+            ]
+        );
+    }
+
+    #[test]
+    fn closing_precedes_teardown_and_control_is_last_even_after_failures() {
+        for original_failure in [false, true] {
+            let calls = RefCell::new(Vec::new());
+            let result = if original_failure {
+                Err("original runtime failure".into())
+            } else {
+                Ok(())
+            };
+            let error = finish_probe_with(result, || {
+                owner_cleanup_with(
+                    &mut (),
+                    |_| {
+                        calls.borrow_mut().push("closing");
+                        Err("closing failure".into())
+                    },
+                    || {
+                        x11::resource::cleanup_all([
+                            Box::new(|| {
+                                calls.borrow_mut().push("input/popup");
+                                Err("release failure".into())
+                            })
+                                as Box<dyn FnOnce() -> Result<(), HostError>>,
+                            Box::new(|| {
+                                calls.borrow_mut().push("renderer");
+                                Err("renderer failure".into())
+                            }),
+                            Box::new(|| {
+                                calls.borrow_mut().push("body");
+                                Ok(())
+                            }),
+                        ])
+                    },
+                    |_| {
+                        calls.borrow_mut().push("control");
+                        Err("destroy failure".into())
+                    },
+                    || {
+                        calls.borrow_mut().push("flush");
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                if original_failure {
+                    "original runtime failure"
+                } else {
+                    "closing failure"
+                }
+            );
+            assert_eq!(
+                *calls.borrow(),
+                [
+                    "closing",
+                    "input/popup",
+                    "renderer",
+                    "body",
+                    "control",
+                    "flush"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn ready_publication_follows_existing_map_and_correction_truth() {
+        let mut runtime = ProbeRuntime::new();
+        let mut window = tests::test_window();
+        let bounds = crate::geometry::ValidOriginBounds::new(0, 50, 0, 50);
+        let actual = crate::geometry::Rect::new(100, 100, 160, 160);
+        let writes = Cell::new(0);
+        let publish = || {
+            writes.set(writes.get() + 1);
+            Ok(())
+        };
+        publish_ready_if(runtime.body, publish).unwrap();
+        assert_eq!(writes.get(), 0);
+        assert_eq!(
+            probe_deadline(&runtime, None),
+            None,
+            "map wait has no timeout or idle polling"
+        );
+        runtime.body = BodyAvailability::Validating; // native map/workspace gate in run_probe
+        runtime
+            .placement_with(&mut window, actual, &bounds, |_, target| {
+                assert_eq!(target, Point::new(50, 50));
+                Ok(())
+            })
+            .unwrap();
+        publish_ready_if(runtime.body, publish).unwrap();
+        assert_eq!(writes.get(), 0);
+        let deadline = runtime.correction.unwrap().1;
+        runtime
+            .check_correction(deadline, Point::new(50, 50), &bounds)
+            .unwrap();
+        publish_ready_if(runtime.body, publish).unwrap();
+        assert_eq!(writes.get(), 1);
+        assert!(publish_ready_if(runtime.body, || Err("descriptor write failed".into())).is_err());
+        for state in [
+            BodyAvailability::AwaitingMap,
+            BodyAvailability::Unavailable,
+            BodyAvailability::Validating,
+            BodyAvailability::Destroyed,
+        ] {
+            publish_ready_if(state, || panic!("unready publication")).unwrap();
+        }
+    }
+
+    #[test]
+    fn duration_is_optional_and_does_not_add_map_timeout() {
+        let runtime = ProbeRuntime::new();
+        assert_eq!(probe_duration_deadline(Instant::now(), None).unwrap(), None);
+        assert_eq!(probe_deadline(&runtime, None), None);
+        let deadline = probe_duration_deadline(Instant::now(), Some(30)).unwrap();
+        assert_eq!(probe_deadline(&runtime, deadline), deadline);
+        assert!(probe_duration_deadline(Instant::now(), Some(u64::MAX)).is_err());
     }
 }

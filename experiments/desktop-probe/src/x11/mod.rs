@@ -1,3 +1,4 @@
+pub mod control;
 pub mod menu;
 pub mod monitors;
 pub mod pointer;
