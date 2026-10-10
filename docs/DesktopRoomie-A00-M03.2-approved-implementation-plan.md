@@ -6,6 +6,8 @@
 >
 > **Stage-E owner-approved amendment and acceptance (2026-10-10):** The original Section 5 Hide/Show owner deadline of 1 s is superseded **for standalone Show only** by **admission +2500 ms**, including 500 ms slower-host margin. Hide remains 1 s, Bring Top remains 2 s pending a separate Stage G composition decision, caller remains 4 s and geometry confirmation remains 150 ms. Accepted executable `174d8a92574e16768330fb3c315578b105e4b698`, [matching CI 38085985756](https://github.com/zNe4/DesktopRoomie/actions/runs/38085985756) (299 tests). The real Openbox dual-monitor failure was caused by an admitted Show reaching socket wait without immediate owner progression; the accepted correction services Show after control routing and after event batches, retaining checked MapWindow and the fixed no-extension deadline. See [STATUS](STATUS.md). This dated exception does not authorize F/G/H.
 
+> **Owner-approved Openbox off-workspace amendment (2026-10-10):** Stage-F candidate `2424c8887d83d1e503caba326cd512d036639c3e` passed source/CI review ([38089949879](https://github.com/zNe4/DesktopRoomie/actions/runs/38089949879), 332 passed, 0 failed) and initial same-workspace checks, but failed H15 with `HIDE=7`: Iconic + Unmapped + no HIDDEN on body workspace 0/current workspace 1. It is **not accepted**; A–E remain accepted at `174d8a92574e16768330fb3c315578b105e4b698`, G remains blocked, and no final M03.2 acceptance exists. The [Openbox evidence and approved request matrix](host/OPENBOX.md#openbox-off-workspace-visibility-amendment-2026-10-10) supersede the original uniform ICCCM Hide/MapWindow Show assumptions: retain those primitives for current/all-desktop cases; use checked root-directed EWMH ADD-HIDDEN for off-workspace Hide and REMOVE-HIDDEN for genuinely minimized off-workspace Show, without MapWindow. This is WM-directed state change, never direct HIDDEN property mutation. The manual ADD/REMOVE experiments and failed off-workspace MapWindow Show are separate from executable acceptance. No deadline amendment or implementation authorization accompanies this docs-only checkpoint.
+
 ---
 
 # DesktopRoomie A00-M03.2 — Revised read-only implementation plan
@@ -318,7 +320,7 @@ An exact duplicate of the active request is ignored; the original will produce o
 - Caller deadline: four seconds from beginning discovery after connection establishment.
 - Discovery, validation, sending, and response waiting share that budget.
 - There is no acceptance acknowledgement or separate acceptance timeout.
-- Hide/Show owner deadline: admission plus one second.
+- Hide owner deadline: admission plus 1000 ms; standalone Show: admission plus 2500 ms under the Stage-E amendment.
 - Bring Top total deadline: admission plus two seconds; visibility uses at most the first second, and layer work retains its one-second maximum capped by the total deadline.
 - Existing 150 ms geometry confirmation remains; do not dispatch correction without its full confirmation interval remaining.
 - No event, phase notification, or duplicate extends a deadline.
@@ -381,7 +383,7 @@ Validate → reserve → input fence and checked cancellation
 → fresh classification → request actual minimization if needed
 → observe → terminal result
 
-Exact request:
+Current/all-desktop request (retained):
 
 SendEvent(
   false,
@@ -398,9 +400,9 @@ SendEvent(
 Use checked x11rb transport. There is no EWMH source field in this ICCCM message.
 
 - Already coherently minimized: idempotent after settling input obligations.
-- Off-workspace without HIDDEN: send the minimization request, even if WM_STATE is already Iconic.
+- Off-workspace without HIDDEN: send checked root-directed EWMH `_NET_WM_STATE ADD _NET_WM_STATE_HIDDEN`, even if WM_STATE is already Iconic; use state2=0 and application source indication 1. See the [exact envelope and host evidence](host/OPENBOX.md#openbox-off-workspace-visibility-amendment-2026-10-10).
 - Success requires fresh Iconic + Unmapped + HIDDEN evidence.
-- If Openbox ignores the off-workspace request or cannot distinguish minimization, timeout and stop for host/architecture review. Do not substitute direct HIDDEN writes or workspace movement.
+- The original off-workspace ICCCM path failed H15 and triggered host/architecture review. The approved Openbox correction is the WM-directed EWMH request above, not a direct HIDDEN write or workspace movement. If the amended request cannot produce fresh coherent minimization, fail within the unchanged deadline and stop for review.
 - Never use withdrawal or application UnmapWindow as Hide.
 - On failure, restore body input only after coherent local visibility and placement validation; otherwise keep it unavailable.
 - No taskbar/pager state mutations accompany Hide.
@@ -411,7 +413,8 @@ Show ensures that the body is not minimized, rather than requiring NormalState e
 
 ### Behavior
 
-- Coherently minimized: keep input disabled, ensure _NET_WM_USER_TIME=0, then issue one checked MapWindow.
+- Coherently minimized, current/all-desktops: keep input disabled, ensure _NET_WM_USER_TIME=0, then issue one checked MapWindow.
+- Coherently minimized, other workspace on Openbox: keep input disabled and send one checked root-directed EWMH `_NET_WM_STATE REMOVE _NET_WM_STATE_HIDDEN` (state2=0, application source indication 1); **do not issue MapWindow**. The current executable lacks this path; the owner manual experiment confirmed the request semantics, while existing off-workspace MapWindow Show failed with `SHOW=7`.
 - Off-workspace and not minimized: do not map or deiconify it. Return qualified success after preservation checks.
 - Locally not minimized and Ready: fresh verification, then no-op.
 - Incoherent/current-workspace unavailability: observe within the deadline; do not infer minimization.
@@ -425,7 +428,7 @@ No MapRaised, activation, focus, keyboard grab, or stacking request.
 After actual restoration:
 
 - Current/all-desktops: require no HIDDEN, Normal + Viewable, and validated placement.
-- Other workspace: allow either coherent off-workspace representation above, including Iconic + Unmapped + no HIDDEN. Do not require a transition to Normal merely for success.
+- Other workspace: require fresh no HIDDEN and a coherent off-workspace not-minimized representation above, including Iconic + Unmapped + no HIDDEN; original body workspace and user current workspace must remain unchanged. Do not require a transition to Normal merely for success.
 
 For Show, snapshot the fresh effective layer and body workspace. Require them to remain unchanged at completion. Reject a contradictory/unverifiable layer baseline.
 
@@ -458,7 +461,7 @@ The visibility stage preserves workspace but does not enforce Show’s unchanged
 |---|---|
 | Locally visible Normal/Below | Existing Above transition |
 | Locally visible Above | Fresh confirmation, no mutation |
-| Minimized Above | Map, confirm not minimized, re-observe Above; add only if necessary |
+| Minimized Above | Restore using the approved local/off-workspace primitive, confirm not minimized, re-observe Above; add only if necessary |
 | Minimized Normal/Below | Restore, then Above |
 | Off-workspace Iconic/Unmapped without HIDDEN | Do not map; operate through the existing layer controller there |
 | Off-workspace Normal/non-viewable without HIDDEN | Same |
@@ -570,7 +573,7 @@ Source paths are relative to experiments/desktop-probe/src/.
 |---|---|
 | New control.rs | Pure command/result types, exact message/marker codecs, correlation, combined visibility classification, phases/deadlines. No mutable ticket/replay state. Own protocol and pure classification/composition tests. |
 | New x11/control.rs | Atoms, InputOnly resources, timestamp probe, guarded acquisition, descriptor/marker validation, direct request/reply transport, caller wait and cleanup. Own injected acquisition/lifecycle/peer-failure tests. |
-| New x11/visibility.rs | Strict WM_STATE/map/HIDDEN/workspace observation, capability validation, iconify request and non-activating MapWindow. Own decoding and request-envelope tests. |
+| New x11/visibility.rs | Strict WM_STATE/map/HIDDEN/workspace observation, capability validation, local ICCCM iconify/non-activating MapWindow and Openbox off-workspace EWMH ADD/REMOVE-HIDDEN requests. Own decoding and request-envelope tests. |
 | main.rs | Pure CLI parser, roles, acquired Starting delay, startup cleanup scope, structured layer results, remote operation orchestration, input fence and event/deadline routing. Extend existing closure-based tests. |
 | layer.rs | Bounded entry accepting an outer deadline; retain existing default one-second behavior and transition algorithm. Test deadline capping. |
 | x11/state.rs | Shared strict EWMH decoding and verified not-minimized off-workspace observation path, including Iconic/no-HIDDEN cases. Preserve local viewability and transport rules. |
@@ -610,10 +613,10 @@ Use production helpers with small fake clocks, event queues, property replies, a
 | Deadlines | Single caller deadline; owner deadlines capped; no extension; final fresh observation; no mutation at expiry; owner may complete after caller timeout |
 | Visibility classification | All table combinations, especially Iconic/Unmapped/HIDDEN versus Iconic/Unmapped/other/no-HIDDEN; Normal/non-viewable/other; current-workspace contradictions |
 | Evidence validity | Missing HIDDEN support; absent/malformed EWMH state; malformed WM_STATE; unreadable workspace; no desktop-zero fallback; inconsistent snapshots never succeed |
-| Hide | Local not-minimized→minimized; already minimized; off-workspace Iconic/no-HIDDEN must send; Normal/off-workspace must send; no success until HIDDEN confirmed |
+| Hide | Local ICCCM not-minimized→minimized; already minimized; off-workspace Iconic/no-HIDDEN and coherent Normal/non-viewable/no-HIDDEN must send EWMH ADD-HIDDEN; exact checked envelope; no success until HIDDEN confirmed |
 | Hide failures | Off-workspace iconification ignored; HIDDEN never appears; map/WM/HIDDEN disagreement; send failure; timeout; external unmap/destroy |
 | Hide input | Drag, OpeningRight, Menu and queued automatic capture released first; failed release blocks send; popup cleanup still attempted; batch-boundary motion discarded |
-| Show | Actual minimized restoration; local no-op; off-workspace Iconic/no-HIDDEN and Normal/non-viewable/no-HIDDEN send no MapWindow |
+| Show | Local minimized restoration uses user-time-zero + MapWindow; Openbox genuinely minimized off-workspace restoration uses checked EWMH REMOVE-HIDDEN and no MapWindow; exact envelope, no retry/reset; local no-op; off-workspace Iconic/no-HIDDEN and coherent Normal/non-viewable/no-HIDDEN send no restoration |
 | Show completion | Off-workspace restoration may finish Iconic/no-HIDDEN; local restoration requires Normal/Viewable; layer/workspace preserved; withdrawn body not re-managed |
 | Show geometry | Workarea changed while hidden; one correction; confirmation before input; insufficient remaining budget; correction refusal; retained monitor removed; no caller-workarea correction elsewhere |
 | Bring Top | All layer combinations; actual hidden restoration; off-workspace non-minimized cases layer-only; restoration failure blocks Above; partial restoration/layer result |
@@ -672,7 +675,7 @@ Stop for architecture review if:
 2. Timestamp acquisition requires CurrentTime fallback or unbounded retries.
 3. Server-grab work expands beyond brief ownership arbitration or release cannot be safely attempted.
 4. Openbox cannot distinguish actual minimization from inactive-workspace state using the required evidence.
-5. Off-workspace Hide cannot cause and confirm HIDDEN through the approved ICCCM path.
+5. Off-workspace Hide cannot cause and confirm HIDDEN through the amended Openbox EWMH ADD-HIDDEN path. The original ICCCM-only path already failed this gate; that failure remains recorded in the host amendment.
 6. Restoration needs focus, activation, workspace movement, or re-management.
 7. Off-workspace Above requires weakening managed/not-minimized verification.
 8. Hide can dispatch with unresolved pointer debt or stale input can recreate capture.
@@ -735,7 +738,7 @@ No user-facing choice or protocol mechanism remains unspecified. Independent Cha
 
 New or sharpened stop conditions
 
-The principal additions are inability to obtain a usable real timestamp without fallback/unbounded retry, inability to distinguish off-workspace state from minimization, and inability to minimize an off-workspace body through WM_CHANGE_STATE while confirming HIDDEN.
+The original planning stop conditions included inability to obtain a usable real timestamp without fallback/unbounded retry, inability to distinguish off-workspace state from minimization, and inability to minimize an off-workspace body through WM_CHANGE_STATE while confirming HIDDEN. The last condition was reproduced in F; the dated Openbox amendment above records the approved correction and supersedes the uniform request assumption.
 
 Implementation readiness
 
