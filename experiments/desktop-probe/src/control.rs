@@ -1,5 +1,4 @@
 //! Pure M03.2 wire values and observations. No X11 resources or operations.
-// Visibility foundations remain inert until the later integration stages.
 #![allow(dead_code)]
 
 use std::fmt;
@@ -358,6 +357,37 @@ pub struct ActiveOperation {
     pub stage: Stage,
     pub deadline: std::time::Instant,
     pub detail: Detail,
+    pub show: ShowProgress,
+}
+
+/// Owner-only progression, kept in the transport's single authoritative record.
+/// These are not wire values and retain no completed-request history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShowPhase {
+    #[default]
+    Observe,
+    Fenced,
+    RestoreRequested,
+    EnablingInput,
+    InputRestored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShowBaseline {
+    pub desktop: u32,
+    pub current_desktop: u32,
+    pub layer: LayerObservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShowProgress {
+    pub phase: ShowPhase,
+    pub baseline: Option<ShowBaseline>,
+    pub area: Option<crate::geometry::Rect>,
+    pub correction: Option<(crate::geometry::Point, std::time::Instant)>,
+    pub correction_sent: bool,
+    pub observe: bool,
+    pub layout_interrupted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +441,10 @@ pub fn admit(
                 Command::BringTop => 2,
             }),
         detail: preflight_detail(Reason::Unsupported, Stage::Preflight),
+        show: ShowProgress {
+            observe: true,
+            ..ShowProgress::default()
+        },
     });
     Admission::Admitted
 }

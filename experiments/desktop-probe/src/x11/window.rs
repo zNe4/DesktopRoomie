@@ -56,6 +56,7 @@ pub struct ManagedProbeWindow {
     pub window: Window,
     pub colormap: Colormap,
     pub wm_delete_window: u32,
+    pub wm_protocols: u32,
     pub requested_origin: Point,
     pub confirmed_origin: Point,
     pub in_flight_moves: VecDeque<Point>,
@@ -137,6 +138,7 @@ impl ManagedProbeWindow {
             window,
             colormap,
             wm_delete_window: 0,
+            wm_protocols: 0,
             requested_origin: initial_origin,
             confirmed_origin: initial_origin,
             in_flight_moves: VecDeque::new(),
@@ -144,7 +146,7 @@ impl ManagedProbeWindow {
             width,
             height,
         };
-        let initialization: Result<(u32, u64), Box<dyn std::error::Error>> = (|| {
+        let initialization: Result<(u32, u32, u64), Box<dyn std::error::Error>> = (|| {
             // Set WM_NORMAL_HINTS (UserSpecified position and size) to direct Openbox placement
             let mut size_hints = x11rb::properties::WmSizeHints::new();
             size_hints.position = Some((
@@ -247,12 +249,13 @@ impl ManagedProbeWindow {
             map.check()?;
             conn.flush()?;
 
-            Ok((wm_delete_window, map_sequence))
+            Ok((wm_delete_window, wm_protocols, map_sequence))
         })();
         match initialization {
-            Ok((wm_delete_window, map_sequence)) => Ok((
+            Ok((wm_delete_window, wm_protocols, map_sequence)) => Ok((
                 Self {
                     wm_delete_window,
+                    wm_protocols,
                     ..probe
                 },
                 map_sequence,
@@ -303,6 +306,36 @@ impl ManagedProbeWindow {
         }
         self.in_flight_moves.push_back(target);
         Ok(())
+    }
+
+    /// Show's one necessary correction has a checked dispatch and must retain
+    /// the entire existing confirmation interval inside the owner's deadline.
+    pub fn correct_show_position(
+        &mut self,
+        conn: &impl Connection,
+        target: Point,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+    ) -> Result<Option<std::time::Instant>, Box<dyn std::error::Error>> {
+        i16::try_from(target.x).map_err(|_| "Unsupported X11 movement x coordinate")?;
+        i16::try_from(target.y).map_err(|_| "Unsupported X11 movement y coordinate")?;
+        if !self.in_flight_moves.is_empty() {
+            return Err("Show correction conflicts with pending movement".into());
+        }
+        let now = std::time::Instant::now();
+        let confirmation = now + crate::CONFIRMATION_TIMEOUT;
+        if confirmation > deadline {
+            return Ok(None);
+        }
+        let cookie = conn.configure_window(
+            self.window,
+            &ConfigureWindowAux::new().x(target.x).y(target.y),
+        )?;
+        *dispatched = true;
+        cookie.check()?;
+        self.requested_origin = target;
+        self.in_flight_moves.push_back(target);
+        Ok(Some(confirmation))
     }
 
     /// Records a superseded movement target in a bounded history buffer.
@@ -754,6 +787,7 @@ mod tests {
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
+            wm_protocols: 3,
             requested_origin: Point::new(80, 80),
             confirmed_origin: Point::new(80, 80),
             in_flight_moves: VecDeque::new(),
@@ -805,6 +839,7 @@ mod tests {
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
+            wm_protocols: 3,
             requested_origin: Point::new(100, 100),
             confirmed_origin: Point::new(80, 80),
             in_flight_moves: VecDeque::new(),
@@ -837,6 +872,7 @@ mod tests {
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
+            wm_protocols: 3,
             requested_origin: Point::new(100, 100),
             confirmed_origin: Point::new(100, 100),
             in_flight_moves: VecDeque::new(),
@@ -866,6 +902,7 @@ mod tests {
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
+            wm_protocols: 3,
             requested_origin: Point::new(100, 100),
             confirmed_origin: Point::new(100, 100),
             in_flight_moves: VecDeque::new(),
@@ -914,6 +951,7 @@ mod tests {
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
+            wm_protocols: 3,
             requested_origin: Point::new(120, 120),
             confirmed_origin: Point::new(100, 100),
             in_flight_moves: VecDeque::new(),
@@ -958,6 +996,7 @@ mod tests {
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
+            wm_protocols: 3,
             requested_origin: Point::new(150, 150),
             confirmed_origin: Point::new(80, 80),
             in_flight_moves: VecDeque::new(),
@@ -994,6 +1033,7 @@ mod tests {
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
+            wm_protocols: 3,
             requested_origin: Point::new(50, 50),
             confirmed_origin: Point::new(50, 50),
             in_flight_moves: VecDeque::new(),
@@ -1037,6 +1077,7 @@ mod tests {
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
+            wm_protocols: 3,
             requested_origin: Point::new(50, 50),
             confirmed_origin: Point::new(50, 50),
             in_flight_moves: VecDeque::new(),
@@ -1100,6 +1141,7 @@ mod tests {
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
+            wm_protocols: 3,
             requested_origin: Point::new(100, 100),
             confirmed_origin: Point::new(100, 100),
             in_flight_moves: VecDeque::new(),
@@ -1142,6 +1184,7 @@ mod tests {
             window: 100,
             colormap: 1,
             wm_delete_window: 2,
+            wm_protocols: 3,
             requested_origin: Point::new(100, 100),
             confirmed_origin: Point::new(100, 100),
             in_flight_moves: VecDeque::new(),

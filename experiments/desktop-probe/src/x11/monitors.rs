@@ -71,6 +71,26 @@ pub fn query_desktop_layout(
     atoms: &LayoutAtoms,
     selected: Option<Atom>,
 ) -> Result<DesktopLayout, HostError> {
+    query_layout(conn, root, atoms, selected, false)
+}
+
+/// Control/readiness must never use the diagnostic desktop-zero fallback.
+pub fn query_control_layout(
+    conn: &impl Connection,
+    root: Window,
+    atoms: &LayoutAtoms,
+    selected: Atom,
+) -> Result<DesktopLayout, HostError> {
+    query_layout(conn, root, atoms, Some(selected), true)
+}
+
+fn query_layout(
+    conn: &impl Connection,
+    root: Window,
+    atoms: &LayoutAtoms,
+    selected: Option<Atom>,
+    strict: bool,
+) -> Result<DesktopLayout, HostError> {
     let monitors =
         query_monitors(conn, root).map_err(|e| format!("RandR monitor query failed: {e}"))?;
     let monitor = select_monitor(&monitors, selected)?;
@@ -80,11 +100,11 @@ pub fn query_desktop_layout(
             .reply()?,
     )?;
     let current_desktop = match desktop {
-        None => {
+        None if !strict => {
             eprintln!("[WARN] _NET_CURRENT_DESKTOP absent; using desktop 0");
             0
         }
-        Some(values) if values.len() == 1 => values[0],
+        Some(values) if values.len() == 1 && values[0] != u32::MAX => values[0],
         _ => return Err("Malformed _NET_CURRENT_DESKTOP".into()),
     };
     let property = conn
@@ -144,11 +164,25 @@ fn intersect_workarea(
 
 pub fn cardinal_values(property: &GetPropertyReply) -> Result<Option<Vec<u32>>, HostError> {
     if property.type_ == x11rb::NONE {
-        return Ok(None);
+        return if property.format == 0
+            && property.length == 0
+            && property.value_len == 0
+            && property.bytes_after == 0
+            && property.value.is_empty()
+        {
+            Ok(None)
+        } else {
+            Err("Malformed absent CARDINAL property".into())
+        };
     }
     if property.type_ != AtomEnum::CARDINAL.into()
         || property.format != 32
         || property.bytes_after != 0
+        || property.length != property.value_len
+        || usize::try_from(property.value_len)
+            .ok()
+            .and_then(|n| n.checked_mul(4))
+            != Some(property.value.len())
     {
         return Err("Malformed or truncated CARDINAL property".into());
     }
@@ -263,6 +297,24 @@ mod tests {
         truncated.bytes_after = 0;
         truncated.type_ = AtomEnum::STRING.into();
         assert!(parse_workarea(&truncated, 0).is_err());
+    }
+
+    #[test]
+    fn control_layout_cardinal_lengths_and_absent_encoding_are_strict() {
+        let valid = property(&[0, 0, 100, 100]);
+        for case in 0..5 {
+            let mut reply = valid.clone();
+            match case {
+                0 => reply.length += 1,
+                1 => reply.value_len += 1,
+                2 => {
+                    reply.value.pop();
+                }
+                3 => reply.bytes_after = 4,
+                _ => reply.type_ = x11rb::NONE,
+            }
+            assert!(cardinal_values(&reply).is_err());
+        }
     }
     #[test]
     fn intersections_are_checked_and_never_expand_empty_or_invalid_fit() {

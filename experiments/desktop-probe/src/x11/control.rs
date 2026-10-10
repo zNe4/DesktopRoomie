@@ -498,9 +498,55 @@ impl ControlWindow {
         )
     }
 
-    /// Stage C completes within route_request. Keep shutdown completion explicit for
-    /// an admitted record, without waiting, retrying, or skipping ordered cleanup.
+    pub fn active(&self) -> Option<&ActiveOperation> {
+        self.active.as_ref()
+    }
+
+    pub fn active_mut(&mut self) -> Option<&mut ActiveOperation> {
+        self.active.as_mut()
+    }
+
+    pub fn verify_active_ownership(&mut self, conn: &impl Connection) -> Result<()> {
+        if self.active.is_some()
+            && conn.get_selection_owner(self.selection)?.reply()?.owner
+                != self.descriptor.control_xid
+        {
+            self.owns_selection = false;
+            return Err("Control selection ownership lost during Show".into());
+        }
+        Ok(())
+    }
+
+    pub fn complete(
+        &mut self,
+        conn: &impl Connection,
+        result: control::OperationResult,
+    ) -> Result<()> {
+        let operation = self.active.as_ref().ok_or("Missing admitted operation")?;
+        let response = TerminalResponse {
+            status: result.status(),
+            detail: result.detail(),
+            request_id: operation.request.request_id,
+            control_xid: self.descriptor.control_xid,
+        };
+        finish_active(
+            &mut NativePeer {
+                conn,
+                selection: self.selection,
+            },
+            self.transport,
+            &mut self.active,
+            response,
+        )
+    }
+
+    /// Shutdown attempts one terminal reply without waiting or retrying.
     pub fn finish_remote(&mut self, conn: &impl Connection) -> Result<()> {
+        let selection = self.selection;
+        self.finish_remote_with(&mut NativePeer { conn, selection })
+    }
+
+    fn finish_remote_with(&mut self, host: &mut impl PeerHost) -> Result<()> {
         let Some(operation) = self.active.as_ref() else {
             return Ok(());
         };
@@ -508,13 +554,13 @@ impl ControlWindow {
             status: Status::Closing,
             request_id: operation.request.request_id,
             control_xid: self.descriptor.control_xid,
-            detail: control::preflight_detail(Reason::Closing, Stage::Shutdown),
+            detail: control::Detail {
+                reason: Reason::Closing,
+                stage: Stage::Shutdown,
+                ..operation.detail
+            },
         };
-        let mut host = NativePeer {
-            conn,
-            selection: self.selection,
-        };
-        finish_active(&mut host, self.transport, &mut self.active, response)
+        finish_active(host, self.transport, &mut self.active, response)
     }
 
     /// One existing-size batch at the Closing boundary; never wait for callers or
@@ -918,6 +964,12 @@ fn route_request_with(
         Admission::Reply(status, reason, stage) => {
             (status, control::preflight_detail(reason, stage))
         }
+        Admission::Admitted if request.command == Command::Show => {
+            let operation = active.as_mut().unwrap();
+            operation.stage = Stage::Show;
+            operation.detail = control::preflight_detail(Reason::None, Stage::Show);
+            return Ok(true);
+        }
         Admission::Admitted => (Status::Failed, active.as_ref().unwrap().detail),
     };
     let response = TerminalResponse {
@@ -957,6 +1009,37 @@ impl CallerOutcome {
             Self::NoInstance => "no running instance".into(),
             Self::Protocol => "incompatible, stale, or malformed owner endpoint".into(),
             Self::Lifecycle(lifecycle) => format!("owner is {lifecycle:?}"),
+            Self::Terminal(response)
+                if command == Command::Show && response.status == Status::Success =>
+            {
+                let action = if response.detail.progress.host_mutation_dispatched {
+                    "restored"
+                } else {
+                    "already not minimized"
+                };
+                if response.detail.progress.placement_deferred {
+                    format!("{action} on another workspace; original workspace/layer preserved; placement deferred, input unavailable; not necessarily visible here")
+                } else {
+                    format!("{action} here; original workspace/layer preserved; placement verified, input ready")
+                }
+            }
+            Self::Terminal(response)
+                if command == Command::Show
+                    && response.detail.reason == Reason::ConfirmationTimeout =>
+            {
+                "failed — confirmation timed out; final observations did not prove Show readiness"
+                    .into()
+            }
+            Self::Terminal(response)
+                if command == Command::Show && response.detail.reason == Reason::LayoutChanged =>
+            {
+                "failed — workspace/layout preservation could not be confirmed".into()
+            }
+            Self::Terminal(response)
+                if command == Command::Show && response.detail.reason == Reason::LayerChanged =>
+            {
+                "failed — effective layer changed".into()
+            }
             Self::Terminal(response) => format!(
                 "{:?} — {:?} ({:?})",
                 response.status, response.detail.reason, response.detail.stage
@@ -2455,8 +2538,8 @@ mod transport_tests {
         }
     }
     #[test]
-    fn all_ready_commands_have_one_truthful_unsupported_reply_and_clear_active() {
-        for command in [Command::Hide, Command::Show, Command::BringTop] {
+    fn hide_and_bring_top_have_one_truthful_unsupported_reply_and_clear_active() {
+        for command in [Command::Hide, Command::BringTop] {
             let mut host = Fake::new();
             host.evidence
                 .push_back(Some(evidence(&marker(command).encode().unwrap())));
@@ -2480,6 +2563,122 @@ mod transport_tests {
                 [(1 << 16) | 1, ID as u32, (ID >> 32) as u32, CONTROL, 11]
             );
             assert_eq!(host.log, ["owner", "evidence", "owner", "send"]);
+        }
+    }
+
+    #[test]
+    fn valid_show_is_pending_without_ack_and_gets_one_correlated_terminal() {
+        let mut host = Fake::new();
+        let mut active = None;
+        let req = request(Command::Show);
+        host.route(
+            &mut active,
+            Lifecycle::Ready,
+            false,
+            &request_event(atoms(), CONTROL, req).unwrap(),
+        )
+        .unwrap();
+        assert!(host.sent.is_empty());
+        let operation = active.unwrap();
+        assert_eq!(operation.request, req);
+        assert_eq!(operation.stage, Stage::Show);
+        assert_eq!(operation.deadline, host.now + Duration::from_secs(1));
+        assert_eq!(operation.detail.reason, Reason::None);
+        finish_active(&mut host, atoms(), &mut active, response()).unwrap();
+        assert!(active.is_none());
+        let reply = host.sent[0];
+        let terminal = TerminalResponse::decode(&reply.data.as_data32()).unwrap();
+        assert_eq!(reply.window, req.reply_xid);
+        assert_eq!(terminal.request_id, req.request_id);
+        assert_eq!(terminal.control_xid, CONTROL);
+        assert!(finish_active(&mut host, atoms(), &mut active, response()).is_err());
+        assert_eq!(host.sent.len(), 1);
+    }
+
+    #[test]
+    fn shutdown_at_each_show_phase_replies_once_with_progress_then_clears_record() {
+        for phase in [
+            control::ShowPhase::Observe,
+            control::ShowPhase::Fenced,
+            control::ShowPhase::RestoreRequested,
+            control::ShowPhase::EnablingInput,
+        ] {
+            let mut host = Fake::new();
+            let mut endpoint = ControlWindow::candidate(0, CONTROL, 11, 50, 51, 52);
+            endpoint.transport = atoms();
+            endpoint.descriptor = owner();
+            host.route(
+                &mut endpoint.active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, request(Command::Show)).unwrap(),
+            )
+            .unwrap();
+            let active = endpoint.active_mut().unwrap();
+            active.show.phase = phase;
+            active.detail.progress.host_mutation_dispatched = matches!(
+                phase,
+                control::ShowPhase::RestoreRequested | control::ShowPhase::EnablingInput
+            );
+            let progress = active.detail.progress;
+            endpoint.finish_remote_with(&mut host).unwrap();
+            endpoint.finish_remote_with(&mut host).unwrap();
+            assert!(endpoint.active().is_none());
+            assert_eq!(host.sent.len(), 1);
+            let response = TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap();
+            assert_eq!(response.status, Status::Closing);
+            assert_eq!(response.detail.reason, Reason::Closing);
+            assert_eq!(response.detail.stage, Stage::Shutdown);
+            assert_eq!(response.detail.progress, progress);
+            assert_eq!(response.request_id, ID);
+        }
+    }
+
+    #[test]
+    fn caller_gone_before_show_admission_creates_no_operation_or_reply() {
+        let mut host = Fake::new();
+        host.evidence.push_back(None);
+        let mut active = None;
+        host.route(
+            &mut active,
+            Lifecycle::Ready,
+            false,
+            &request_event(atoms(), CONTROL, request(Command::Show)).unwrap(),
+        )
+        .unwrap();
+        assert!(active.is_none());
+        assert!(host.sent.is_empty());
+    }
+
+    #[test]
+    fn show_diagnostics_distinguish_location_dispatch_timeout_and_drift() {
+        for (elsewhere, dispatched, expected) in [
+            (false, true, "restored here"),
+            (false, false, "already not minimized here"),
+            (true, true, "restored on another workspace"),
+            (true, false, "already not minimized on another workspace"),
+        ] {
+            let mut terminal = response();
+            terminal.status = Status::Success;
+            terminal.detail.progress.host_mutation_dispatched = dispatched;
+            terminal.detail.progress.placement_deferred = elsewhere;
+            let diagnostic = CallerOutcome::Terminal(terminal).diagnostic(Command::Show);
+            assert!(diagnostic.contains(expected));
+            if elsewhere {
+                assert!(diagnostic.contains("not necessarily visible here"));
+            }
+        }
+        for (reason, expected) in [
+            (Reason::ConfirmationTimeout, "timed out"),
+            (Reason::LayoutChanged, "workspace/layout"),
+            (Reason::LayerChanged, "layer changed"),
+            (Reason::Unverifiable, "Unverifiable"),
+        ] {
+            let mut terminal = response();
+            terminal.detail.reason = reason;
+            assert!(CallerOutcome::Terminal(terminal)
+                .diagnostic(Command::Show)
+                .contains(expected));
         }
     }
     #[test]
@@ -2582,8 +2781,10 @@ mod transport_tests {
             &request_event(atoms(), CONTROL, req).unwrap(),
         )
         .unwrap();
+        assert_eq!(host.sent.len(), 2);
+        assert_eq!(active.unwrap().request, req); // replay is a new pending admission
+        finish_active(&mut host, atoms(), &mut active, response()).unwrap();
         assert_eq!(host.sent.len(), 3);
-        assert!(active.is_none());
     }
     #[test]
     fn admission_deadline_is_fixed_at_admission_and_not_extended_by_duplicates() {
@@ -2647,7 +2848,10 @@ mod transport_tests {
                 false,
                 &request_event(atoms(), CONTROL, request(Command::Show)).unwrap(),
             );
-            assert_eq!(result.is_err(), failure);
+            assert!(result.is_ok()); // Show admission never sends a terminal reply
+            assert!(active.is_some());
+            let completion = finish_active(&mut host, atoms(), &mut active, response());
+            assert_eq!(completion.is_err(), failure);
             assert!(active.is_none());
             assert_eq!(host.sent.len(), 1);
             assert_eq!(

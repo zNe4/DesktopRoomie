@@ -1,5 +1,4 @@
-//! Stage D foundations only: observations are candidates, never operation confirmations.
-//! No production command dispatch calls this module's mutation helpers.
+//! Strict native visibility evidence and checked nonactivating requests.
 #![allow(dead_code)]
 
 use x11rb::connection::Connection;
@@ -292,30 +291,74 @@ enum VisibilityRequest {
 }
 
 fn checked_request(conn: &impl Connection, request: VisibilityRequest) -> Result<(), HostError> {
-    match request {
+    checked_request_marked(conn, request, &mut false)
+}
+
+fn checked_request_marked(
+    conn: &impl Connection,
+    request: VisibilityRequest,
+    dispatched: &mut bool,
+) -> Result<(), HostError> {
+    let cookie = match request {
         VisibilityRequest::Iconify {
             destination,
             propagate,
             mask,
             event,
-        } => conn
-            .send_event(propagate, destination, mask, event)?
-            .check()?,
+        } => conn.send_event(propagate, destination, mask, event)?,
         VisibilityRequest::UserTime {
             body,
             property,
             mode,
             type_,
             data,
-        } => conn
-            .change_property32(mode, body, property, type_, &data)?
-            .check()?,
-        VisibilityRequest::Map { body } => conn.map_window(body)?.check()?,
-    }
+        } => conn.change_property32(mode, body, property, type_, &data)?,
+        VisibilityRequest::Map { body } => conn.map_window(body)?,
+    };
+    *dispatched = true;
+    cookie.check()?;
     Ok(())
 }
 
 impl VisibilityAtoms {
+    /// One shared deadline, checked separately before both native mutations.
+    /// A checked acknowledgement is not WM confirmation. Mark dispatch before
+    /// checking, since a failed check cannot establish that the request had no effect.
+    pub fn request_restore_before(
+        &self,
+        conn: &impl Connection,
+        body: Window,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+    ) -> Result<bool, HostError> {
+        self.restore_before_with(
+            body,
+            deadline,
+            dispatched,
+            std::time::Instant::now,
+            |request, dispatched| checked_request_marked(conn, request, dispatched),
+        )
+    }
+
+    fn restore_before_with(
+        &self,
+        body: Window,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+        mut now: impl FnMut() -> std::time::Instant,
+        mut checked: impl FnMut(VisibilityRequest, &mut bool) -> Result<(), HostError>,
+    ) -> Result<bool, HostError> {
+        let mut mapped = false;
+        self.restore_with(body, |request| {
+            if now() >= deadline {
+                return Ok(());
+            }
+            mapped |= matches!(request, VisibilityRequest::Map { .. });
+            checked(request, dispatched)
+        })?;
+        Ok(mapped)
+    }
+
     pub fn request_iconify(
         &self,
         conn: &impl Connection,
@@ -360,6 +403,82 @@ impl VisibilityAtoms {
 mod tests {
     use super::*;
     use crate::control::{Reason, Visibility};
+
+    #[test]
+    fn fixed_restore_deadline_is_checked_before_each_native_request() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        for expire_after_user_time in [false, true] {
+            let start = Instant::now();
+            let clock = Cell::new(start);
+            let deadline = start + Duration::from_secs(1);
+            let mut dispatched = false;
+            let mut calls = vec![];
+            let mapped = atoms()
+                .restore_before_with(
+                    100,
+                    deadline,
+                    &mut dispatched,
+                    || clock.get(),
+                    |request, sent| {
+                        *sent = true;
+                        calls.push(match request {
+                            VisibilityRequest::UserTime { data: [0], .. } => "zero",
+                            VisibilityRequest::Map { body: 100 } => "map",
+                            _ => panic!("unexpected mutation"),
+                        });
+                        if expire_after_user_time {
+                            clock.set(deadline);
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert!(dispatched);
+            assert_eq!(mapped, !expire_after_user_time);
+            assert_eq!(
+                calls,
+                if expire_after_user_time {
+                    vec!["zero"]
+                } else {
+                    vec!["zero", "map"]
+                }
+            );
+        }
+        let deadline = Instant::now();
+        let mut dispatched = false;
+        assert!(!atoms()
+            .restore_before_with(
+                100,
+                deadline,
+                &mut dispatched,
+                || deadline,
+                |_, _| panic!("expired mutation")
+            )
+            .unwrap());
+        assert!(!dispatched);
+    }
+
+    #[test]
+    fn unsent_request_error_does_not_invent_host_dispatch_or_retry() {
+        let now = std::time::Instant::now();
+        let mut dispatched = false;
+        let mut calls = 0;
+        assert!(atoms()
+            .restore_before_with(
+                100,
+                now + std::time::Duration::from_secs(1),
+                &mut dispatched,
+                || now,
+                |_, _| {
+                    calls += 1;
+                    Err("send failed before native cookie".into())
+                }
+            )
+            .is_err());
+        assert_eq!(calls, 1);
+        assert!(!dispatched);
+    }
 
     fn atoms() -> VisibilityAtoms {
         VisibilityAtoms {
