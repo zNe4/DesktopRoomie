@@ -515,8 +515,19 @@ impl OperationResult {
         if status == Status::Success
             && (detail.reason != Reason::None
                 || !match command {
-                    Command::Hide => confirmed.visibility == Some(ConfirmedVisibility::Minimized),
-                    Command::Show => not_minimized,
+                    Command::Hide => {
+                        confirmed.visibility == Some(ConfirmedVisibility::Minimized)
+                            && detail.workspace != Workspace::Unknown
+                    }
+                    Command::Show => {
+                        not_minimized
+                            && matches!(
+                                detail.layer,
+                                LayerObservation::Normal
+                                    | LayerObservation::Above
+                                    | LayerObservation::Below
+                            )
+                    }
                     Command::BringTop => not_minimized && confirmed.above,
                 })
         {
@@ -1311,6 +1322,8 @@ mod tests {
     fn confirmed_results_and_partial_progress_remain_distinct() {
         let d = Detail {
             visibility: Visibility::Minimized,
+            workspace: Workspace::Current,
+            layer: LayerObservation::Normal,
             stage: Stage::Hide,
             ..detail()
         };
@@ -1343,6 +1356,7 @@ mod tests {
             let d = Detail {
                 visibility,
                 workspace,
+                layer: LayerObservation::Normal,
                 progress: Progress {
                     not_minimized_confirmed: true,
                     placement_deferred: workspace == Workspace::Other,
@@ -1414,6 +1428,7 @@ mod tests {
         let d = Detail {
             visibility: Visibility::NotMinimizedHere,
             workspace: Workspace::Current,
+            layer: LayerObservation::Normal,
             progress: Progress {
                 not_minimized_confirmed: true,
                 ..Progress::default()
@@ -1439,6 +1454,7 @@ mod tests {
         let d = Detail {
             visibility: Visibility::NotMinimizedElsewhere,
             workspace: Workspace::Other,
+            layer: LayerObservation::Normal,
             progress: Progress {
                 not_minimized_confirmed: true,
                 input_ready: true,
@@ -1468,6 +1484,104 @@ mod tests {
             Err(ResultError::InconsistentConfirmation)
         );
     }
+    #[test]
+    fn hide_success_requires_known_workspace_but_failure_and_partial_do_not() {
+        let d = Detail {
+            visibility: Visibility::Minimized,
+            layer: LayerObservation::Normal,
+            stage: Stage::Hide,
+            progress: Progress {
+                host_mutation_dispatched: true,
+                ..Progress::default()
+            },
+            ..detail()
+        };
+        let c = Confirmation {
+            visibility: Some(ConfirmedVisibility::Minimized),
+            above: false,
+        };
+        assert_eq!(
+            OperationResult::new(Command::Hide, Status::Success, d, c),
+            Err(ResultError::UnconfirmedSuccess)
+        );
+        for status in [Status::Failed, Status::Partial] {
+            let result = OperationResult::new(Command::Hide, status, d, c).unwrap();
+            assert_eq!(result.status(), status);
+            assert_eq!(result.detail(), d);
+        }
+        for workspace in [Workspace::Current, Workspace::Other, Workspace::AllDesktops] {
+            assert_eq!(
+                OperationResult::new(Command::Hide, Status::Success, Detail { workspace, ..d }, c)
+                    .unwrap()
+                    .exit_code(),
+                ExitCode::Success
+            );
+        }
+    }
+
+    #[test]
+    fn show_success_requires_verifiable_layer_but_failure_and_partial_do_not() {
+        for (visibility, confirmed, workspace) in [
+            (
+                Visibility::NotMinimizedHere,
+                ConfirmedVisibility::NotMinimizedHere,
+                Workspace::Current,
+            ),
+            (
+                Visibility::NotMinimizedHere,
+                ConfirmedVisibility::NotMinimizedHere,
+                Workspace::AllDesktops,
+            ),
+            (
+                Visibility::NotMinimizedElsewhere,
+                ConfirmedVisibility::NotMinimizedElsewhere,
+                Workspace::Other,
+            ),
+        ] {
+            let d = Detail {
+                visibility,
+                workspace,
+                stage: Stage::Show,
+                progress: Progress {
+                    not_minimized_confirmed: true,
+                    host_mutation_dispatched: true,
+                    placement_deferred: workspace == Workspace::Other,
+                    input_ready: workspace != Workspace::Other,
+                    ..Progress::default()
+                },
+                ..detail()
+            };
+            let c = Confirmation {
+                visibility: Some(confirmed),
+                above: false,
+            };
+            for layer in [LayerObservation::Unknown, LayerObservation::Conflict] {
+                let d = Detail { layer, ..d };
+                assert_eq!(
+                    OperationResult::new(Command::Show, Status::Success, d, c),
+                    Err(ResultError::UnconfirmedSuccess)
+                );
+                for status in [Status::Failed, Status::Partial] {
+                    let result = OperationResult::new(Command::Show, status, d, c).unwrap();
+                    assert_eq!(result.status(), status);
+                    assert_eq!(result.detail(), d);
+                }
+            }
+            for layer in [
+                LayerObservation::Normal,
+                LayerObservation::Above,
+                LayerObservation::Below,
+            ] {
+                assert_eq!(
+                    OperationResult::new(Command::Show, Status::Success, Detail { layer, ..d }, c)
+                        .unwrap()
+                        .exit_code(),
+                    ExitCode::Success
+                );
+            }
+        }
+    }
+
     #[test]
     fn terminal_and_cli_exit_mapping() {
         for (status, code) in [
