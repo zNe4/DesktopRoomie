@@ -1,6 +1,6 @@
 # Openbox host integration — user-managed setup
 
-**Status (2026-10-10):** M03.2 stages A–D are accepted. Independent second-invocation control CLI now exists: `--hide`, `--show` and `--bring-top` are parsed and transported, but a Ready owner returns `Failed / Unsupported / Preflight` (exit 7). Actual visibility/recovery behavior is not enabled. [STATUS](../STATUS.md) records exact executable and acceptance evidence; Stage E is next and has not started. This page is not a mandatory installation procedure and does not authorize code or host configuration edits.
+**Status (2026-10-10):** stages A–E accepted. Independent `--show` restores an externally minimized managed body, owner-tested on dual/differing monitors with retained main-monitor placement, no focus/layer/workspace drift and preserved input/click-through. Accepted executable `174d8a92574e16768330fb3c315578b105e4b698`. Ready `--hide` and `--bring-top` still return `Failed / Unsupported / Preflight` (exit 7). [STATUS](../STATUS.md) records exact evidence; F is not authorized. This guide does not authorize host-config edits.
 
 DesktopRoomie should own safe same-instance control, WM-state verification, input cleanup and keyboard-focus isolation. Openbox should be reused for *optional* user conveniences such as keyboard shortcuts, application menus and session autostart. The application must be recoverable from its CLI without optional Openbox bindings; no global key-grabbing daemon, tray framework or automatic dotfile rewriting is required.
 
@@ -21,11 +21,29 @@ DesktopRoomie should own safe same-instance control, WM-state verification, inpu
 
 Before making any manual change, inspect the existing configuration, preserve a backup and choose key combinations not already in use. Do not replace Archcraft-specific files with stock defaults. Do not change focus policy, configure global keyboard capture in DesktopRoomie or execute configuration edits as part of the program.
 
-## Future keyboard binding example — not active yet
+## Working manual Show command
 
-Openbox supports `<action name="Execute">` and `<command>` under a `<keybind>` in the `<keyboard>` section. The following is **illustrative only**: the executable path must be replaced, the key combination checked for conflicts, and the actual `--bring-top` operation enabled and accepted first. Insert a keybind **inside the existing `<keyboard>` element**; do not add a second root `<keyboard>` section.
+With the owner running in the same X11 session, use a second terminal. Point `BIN` at the actual compiled executable:
+
+```sh
+BIN=/ABSOLUTE/PATH/TO/desktop-probe
+"$BIN" --show
+```
+
+Show returns success only after fresh readiness evidence. If already visible it is a no-op; on another workspace it does **not** move the body or switch desktops, and local input/placement is deferred. Show cannot raise a covered, already visible Below body. Hide/Bring Top remain Unsupported. No optional shortcut is necessary.
+
+## Optional keyboard binding examples
+
+Openbox supports `<action name="Execute">` and `<command>` under a `<keybind>` in the `<keyboard>` section. The following examples are **illustrative only**: replace the executable path and check keys for conflicts. Show is accepted; Bring Top remains a future example. Insert a keybind **inside the existing `<keyboard>` element**; do not add a second root `<keyboard>` section.
 
 ```xml
+<!-- Optional accepted --show shortcut; user must check W-C-F8 -->
+<keybind key="W-C-F8">
+  <action name="Execute">
+    <command>/ABSOLUTE/PATH/TO/desktop-probe --show</command>
+  </action>
+</keybind>
+
 <!-- FUTURE RECOVERY EXAMPLE: --bring-top currently returns Unsupported on Ready -->
 <keybind key="W-C-F9">
   <action name="Execute">
@@ -46,7 +64,7 @@ After deliberately editing the active `rc.xml`, `openbox --reconfigure` requests
 | `--bring-here` | Move the **same instance** to the current workspace, preserving its layer; hidden-state handling to be designed | M03.3 |
 | `--recover` | Explicitly compose Bring Here and Bring Top, with truthful partial-failure reporting | M03.3 |
 
-The M03.2 command spellings and transport are implemented under the approved design; their visibility/layer operations remain unimplemented. M03.3 commands remain future design scope. Optional Openbox bindings are user-managed and must not be presented as working recovery shortcuts before their operations are accepted.
+M03.2 command spellings and transport are implemented; only Show's real visibility operation has passed acceptance. Hide/Bring Top and M03.3 remain future gated work. Optional bindings stay user-managed; only accepted operations should be recommended as working shortcuts.
 
 ## Official reference material
 
@@ -55,4 +73,4 @@ The M03.2 command spellings and transport are implemented under the approved des
 - [Openbox autostart](https://openbox.org/help/Autostart) — user startup scripts and `openbox-session` distinction.
 - [Openbox configuration](https://openbox.org/help/Configuration) — user/system configuration locations.
 
-Once the actual M03.2 visibility/recovery operations have passed owner host acceptance, update this guide with the verified executable name/path, concrete working commands, an optional keyboard-binding smoke test and any target-specific configuration differences. Once M03.3 is accepted, extend it with Bring Here and combined Recover examples.
+Once Hide and Bring Top pass owner acceptance, extend the examples and record any actual shortcut smoke test (none is claimed for E). After M03.3 acceptance, add Bring Here and Recover.

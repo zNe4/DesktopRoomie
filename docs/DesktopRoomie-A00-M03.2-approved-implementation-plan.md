@@ -3,6 +3,8 @@
 > **Provenance:** Codex prepared this plan against `m03` HEAD `b744272a8d3a60f6a88406c1197dd206550dbcbe`, with no repo changes during planning. ChatGPT independently reviewed both passes and approved the revised design; user authorized publication of this design in the documentation. Its recorded read-only baseline and original concluding 'approval still required' statements are **historical planning text**, superseded solely in status by this header. Technical assumptions remain subject to deterministic checks and the real Openbox acceptance gates in the plan.
 >
 > **Stage decomposition:** Section 16 is Codex's proposed ordered sequence, not the final allocation of bounded implementation stages. Stage contracts and checkpoints will be decided separately. Keep M03.2 Hide/Show/Bring Top independent from M03.3 Bring Here/combined Recover.
+>
+> **Stage-E owner-approved amendment and acceptance (2026-10-10):** The original Section 5 Hide/Show owner deadline of 1 s is superseded **for standalone Show only** by **admission +2500 ms**, including 500 ms slower-host margin. Hide remains 1 s, Bring Top remains 2 s pending a separate Stage G composition decision, caller remains 4 s and geometry confirmation remains 150 ms. Accepted executable `174d8a92574e16768330fb3c315578b105e4b698`, [matching CI 38085985756](https://github.com/zNe4/DesktopRoomie/actions/runs/38085985756) (299 tests). The real Openbox dual-monitor failure was caused by an admitted Show reaching socket wait without immediate owner progression; the accepted correction services Show after control routing and after event batches, retaining checked MapWindow and the fixed no-extension deadline. See [STATUS](STATUS.md). This dated exception does not authorize F/G/H.
 
 ---
 

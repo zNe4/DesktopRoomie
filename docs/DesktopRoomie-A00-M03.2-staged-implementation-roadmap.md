@@ -2,7 +2,7 @@
 
 **Status (2026-10-09): OWNER-APPROVED STAGE DECOMPOSITION; IMPLEMENTATION NOT AUTHORIZED.** This document allocates the approved M03.2 design into eight independently reviewed implementation checkpoints (A–H). Publishing this roadmap **does not authorize M03.2-A**, any Rust changes, subsequent stages, host-configuration edits, or M03.3. A separately approved, bounded Codex assignment is required for every stage.
 
-**Execution checkpoint (2026-10-10):** stages A–D are accepted; see [STATUS](STATUS.md) for exact executable revisions, CI and owner evidence, including the Stage D click-through correction. E is next and has not started. The original roadmap approval above grants no automatic authorization for remaining stages; each still requires a separate assignment.
+**Execution checkpoint (2026-10-10):** stages A–E are accepted. Stage E Show is accepted at `174d8a92574e16768330fb3c315578b105e4b698` with [CI 38085985756](https://github.com/zNe4/DesktopRoomie/actions/runs/38085985756), 299 tests, after dual-monitor host/scheduler correction; [STATUS](STATUS.md) has the full evidence and Stage D click-through history. F Hide is next, but **unstarted and unauthorized**; original roadmap approval grants no standing authorization.
 
 **Technical authority:** [Approved M03.2 implementation plan](DesktopRoomie-A00-M03.2-approved-implementation-plan.md). Its protocol, classification, lifecycle, tests (Section 12), stop rules (Section 14), and host matrix H01–H28 (Section 13) remain authoritative. This roadmap assigns work; it does not replace or silently revise that technical contract. Follow [AGENTS.md](../AGENTS.md), [WORKFLOW.md](WORKFLOW.md), [INVARIANTS.md](INVARIANTS.md), and [STATUS.md](STATUS.md) for execution and acceptance. The original plan's Section 16 is an earlier sequencing proposal; the stage allocation below supersedes **only that implementation ordering**.
 
@@ -110,6 +110,8 @@ Every stage receives **one explicitly approved Codex prompt**, with:
 **Acceptance:** owner **externally minimizes through Openbox**, invokes Show independently, and confirms same body, no focus theft, no workspace/layer change, safe input/geometry; tests also verify an off-workspace not-minimized body is not deiconified. Show must work **before** implementing the Hide command. Cite relevant H05, H12, H16, H17, H23, H24; mark unobserved host representations pending rather than fabricating evidence.
 
 **Stop:** Openbox restoration requires activation, re-management, workspace movement, or untruthful preservation/visibility claims.
+
+**Accepted E execution note:** Real dual-monitor `--show` first failed despite successful raw MapWindow. The owner approved a Show-only fixed admission deadline of **2500 ms** (Hide 1000 ms and Bring Top 2000 ms unchanged). Correction `7bc36fb7786a3b2b89b3e4abe679d6a9cbefafe6` fixed map dispatch phase reporting but did not fix the ~2.518 s owner timeout. Final `174d8a92574e16768330fb3c315578b105e4b698` added immediate post-admission and post-batch Show progression; the owner then confirmed same-body restoration, focus/layer/workspace preservation, existing gestures and transparent-padding click-through on dual and differing-monitor Openbox setups. The scheduler fix, not increasing the deadline, resolved the failing host path. Off-workspace representation variants without a real host reproduction remain automated evidence. Stage G must separately decide how its 2 s composition budget interacts with Show's accepted 2.5 s standalone budget.
 
 ### M03.2-F — Hide (safe only after Show accepted)
 
