@@ -2571,11 +2571,53 @@ fn show_layout_interruption(event: &Event, root: u32, layout: &x11::monitors::La
 }
 
 fn show_deadline(owner: &ControlWindow) -> Option<Instant> {
-    owner.active().map(|op| {
-        op.show
-            .correction
-            .map_or(op.deadline, |(_, dl)| dl.min(op.deadline))
-    })
+    owner.active().map(show_operation_deadline)
+}
+
+fn show_operation_deadline(operation: &control::ActiveOperation) -> Instant {
+    operation
+        .show
+        .correction
+        .map_or(operation.deadline, |(_, dl)| dl.min(operation.deadline))
+}
+
+fn show_service_due(operation: &control::ActiveOperation, now: Instant) -> bool {
+    operation.show.observe || now >= show_operation_deadline(operation)
+}
+
+/// Both routing sites preserve event order and give consumed requests a Show
+/// progression boundary before the next event or socket wait.
+fn route_owner_request_with<O, H>(
+    owner: &mut O,
+    host: &mut H,
+    route: impl FnOnce(&mut O, &mut H) -> Result<bool, HostError>,
+    service: impl FnOnce(&mut O, &mut H) -> Result<(), HostError>,
+) -> Result<bool, HostError> {
+    let consumed = route(owner, host)?;
+    if consumed {
+        service(owner, host)?;
+    }
+    Ok(consumed)
+}
+
+fn route_owner_request<C: Connection>(
+    owner: &mut ControlWindow,
+    event: &Event,
+    host: &mut NativeShow<'_, C>,
+) -> Result<bool, HostError> {
+    route_owner_request_with(
+        owner,
+        host,
+        |owner, host| {
+            owner.route_request(
+                host.conn,
+                event,
+                host.runtime.menu.as_ref().map(|popup| popup.window),
+                host.runtime.layers.pending().is_some(),
+            )
+        },
+        service_owner_show,
+    )
 }
 
 /// A failed enabling check may still have changed native SHAPE. Re-fence once
@@ -2617,13 +2659,7 @@ fn service_owner_show<C: Connection>(
     let Some(operation) = owner.active_mut() else {
         return Ok(());
     };
-    if !operation.show.observe
-        && host.now() < operation.deadline
-        && operation
-            .show
-            .correction
-            .is_none_or(|(_, deadline)| host.now() < deadline)
-    {
+    if !show_service_due(operation, host.now()) {
         return Ok(());
     }
     owner.verify_active_ownership(host.conn)?;
@@ -2856,12 +2892,24 @@ fn run_probe(
             if owner.handle_event(conn, &event)? {
                 return probe_termination_result(ProbeTermination::ControlEndpointLost);
             }
-            if owner.route_request(
-                conn,
+            if route_owner_request(
+                owner,
                 &event,
-                runtime.menu.as_ref().map(|popup| popup.window),
-                runtime.layers.pending().is_some(),
+                &mut NativeShow {
+                    conn,
+                    root,
+                    atoms: &visibility_atoms,
+                    layout_atoms: atoms,
+                    selected_monitor,
+                    window,
+                    runtime,
+                    bounds: &mut bounds,
+                    area: &mut usable_area,
+                },
             )? {
+                if runtime.body == BodyAvailability::Destroyed {
+                    return Ok(());
+                }
                 continue;
             }
             if let Event::Error(error) = &event {
@@ -3332,6 +3380,25 @@ fn run_probe(
             }
         }
 
+        // Notifications in this batch can make Show actionable without leaving
+        // another event to wake the socket. Settle that work before any wait.
+        service_owner_show(
+            owner,
+            &mut NativeShow {
+                conn,
+                root,
+                atoms: &visibility_atoms,
+                layout_atoms: atoms,
+                selected_monitor,
+                window,
+                runtime,
+                bounds: &mut bounds,
+                area: &mut usable_area,
+            },
+        )?;
+        if runtime.body == BodyAvailability::Destroyed {
+            return Ok(());
+        }
         publish_ready_if(runtime.body, || owner.publish_ready(conn))?;
         if let Some(popup) = runtime.menu.as_mut() {
             popup.repaint_if_changed(conn, runtime.interaction.state())?;
@@ -3342,12 +3409,24 @@ fn run_probe(
             if owner.handle_event(conn, &event)? {
                 return probe_termination_result(ProbeTermination::ControlEndpointLost);
             }
-            if owner.route_request(
-                conn,
+            if route_owner_request(
+                owner,
                 &event,
-                runtime.menu.as_ref().map(|popup| popup.window),
-                runtime.layers.pending().is_some(),
+                &mut NativeShow {
+                    conn,
+                    root,
+                    atoms: &visibility_atoms,
+                    layout_atoms: atoms,
+                    selected_monitor,
+                    window,
+                    runtime,
+                    bounds: &mut bounds,
+                    area: &mut usable_area,
+                },
             )? {
+                if runtime.body == BodyAvailability::Destroyed {
+                    return Ok(());
+                }
                 continue;
             }
             if runtime.input_fence.rejects(&event, window.window, sequence) {
@@ -6634,6 +6713,370 @@ mod show_tests {
             }
         );
         control::Detail::decode(d.encode()).unwrap();
+    }
+
+    mod scheduling {
+        use super::*;
+
+        #[derive(Clone, Copy)]
+        enum Queued {
+            Request(control::Request),
+            Ordinary(&'static str),
+            Visible,
+        }
+
+        #[derive(Default)]
+        struct Owner {
+            active: Option<ActiveOperation>,
+            replies: Vec<(Command, Status, Reason, Instant)>,
+        }
+        impl Owner {
+            // Admission is injected at the validated transport boundary. The
+            // scheduling seam and Show readiness/deadline logic are production code.
+            fn route(&mut self, host: &mut Fake, event: Queued) -> Result<bool, HostError> {
+                let Queued::Request(request) = event else {
+                    return Ok(false);
+                };
+                host.step("request")?;
+                match control::admit(&mut self.active, request, Lifecycle::Ready, false, host.now) {
+                    control::Admission::Admitted if request.command == Command::Show => {
+                        host.step("admit")?;
+                        let op = self.active.as_mut().unwrap();
+                        op.stage = control::Stage::Show;
+                        op.detail = control::preflight_detail(Reason::None, control::Stage::Show);
+                    }
+                    control::Admission::Admitted => {
+                        self.active = None;
+                        self.replies.push((
+                            request.command,
+                            Status::Failed,
+                            Reason::Unsupported,
+                            host.now,
+                        ));
+                    }
+                    control::Admission::Duplicate => host.step("duplicate")?,
+                    control::Admission::Reply(status, reason, _) => {
+                        self.replies
+                            .push((request.command, status, reason, host.now));
+                    }
+                }
+                Ok(true)
+            }
+            fn service(&mut self, host: &mut Fake) -> Result<(), HostError> {
+                let Some(op) = self.active.as_mut() else {
+                    return Ok(());
+                };
+                if !show_service_due(op, host.now) {
+                    return Ok(());
+                }
+                if let Some(result) = service_show_safely_with(op, host)? {
+                    self.replies.push((
+                        Command::Show,
+                        result.status(),
+                        result.detail().reason,
+                        host.now,
+                    ));
+                    self.active = None;
+                }
+                Ok(())
+            }
+        }
+
+        struct Loop {
+            owner: Owner,
+            host: Fake,
+            waits: Vec<Option<Instant>>,
+            event_cost: Duration,
+        }
+        impl Loop {
+            fn new() -> Self {
+                Self {
+                    owner: Owner::default(),
+                    host: minimized(),
+                    waits: vec![],
+                    event_cost: Duration::ZERO,
+                }
+            }
+            fn route(&mut self, event: Queued) -> Result<bool, HostError> {
+                route_owner_request_with(
+                    &mut self.owner,
+                    &mut self.host,
+                    |owner, host| owner.route(host, event),
+                    Owner::service,
+                )
+            }
+            // One outer iteration, including the real bounded drain, both
+            // routing sites, and an injected socket wait (no X server or sleeps).
+            fn iteration(&mut self, queue: &mut VecDeque<Queued>) -> Result<(), HostError> {
+                self.owner.service(&mut self.host)?;
+                for event in
+                    drain_events_bounded(&mut None, 64, || Ok::<_, HostError>(queue.pop_front()))?
+                {
+                    if self.route(event)? {
+                        continue;
+                    }
+                    if self
+                        .owner
+                        .active
+                        .as_ref()
+                        .is_some_and(|op| self.host.now >= show_operation_deadline(op))
+                    {
+                        self.owner.service(&mut self.host)?;
+                    }
+                    match event {
+                        Queued::Ordinary(name) => self.host.step(name)?,
+                        Queued::Visible => {
+                            self.host.current = visible();
+                            if let Some(op) = self.owner.active.as_mut() {
+                                op.show.observe = true;
+                            }
+                        }
+                        Queued::Request(_) => unreachable!("control event consumed"),
+                    }
+                    self.host.now += self.event_cost;
+                }
+                self.owner.service(&mut self.host)?;
+                if let Some(event) = queue.pop_front() {
+                    if !self.route(event)? {
+                        queue.push_front(event); // one-event lookahead retained
+                    }
+                    return Ok(()); // lookahead continues the outer loop
+                }
+                let deadline = probe_deadline(&self.host.runtime, None)
+                    .into_iter()
+                    .chain(self.owner.active.as_ref().map(show_operation_deadline))
+                    .min();
+                self.host.step("wait")?;
+                self.waits.push(deadline);
+                Ok(())
+            }
+        }
+
+        fn request(command: Command, id: u64) -> Queued {
+            Queued::Request(control::Request {
+                command,
+                request_id: id,
+                reply_xid: 88,
+                epoch: 7,
+            })
+        }
+
+        #[test]
+        fn only_show_event_starts_restore_before_socket_wait_without_another_event() {
+            let mut scheduler = Loop::new();
+            let admission = scheduler.host.now;
+            assert!(scheduler.owner.active.is_none());
+            let mut queue = VecDeque::from([request(Command::Show, 99)]);
+            scheduler.iteration(&mut queue).unwrap();
+            assert!(queue.is_empty());
+            assert_eq!(scheduler.host.count("user_time_zero"), 1);
+            assert_eq!(scheduler.host.count("map"), 1);
+            assert_eq!(scheduler.host.now, admission);
+            assert_eq!(
+                scheduler.owner.active.unwrap().show.phase,
+                ShowPhase::RestoreRequested
+            );
+            assert_eq!(
+                scheduler.waits,
+                [Some(admission + Duration::from_millis(2500))]
+            );
+            assert_eq!(scheduler.host.log.last(), Some(&"wait"));
+        }
+
+        #[test]
+        fn early_show_preserves_events_before_and_after_it_in_the_drained_batch() {
+            let mut scheduler = Loop::new();
+            let mut queue = VecDeque::from([
+                Queued::Ordinary("before_first"),
+                Queued::Ordinary("before_second"),
+                request(Command::Show, 99),
+                Queued::Ordinary("after_first"),
+                Queued::Ordinary("after_second"),
+            ]);
+            scheduler.iteration(&mut queue).unwrap();
+            assert!(queue.is_empty());
+            assert_eq!(
+                scheduler.host.log,
+                [
+                    "before_first",
+                    "before_second",
+                    "request",
+                    "admit",
+                    "observe",
+                    "fence",
+                    "empty",
+                    "release",
+                    "observe",
+                    "user_time_zero",
+                    "map",
+                    "after_first",
+                    "after_second",
+                    "wait",
+                ]
+            );
+        }
+
+        #[test]
+        fn duplicate_does_not_retry_map_and_competing_request_is_busy() {
+            let mut scheduler = Loop::new();
+            let admission = scheduler.host.now;
+            let mut queue = VecDeque::from([
+                request(Command::Show, 99),
+                request(Command::Show, 99),
+                request(Command::Show, 100),
+            ]);
+            scheduler.iteration(&mut queue).unwrap();
+            assert_eq!(scheduler.host.count("map"), 1);
+            assert_eq!(scheduler.host.count("user_time_zero"), 1);
+            assert_eq!(scheduler.host.count("duplicate"), 1);
+            assert_eq!(scheduler.host.count("observe"), 2);
+            assert_eq!(
+                scheduler.owner.replies,
+                [(Command::Show, Status::Busy, Reason::Busy, admission)]
+            );
+            let op = scheduler.owner.active.unwrap();
+            assert_eq!(op.request.request_id, 99);
+            assert_eq!(op.deadline, admission + Duration::from_millis(2500));
+        }
+
+        #[test]
+        fn unsupported_commands_still_reply_without_show_mutations() {
+            let mut scheduler = Loop::new();
+            let mut queue =
+                VecDeque::from([request(Command::Hide, 1), request(Command::BringTop, 2)]);
+            scheduler.iteration(&mut queue).unwrap();
+            assert_eq!(scheduler.owner.replies.len(), 2);
+            for (reply, command) in scheduler
+                .owner
+                .replies
+                .iter()
+                .zip([Command::Hide, Command::BringTop])
+            {
+                assert_eq!(
+                    (reply.0, reply.1, reply.2),
+                    (command, Status::Failed, Reason::Unsupported)
+                );
+                assert_eq!(reply.1.exit_code() as i32, 7);
+            }
+            assert!(scheduler.owner.active.is_none());
+            assert_eq!(scheduler.host.count("map"), 0);
+            assert_eq!(scheduler.host.count("user_time_zero"), 0);
+            assert_eq!(scheduler.waits, [None]);
+        }
+
+        #[test]
+        fn lookahead_request_gets_the_same_immediate_progression_before_outer_continue() {
+            let mut scheduler = Loop::new();
+            let admission = scheduler.host.now;
+            let mut queue = VecDeque::from(vec![Queued::Ordinary("before"); 64]);
+            queue.push_back(request(Command::Show, 99));
+            scheduler.iteration(&mut queue).unwrap();
+            assert!(queue.is_empty());
+            assert_eq!(scheduler.host.count("before"), 64);
+            assert_eq!(scheduler.host.count("map"), 1);
+            assert_eq!(scheduler.host.now, admission);
+            assert!(scheduler.waits.is_empty()); // lookahead continues, after servicing
+            assert_eq!(scheduler.host.log.last(), Some(&"map"));
+            scheduler.iteration(&mut queue).unwrap();
+            assert_eq!(
+                scheduler.waits,
+                [Some(admission + Duration::from_millis(2500))]
+            );
+            assert_eq!(scheduler.host.count("map"), 1);
+        }
+
+        #[test]
+        fn idle_and_pending_show_reach_socket_wait_without_repeated_work_or_spin() {
+            let mut scheduler = Loop::new();
+            scheduler.iteration(&mut VecDeque::new()).unwrap();
+            assert_eq!(scheduler.waits, [None]);
+            assert_eq!(scheduler.host.log, ["wait"]);
+            scheduler
+                .iteration(&mut VecDeque::from([request(Command::Show, 99)]))
+                .unwrap();
+            let observations = scheduler.host.count("observe");
+            let deadline = scheduler.owner.active.unwrap().deadline;
+            scheduler.iteration(&mut VecDeque::new()).unwrap();
+            assert_eq!(scheduler.waits, [None, Some(deadline), Some(deadline)]);
+            assert_eq!(scheduler.host.count("observe"), observations);
+            assert_eq!(scheduler.host.count("map"), 1);
+            assert!(!show_service_due(
+                scheduler.owner.active.as_ref().unwrap(),
+                scheduler.host.now
+            ));
+        }
+
+        #[test]
+        fn last_batch_notification_finishes_show_before_socket_wait() {
+            let mut scheduler = Loop::new();
+            scheduler
+                .iteration(&mut VecDeque::from([
+                    request(Command::Show, 99),
+                    Queued::Visible,
+                ]))
+                .unwrap();
+            assert!(scheduler.owner.active.is_none());
+            assert_eq!(scheduler.owner.replies[0].1, Status::Success);
+            assert_eq!(scheduler.host.count("map"), 1);
+            assert_eq!(scheduler.host.count("enable"), 1);
+            assert_eq!(scheduler.waits, [None]);
+        }
+
+        #[test]
+        fn correction_wait_uses_150_ms_and_wakes_without_another_event() {
+            let mut scheduler = Loop::new();
+            let admission = scheduler.host.now;
+            scheduler.host.bounds = ValidOriginBounds::new(200, 500, 200, 500);
+            scheduler
+                .iteration(&mut VecDeque::from([
+                    request(Command::Show, 99),
+                    Queued::Visible,
+                ]))
+                .unwrap();
+            let op = scheduler.owner.active.unwrap();
+            let confirmation = admission + Duration::from_millis(150);
+            assert_eq!(op.show.correction.unwrap().1, confirmation);
+            assert_eq!(scheduler.waits, [Some(confirmation)]);
+            assert_eq!(scheduler.host.count("enable"), 0);
+            scheduler.host.now = confirmation - Duration::from_millis(1);
+            assert!(!show_service_due(&op, scheduler.host.now));
+            scheduler.host.now = confirmation;
+            scheduler.iteration(&mut VecDeque::new()).unwrap();
+            assert!(scheduler.owner.active.is_none());
+            assert_eq!(scheduler.owner.replies[0].1, Status::Success);
+            assert_eq!(scheduler.host.count("correct"), 1);
+            assert_eq!(scheduler.host.count("enable"), 1);
+            assert_eq!(scheduler.host.count("map"), 1);
+            assert_eq!(scheduler.waits.last(), Some(&None));
+        }
+
+        #[test]
+        fn sustained_batches_cannot_starve_fixed_show_deadline() {
+            let mut scheduler = Loop::new();
+            let admission = scheduler.host.now;
+            scheduler.event_cost = Duration::from_millis(10);
+            let mut queue = VecDeque::from([request(Command::Show, 99)]);
+            queue.extend(vec![Queued::Ordinary("traffic"); 400]);
+            while scheduler.owner.replies.is_empty() {
+                scheduler.iteration(&mut queue).unwrap();
+            }
+            assert_eq!(
+                scheduler.owner.replies,
+                [(
+                    Command::Show,
+                    Status::Failed,
+                    Reason::ConfirmationTimeout,
+                    admission + Duration::from_millis(2500)
+                )]
+            );
+            assert!(!queue.is_empty());
+            assert!(scheduler.host.count("traffic") > 64);
+            assert!(scheduler.waits.is_empty());
+            assert_eq!(scheduler.host.count("user_time_zero"), 1);
+            assert_eq!(scheduler.host.count("map"), 1);
+            assert_eq!(scheduler.host.count("correct"), 0);
+            assert_eq!(scheduler.host.count("enable"), 0);
+        }
     }
 
     #[test]
