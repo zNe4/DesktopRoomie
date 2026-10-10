@@ -1198,7 +1198,7 @@ fn run_probe(
         let now = Instant::now();
         if duration_deadline.is_some_and(|dl| now >= dl) {
             // Ordered owner cleanup publishes Closing before layer/input teardown.
-            return Ok(());
+            return probe_termination_result(ProbeTermination::DurationExpired);
         }
         if runtime
             .layers
@@ -1285,8 +1285,7 @@ fn run_probe(
         })?;
         for (event, sequence) in batch {
             if owner.handle_event(conn, &event)? {
-                println!("[LIFECYCLE] Control endpoint lost; shutting down without reacquisition");
-                return Ok(());
+                return probe_termination_result(ProbeTermination::ControlEndpointLost);
             }
             // Preserve the original fatal diagnostic even if release/cleanup also fails.
             if let Event::Error(error) = &event {
@@ -1677,7 +1676,7 @@ fn run_probe(
                     if ev.window == window.window
                         && ev.data.as_data32()[0] == window.wm_delete_window =>
                 {
-                    return Ok(());
+                    return probe_termination_result(ProbeTermination::WmClose);
                 }
                 Event::Error(error) => {
                     return Err(format!("Asynchronous X11 error: {error:?}").into())
@@ -1694,8 +1693,7 @@ fn run_probe(
         // batch boundary must discard the coalesced move just like one within a batch.
         if let Some((event, sequence)) = conn.poll_for_event_with_sequence()? {
             if owner.handle_event(conn, &event)? {
-                println!("[LIFECYCLE] Control endpoint lost; shutting down without reacquisition");
-                return Ok(());
+                return probe_termination_result(ProbeTermination::ControlEndpointLost);
             }
             if runtime.apply_safety(Instant::now(), Some(sequence)) {
                 runtime.cancel(
@@ -1730,6 +1728,24 @@ fn run_probe(
         }
         let timeout = probe_deadline(runtime, duration_deadline);
         wait_x11(conn, timeout)?;
+    }
+}
+
+/// Exit classification shared by both control-event routing sites and normal completion.
+#[derive(Clone, Copy)]
+enum ProbeTermination {
+    DurationExpired,
+    WmClose,
+    ControlEndpointLost,
+}
+
+fn probe_termination_result(reason: ProbeTermination) -> Result<(), HostError> {
+    match reason {
+        ProbeTermination::DurationExpired | ProbeTermination::WmClose => Ok(()),
+        ProbeTermination::ControlEndpointLost => {
+            println!("[LIFECYCLE] Control endpoint lost; shutting down without reacquisition");
+            Err("Control endpoint lost during running probe".into())
+        }
     }
 }
 
@@ -4511,6 +4527,72 @@ mod ownership_integration_tests {
                     "flush"
                 ]
             );
+        }
+    }
+
+    #[test]
+    fn runtime_control_loss_remains_primary_through_ordered_cleanup() {
+        for cleanup_fails in [false, true] {
+            let calls = RefCell::new(Vec::new());
+            // Both the event batch and one-event lookahead use this exit classification
+            // after the native ownership check has verified actual endpoint loss.
+            let result = probe_termination_result(ProbeTermination::ControlEndpointLost);
+            let error = finish_probe_with(result, || {
+                owner_cleanup_with(
+                    &mut (),
+                    |_| {
+                        calls.borrow_mut().push("closing ownership check");
+                        Ok(()) // already lost: native closing skips descriptor publication
+                    },
+                    || {
+                        calls.borrow_mut().push("input/popup/renderer/body");
+                        if cleanup_fails {
+                            Err("body cleanup failed".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    |_| {
+                        calls.borrow_mut().push("control cleanup");
+                        if cleanup_fails {
+                            Err("control cleanup failed".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    || {
+                        calls.borrow_mut().push("flush");
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Control endpoint lost during running probe"
+            );
+            assert_eq!(
+                *calls.borrow(),
+                [
+                    "closing ownership check",
+                    "input/popup/renderer/body",
+                    "control cleanup",
+                    "flush"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn duration_and_wm_close_remain_normal_completion_after_cleanup() {
+        for reason in [ProbeTermination::DurationExpired, ProbeTermination::WmClose] {
+            let cleaned = Cell::new(false);
+            finish_probe_with(probe_termination_result(reason), || {
+                cleaned.set(true);
+                Ok(())
+            })
+            .unwrap();
+            assert!(cleaned.get());
         }
     }
 
