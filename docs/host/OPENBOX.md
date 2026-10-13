@@ -1,6 +1,6 @@
 # Openbox host integration — user-managed setup
 
-**Status (recorded 2026-10-13):** stages A–F are accepted at latest executable `ccd01915bef13850067391f70f1524362a6440dc`. The original failed candidate and manual experiments remain below, separate from the [corrected Stage-F acceptance](#stage-f-acceptance-recorded-2026-10-13). G is unblocked for separate planning/assignment, requiring its own model/effort decision and bounded authorization; Bring Top remains Unsupported (exit 7). H remains blocked on G; no final M03.2 acceptance exists. [STATUS](../STATUS.md) records the checkpoint. This guide authorizes neither executable work nor host-config edits.
+**Status (recorded 2026-10-13):** stages A–F are accepted at latest executable `ccd01915bef13850067391f70f1524362a6440dc`. The original failed candidate and manual experiments remain below, separate from the [corrected Stage-F acceptance](#stage-f-acceptance-recorded-2026-10-13). The owner-approved [Stage-G plan](../DesktopRoomie-A00-M03.2-stage-G-approved-plan.md) is ready for separately authorized G1/G2/G3 implementation, with G1 next; Bring Top remains Unsupported (exit 7) in the accepted executable. H remains blocked on G acceptance; no final M03.2 acceptance exists. [STATUS](../STATUS.md) records the checkpoint. This guide authorizes neither executable work nor host-config edits.
 
 DesktopRoomie should own safe same-instance control, WM-state verification, input cleanup and keyboard-focus isolation. Openbox should be reused for *optional* user conveniences such as keyboard shortcuts, application menus and session autostart. The application must be recoverable from its CLI without optional Openbox bindings; no global key-grabbing daemon, tray framework or automatic dotfile rewriting is required.
 
@@ -84,7 +84,7 @@ Hide still requires **fresh coherent Iconic + Unmapped + HIDDEN**. Off-workspace
 
 These are **WM-directed ClientMessages**, not `ChangeProperty` on `_NET_WM_STATE` or directly writing HIDDEN. They do not authorize workspace movement, activation, MapRaised, SetInputFocus, `_NET_ACTIVE_WINDOW` or re-management. Fresh observation proves success; request acknowledgement does not. Preserve input fencing, layer/workspace preservation and existing failure handling.
 
-No deadline amendment: Hide owner **1000 ms**, Show owner **2500 ms**, Bring Top **2000 ms pending Stage G review**, caller **4000 ms**, geometry confirmation **150 ms**. The EWMH request must fit the existing fixed operation deadline: **no retries and no deadline reset**.
+At the accepted Stage-F executable, Hide owner is **1000 ms**, Show owner **2500 ms**, Bring Top is still Unsupported with its pre-G **2000 ms** placeholder, caller is **4000 ms**, and geometry confirmation is **150 ms**. The later owner-approved Stage-G plan changes only future Bring Top timing: **3500 ms owner**, **2500 ms visibility cutoff**, up to **1000 ms layer work capped by the owner deadline**, and **5000 ms Bring Top caller**; Hide/Show callers remain 4000 ms. These G values are approved design, not implemented F behavior. All paths retain **no retries and no deadline reset**.
 
 This split is approved from direct Openbox evidence and must not be generalized to all X11 WMs. Other WMs require their own evidence before assuming ADD/REMOVE-HIDDEN semantics. Successful manual requests alone did not establish executable acceptance; the corrected DesktopRoomie paths subsequently passed the separate source/CI and owner native gates below.
 
@@ -139,7 +139,7 @@ H09 preserves the **effective Above/Normal/Below layer**, not exact relative z-o
 
 Accepted F scope: managed Hide; same-workspace/current/all-desktop ICCCM minimization; Openbox off-workspace ADD-HIDDEN minimization; retained local Stage-E Show; Openbox off-workspace REMOVE-HIDDEN Show; input fencing and deferred local input restoration; workspace/effective-layer preservation; truthful second-process terminal results. Native observations above establish the exercised Openbox cases; all-desktop and synthetic failure variants remain deterministic evidence unless separately observed.
 
-Stages **A–F are accepted**. **G is unblocked for separate planning/assignment**, requiring its own model/effort decision and bounded authorization. Bring Top remains unsupported; **H remains blocked on G** and no final M03.2 acceptance exists. This record claims neither other-WM verification nor Wayland support, and does not authorize further implementation or host configuration changes.
+Stages **A–F are accepted**. The [Stage-G plan](../DesktopRoomie-A00-M03.2-stage-G-approved-plan.md) and D1/D2 timing are owner-approved; **G1 is the next separately authorized implementation checkpoint**, followed by gated G2/G3. Bring Top remains unsupported in the accepted executable; **H remains blocked on G acceptance** and no final M03.2 acceptance exists. This record claims neither other-WM verification nor Wayland support, and this documentation checkpoint itself authorizes no executable or host-configuration changes.
 
 ## Configuration levels
 
@@ -201,7 +201,7 @@ After deliberately editing the active `rc.xml`, `openbox --reconfigure` requests
 | `--bring-here` | Move the **same instance** to the current workspace, preserving its layer; hidden-state handling to be designed | M03.3 |
 | `--recover` | Explicitly compose Bring Here and Bring Top, with truthful partial-failure reporting | M03.3 |
 
-M03.2 command spellings and transport are implemented; Hide and local/off-workspace Show have passed acceptance at `ccd0191…`. Bring Top remains Unsupported and requires a separately authorized G assignment; M03.3 remains future work. Optional bindings stay user-managed; only accepted operations should be recommended as working shortcuts.
+M03.2 command spellings and transport are implemented; Hide and local/off-workspace Show have passed acceptance at `ccd0191…`. Bring Top remains Unsupported in that executable; its owner-approved G plan proceeds only through separately authorized G1/G2/G3 checkpoints, with G1 next. M03.3 remains future work. Optional bindings stay user-managed; only accepted operations should be recommended as working shortcuts.
 
 ## Official reference material
 
