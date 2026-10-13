@@ -1,6 +1,6 @@
 # Openbox host integration — user-managed setup
 
-**Status (recorded 2026-10-13):** stages A–F are accepted at latest executable `ccd01915bef13850067391f70f1524362a6440dc`. The original failed candidate and manual experiments remain below, separate from the [corrected Stage-F acceptance](#stage-f-acceptance-recorded-2026-10-13). The owner-approved [Stage-G plan](../DesktopRoomie-A00-M03.2-stage-G-approved-plan.md) is ready for separately authorized G1/G2/G3 implementation, with G1 next; Bring Top remains Unsupported (exit 7) in the accepted executable. H remains blocked on G acceptance; no final M03.2 acceptance exists. [STATUS](../STATUS.md) records the checkpoint. This guide authorizes neither executable work nor host-config edits.
+**Status (recorded 2026-10-13):** stages A–G are accepted. Latest owner-tested executable `80d7df4aa1524122bd7c232f5aa09a4e39c8dd9f` supports Bring Top on the body's existing workspace; matching [CI 38468930784](https://github.com/zNe4/DesktopRoomie/actions/runs/38468930784) passed 447 tests, 0 failed. [Stage-G native acceptance](#stage-g-acceptance-recorded-2026-10-13) follows earlier [Stage-F acceptance](#stage-f-acceptance-recorded-2026-10-13); the original failed Stage-F candidate and manual experiments remain preserved as history. H is **unblocked for separately authorized planning but not started**; no final M03.2 acceptance exists. [STATUS](../STATUS.md) records the checkpoint. This guide authorizes neither executable work nor host-config edits.
 
 DesktopRoomie should own safe same-instance control, WM-state verification, input cleanup and keyboard-focus isolation. Openbox should be reused for *optional* user conveniences such as keyboard shortcuts, application menus and session autostart. The application must be recoverable from its CLI without optional Openbox bindings; no global key-grabbing daemon, tray framework or automatic dotfile rewriting is required.
 
@@ -139,7 +139,47 @@ H09 preserves the **effective Above/Normal/Below layer**, not exact relative z-o
 
 Accepted F scope: managed Hide; same-workspace/current/all-desktop ICCCM minimization; Openbox off-workspace ADD-HIDDEN minimization; retained local Stage-E Show; Openbox off-workspace REMOVE-HIDDEN Show; input fencing and deferred local input restoration; workspace/effective-layer preservation; truthful second-process terminal results. Native observations above establish the exercised Openbox cases; all-desktop and synthetic failure variants remain deterministic evidence unless separately observed.
 
-Stages **A–F are accepted**. The [Stage-G plan](../DesktopRoomie-A00-M03.2-stage-G-approved-plan.md) and D1/D2 timing are owner-approved; **G1 is the next separately authorized implementation checkpoint**, followed by gated G2/G3. Bring Top remains unsupported in the accepted executable; **H remains blocked on G acceptance** and no final M03.2 acceptance exists. This record claims neither other-WM verification nor Wayland support, and this documentation checkpoint itself authorizes no executable or host-configuration changes.
+**At the historical Stage-F acceptance checkpoint**, stages A–F were accepted and [Stage-G design](../DesktopRoomie-A00-M03.2-stage-G-approved-plan.md) with D1/D2 was approved; G1 was next and Bring Top was still unsupported **at that F revision**. H was blocked at that time. This historical record remains separate from the later [Stage-G acceptance](#stage-g-acceptance-recorded-2026-10-13). No final M03.2 acceptance exists. This record claims neither other-WM verification nor Wayland support, and this documentation checkpoint itself authorizes no executable or host-configuration changes.
+
+## Stage-G acceptance recorded 2026-10-13
+
+**Decision: A00-M03.2-G ACCEPTED.** This records owner-provided native Openbox evidence after independent exact-commit source/CI review. It is a Stage-G checkpoint, **not final integrated M03.2 acceptance**. No Cargo checks or live X11 experiments were rerun for this later docs-only update.
+
+### Reviewed revisions and CI
+
+| Checkpoint | Exact revision and matching successful CI | Scope |
+| --- | --- | --- |
+| G1 | `ba159932d3245fae438a37896cc68623c3dc75b3`; [CI 38434302376](https://github.com/zNe4/DesktopRoomie/actions/runs/38434302376), 367 passed, 0 failed | Existing layer controller gains bounded/structured outcomes and marked dispatch, plus qualified off-workspace remote reader. Bring Top still Unsupported **at G1**. |
+| G2 | `96de45d3a236a2cdedb1ec74d1a855470b86fa9a`; [CI 38463014850](https://github.com/zNe4/DesktopRoomie/actions/runs/38463014850), 414 passed, 0 failed | Visibility→Above composition, truthful restoration-proof Partial, async admission, CLI exposure, phase-aware routing and approved timing. |
+| **G3 — final accepted executable** | **`80d7df4aa1524122bd7c232f5aa09a4e39c8dd9f`**; [CI 38468930784](https://github.com/zNe4/DesktopRoomie/actions/runs/38468930784), **447 passed, 0 failed** | Additional deterministic failure, lifecycle, transport, pointer, concurrency, deadline and result-invariant hardening, with narrowly tested production fixes. Owner native acceptance followed. |
+
+Accepted G timing: owner Bring Top **3500 ms**, visibility cutoff **admission +2500 ms**, layer deadline `min(layer admission +1000 ms, owner deadline)`, geometry verification **150 ms** inside visibility cutoff, Bring Top caller **5000 ms**; Hide/Show callers remain **4000 ms**. The existing M03.1 layer controller and one remote operation owner are reused; no transport, activation, focus request, generic restack, fullscreen reassertion or retry mechanism was introduced. Logical deadlines assume responsive synchronous X11.
+
+### Owner-observed Openbox matrix
+
+Host: owner's Openbox 3.6.1 / X11 / Picom v13. Native G checks used a single managed body, XID **`56623106`**, on body desktop **0**, with deliberate current desktop **0** or **1**. These XIDs are recorded observations, not portable identifiers.
+
+| Gate | Result | Evidence and scope |
+| --- | --- | --- |
+| **H10** | **PASS** | Local Bring Top from Normal, Below and the already-Above case: exit **0**; final `WM_STATE Normal`, exact `_NET_WM_STATE_ABOVE`, desktop 0, `IsViewable`, focus before/after **58720270**. Layer selections were made through the owner popup. |
+| **H11** | **PASS** | Three genuine local minimized initial layers: `HIDDEN`, `HIDDEN+BELOW`, `HIDDEN+ABOVE`, each `WM_STATE Iconic / IsUnMapped`. Each Hide and subsequent Bring Top returned **0**; all ended `Normal / Above / IsViewable`, desktop 0 with focus unchanged. |
+| **H13** | **PASS** | Naturally observed Openbox off-workspace not-minimized representation `Iconic + IsUnMapped + no HIDDEN`: body desktop **0**, current desktop **1**. Bring Top exit **0** yielded Above without HIDDEN or MapState change; body/current desktops and focus **58720270** remained unchanged. This representation is **native evidence**, not an injected variant. |
+| **H14** | **N/A — not observed** | The alternate `Normal + Unmapped/Unviewable + no HIDDEN` off-workspace representation did **not** naturally appear. Deterministic test coverage is separate; no fabricated native PASS. |
+| **H16** | **PASS** | With a Below body on desktop 0/current 1, remote Hide exit **0** produced `Iconic + IsUnMapped + HIDDEN+BELOW`. Remote Bring Top exit **0** cleared HIDDEN/BELOW and confirmed exact Above while remaining Iconic/Unmapped elsewhere; no workspace transport. |
+| **H17** | **PASS** | During remote recovery body stayed on **0**, current desktop stayed **1**, focus stayed **58720270**. Without another recovery command the owner manually returned to desktop 0 and observed `Normal / Above / IsViewable`. CLI said `placement deferred, input unavailable` while elsewhere. |
+| **H20** | **PASS** | Twenty concurrent Bring Top + Hide rounds: Bring Top exit **0 Success** or **5 Busy**, Hide exit **0** each round; no hang or OutcomeUnknown in pasted outputs. Final body search yielded only XID `56623106` in `Normal / Above / IsViewable` on desktop 0 after normalization. Either concurrent command may finish first; no fixed winner is required. |
+| **H22** | **PASS (owner-reported)** | Owner ran the twenty-round mixed drag/menu/layer/remote exercise and supplied final XID `56623106`, `Normal / Above / IsViewable` on desktop 0. The **individual manual per-round observations were not pasted**; the owner treated the completed exercise as passing. Do not claim individual events were logged. |
+| **H25** | **PASS (owner acceptance)** | With an ordinary application fullscreen, Bring Top exit **0** preserved focus **39845892**, desktop 0, and `Normal / Above / IsViewable`. After exiting fullscreen **without invoking Bring Top again**, the same body properties remained. The supplied X11 log verifies focus/state preservation, but does not separately capture relative visual fullscreen overlap; Above never guarantees fullscreen precedence. |
+
+The owner's off-workspace CLI said: `not minimized + Above confirmed on another workspace; original workspace preserved; placement deferred, input unavailable`. Native evidence confirms WM property states for exercised cases, not generic exact peer z-order or visual precedence over fullscreen.
+
+### Selected E/F regressions on the accepted G executable
+
+- **Local Hide/Show:** both returned **0**; Show reported `restored here; original workspace/layer preserved; placement verified, input ready`. Focus remained **58720270**, with body `WM_STATE Normal / Above / IsViewable` on desktop 0.
+- **Other-workspace Hide/Show:** from body desktop **0**/current desktop **1**, ordinary Openbox representation was `Iconic + IsUnMapped + Above` without HIDDEN. Hide exit **0** added **HIDDEN** while retaining Above; Show exit **0** removed **only HIDDEN**, remaining `Iconic + Above + IsUnMapped`, body/current desktops unchanged. CLI correctly reported deferred placement and input.
+- Earlier Stage-F input, popup and transparent-padding click-through acceptance remains in the [Stage-F record](#stage-f-acceptance-recorded-2026-10-13). Owner declared the final G regression sweep passing; this record does not invent new real-host all-desktops, synthetic failure or monitor-removal checks.
+
+**Boundary/next gate:** accepted Bring Top establishes not-minimized plus freshly confirmed effective **Above on the body's existing workspace**. It does not Bring Here, switch the user's desktop, focus/activate, guarantee caller-workspace visibility, or override fullscreen. Other WMs and Wayland remain unverified. **H is unblocked for separately authorized planning, not yet started or accepted.** Full integrated `ACCEPTANCE-M03.2.md` remains reserved for H; M03.3 Bring Here/Recover remains future. No executable or user Openbox-configuration edits are authorized by this documentation update.
 
 ## Configuration levels
 
@@ -167,11 +207,11 @@ BIN=/ABSOLUTE/PATH/TO/desktop-probe
 "$BIN" --show
 ```
 
-Accepted local Show returns success only after fresh readiness evidence. If already visible it is a no-op; on another workspace it does **not** move the body or switch desktops, and local input/placement is deferred. Show cannot raise a covered, already visible Below body. Genuinely minimized off-workspace Show now uses accepted REMOVE-HIDDEN; Hide is also accepted. Bring Top remains Unsupported. No optional shortcut is necessary.
+Accepted local Show returns success only after fresh readiness evidence. If already visible it is a no-op; on another workspace it does **not** move the body or switch desktops, and local input/placement is deferred. Show cannot raise a covered, already visible Below body. Genuinely minimized off-workspace Show now uses accepted REMOVE-HIDDEN; Hide is also accepted. Accepted Bring Top additionally establishes Above on the existing body workspace without focus/activation or workspace transport; it does not move Vanilla to the caller or override fullscreen. No optional shortcut is necessary.
 
 ## Optional keyboard binding examples
 
-Openbox supports `<action name="Execute">` and `<command>` under a `<keybind>` in the `<keyboard>` section. The following examples are **illustrative only**: replace the executable path and check keys for conflicts. Show is accepted; Bring Top remains a future example. Insert a keybind **inside the existing `<keyboard>` element**; do not add a second root `<keyboard>` section.
+Openbox supports `<action name="Execute">` and `<command>` under a `<keybind>` in the `<keyboard>` section. The following examples are **illustrative only**: replace the executable path and check keys for conflicts. Show and Bring Top are accepted; these examples remain optional, user-managed and not smoke-tested by this documentation-only change. Insert a keybind **inside the existing `<keyboard>` element**; do not add a second root `<keyboard>` section.
 
 ```xml
 <!-- Optional accepted --show shortcut; user must check W-C-F8 -->
@@ -181,7 +221,7 @@ Openbox supports `<action name="Execute">` and `<command>` under a `<keybind>` i
   </action>
 </keybind>
 
-<!-- FUTURE RECOVERY EXAMPLE: --bring-top currently returns Unsupported on Ready -->
+<!-- Optional accepted --bring-top shortcut; user must check W-C-F9 -->
 <keybind key="W-C-F9">
   <action name="Execute">
     <command>/ABSOLUTE/PATH/TO/desktop-probe --bring-top</command>
@@ -201,7 +241,7 @@ After deliberately editing the active `rc.xml`, `openbox --reconfigure` requests
 | `--bring-here` | Move the **same instance** to the current workspace, preserving its layer; hidden-state handling to be designed | M03.3 |
 | `--recover` | Explicitly compose Bring Here and Bring Top, with truthful partial-failure reporting | M03.3 |
 
-M03.2 command spellings and transport are implemented; Hide and local/off-workspace Show have passed acceptance at `ccd0191…`. Bring Top remains Unsupported in that executable; its owner-approved G plan proceeds only through separately authorized G1/G2/G3 checkpoints, with G1 next. M03.3 remains future work. Optional bindings stay user-managed; only accepted operations should be recommended as working shortcuts.
+M03.2 command spellings and transport are implemented; Hide and local/off-workspace Show were accepted at `ccd0191…`, and original-workspace Bring Top now has owner Openbox acceptance at `80d7df4…`. H remains unstarted, M03.2 is not finally accepted, and M03.3 remains future work. Optional bindings stay user-managed; only accepted operations should be recommended as working shortcuts.
 
 ## Official reference material
 
@@ -210,4 +250,4 @@ M03.2 command spellings and transport are implemented; Hide and local/off-worksp
 - [Openbox autostart](https://openbox.org/help/Autostart) — user startup scripts and `openbox-session` distinction.
 - [Openbox configuration](https://openbox.org/help/Configuration) — user/system configuration locations.
 
-Hide and Show are accepted; optional binding changes and shortcut smoke tests remain owner-managed and are not claimed by this record. Once Bring Top passes owner acceptance, extend its example guidance. After M03.3 acceptance, add Bring Here and Recover.
+Hide, Show and original-workspace Bring Top are accepted on the exercised Openbox host; optional binding changes and shortcut smoke tests remain owner-managed and are not claimed by this record. H requires separate approval; Bring Here and Recover are deferred to M03.3.

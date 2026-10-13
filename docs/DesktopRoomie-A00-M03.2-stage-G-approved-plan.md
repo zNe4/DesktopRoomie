@@ -1,6 +1,8 @@
 # DesktopRoomie A00-M03.2-G — approved implementation plan
 
-**Status (owner-approved 2026-10-13): READY FOR BOUNDED IMPLEMENTATION.** Stages A–F remain the accepted executable foundation at `ccd01915bef13850067391f70f1524362a6440dc`. This document records the read-only Stage-G planning pass plus owner decisions D1/D2. It is design authority for separately assigned G1/G2/G3 work, not evidence that Bring Top is implemented or accepted. Bring Top remains Unsupported (exit 7) in the accepted executable; Stage H remains blocked on G acceptance.
+**Current outcome (owner-accepted 2026-10-13): STAGE G ACCEPTED.** This document preserves the originally read-only Stage-G plan and owner-approved D1/D2 decisions as **historical planning authority**. References below to G1 next, readiness for implementation or Bring Top Unsupported describe the original planning checkpoint rather than current behavior. Independently reviewed G1 `ba159932d3245fae438a37896cc68623c3dc75b3` (367 tests), G2 `96de45d3a236a2cdedb1ec74d1a855470b86fa9a` (414 tests), and owner-accepted G3 `80d7df4aa1524122bd7c232f5aa09a4e39c8dd9f` ([CI 38468930784](https://github.com/zNe4/DesktopRoomie/actions/runs/38468930784), 447 passed/0 failed) implemented the plan. [Stage-G native evidence](host/OPENBOX.md#stage-g-acceptance-recorded-2026-10-13) covers H10/H11/H13/H16/H17/H20/H22/H25, H14 not observed. Bring Top is now supported on the existing body workspace. **H is unblocked for separate planning, not started, and no final M03.2 acceptance exists.**
+
+**Historical planning status (2026-10-13 before G implementation):** READY FOR BOUNDED IMPLEMENTATION. A–F were the accepted foundation at `ccd01915bef13850067391f70f1524362a6440dc`. The original document specified separately authorized G1/G2/G3, with Bring Top then Unsupported (exit 7).
 
 **Checkpoint decomposition:** G1 = bounded/structured layer adapter while Bring Top stays Unsupported; G2 = visibility→layer composition and CLI exposure using the approved timing; G3 = scheduler/concurrency/failure hardening before native acceptance.
 
@@ -625,4 +627,4 @@ Final Git state remains clean on m03 at 6d693df5dc55de6ec9f411fc615ec84dde5f1faa
 RECOMMENDATION FOR IMPLEMENTATION:
 READY
 
-Owner-approved decisions: D1—3500 ms Bring Top owner deadline; D2—5000 ms Bring Top caller deadline. G1 is the next bounded implementation checkpoint; this plan itself does not authorize executable changes.
+Historical owner-approved decisions: D1—3500 ms Bring Top owner deadline; D2—5000 ms Bring Top caller deadline. At the original read-only planning checkpoint G1 was next; this historical plan did not itself authorize executable changes. Later implementation and native acceptance are recorded in the current outcome above.
