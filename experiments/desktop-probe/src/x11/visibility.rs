@@ -278,6 +278,12 @@ enum VisibilityRequest {
         mask: EventMask,
         event: ClientMessageEvent,
     },
+    NetWmState {
+        destination: Window,
+        propagate: bool,
+        mask: EventMask,
+        event: ClientMessageEvent,
+    },
     UserTime {
         body: Window,
         property: Atom,
@@ -305,6 +311,12 @@ fn checked_request_marked(
             propagate,
             mask,
             event,
+        }
+        | VisibilityRequest::NetWmState {
+            destination,
+            propagate,
+            mask,
+            event,
         } => conn.send_event(propagate, destination, mask, event)?,
         VisibilityRequest::UserTime {
             body,
@@ -321,6 +333,63 @@ fn checked_request_marked(
 }
 
 impl VisibilityAtoms {
+    /// Openbox off-workspace minimization/deiconification, with no local map,
+    /// user-time write or direct state-property mutation. Acknowledgement is not
+    /// confirmation; the owner consumes the attempt before calling this helper.
+    pub fn request_hidden_before(
+        &self,
+        conn: &impl Connection,
+        root: Window,
+        body: Window,
+        hidden: bool,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+    ) -> Result<bool, HostError> {
+        self.hidden_before_with(
+            root,
+            body,
+            hidden,
+            deadline,
+            dispatched,
+            std::time::Instant::now,
+            |request, sent| checked_request_marked(conn, request, sent),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hidden_before_with(
+        &self,
+        root: Window,
+        body: Window,
+        hidden: bool,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+        now: impl FnOnce() -> std::time::Instant,
+        checked: impl FnOnce(VisibilityRequest, &mut bool) -> Result<(), HostError>,
+    ) -> Result<bool, HostError> {
+        if now() >= deadline {
+            return Ok(false);
+        }
+        let mut sent = false;
+        let result = checked(
+            VisibilityRequest::NetWmState {
+                destination: root,
+                propagate: false,
+                mask: EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+                event: ClientMessageEvent::new(
+                    32,
+                    body,
+                    self.state,
+                    [u32::from(hidden), self.hidden, 0, 1, 0],
+                ),
+            },
+            &mut sent,
+        );
+        *dispatched |= sent;
+        result?;
+        Ok(sent)
+    }
+
     pub fn request_iconify_before(
         &self,
         conn: &impl Connection,
@@ -448,6 +517,103 @@ impl VisibilityAtoms {
 mod tests {
     use super::*;
     use crate::control::{Reason, Visibility};
+
+    #[test]
+    fn hidden_add_remove_envelopes_deadline_and_checked_dispatch_are_exact() {
+        use x11rb::x11_utils::Serialize;
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs(1);
+        for hidden in [true, false] {
+            // Expired, unsent failure, sent/check failure, successful send/check.
+            for case in 0..4 {
+                let mut dispatched = false;
+                let mut calls = 0;
+                let result = atoms().hidden_before_with(
+                    0x12345678,
+                    0x23456789,
+                    hidden,
+                    deadline,
+                    &mut dispatched,
+                    || if case == 0 { deadline } else { start },
+                    |request, sent| {
+                        calls += 1;
+                        let VisibilityRequest::NetWmState {
+                            destination,
+                            propagate,
+                            mask,
+                            event,
+                        } = request
+                        else {
+                            panic!("HIDDEN must use SendEvent, never ChangeProperty/map/iconify")
+                        };
+                        assert_eq!(destination, 0x12345678);
+                        assert!(!propagate);
+                        assert_eq!(u32::from(mask), (1 << 19) | (1 << 20));
+                        // Full 32-byte ClientMessage, including zero sequence/padding.
+                        let mut expected = vec![33, 32, 0, 0];
+                        for word in [
+                            0x23456789,
+                            12, // _NET_WM_STATE
+                            u32::from(hidden),
+                            13, // only HIDDEN, no Above/Below/DEMANDS_ATTENTION
+                            0,  // state2
+                            1,  // application source
+                            0,
+                        ] {
+                            expected.extend(word.to_ne_bytes());
+                        }
+                        assert_eq!(event.serialize().as_slice(), expected);
+                        if case == 1 {
+                            return Err("send failed before cookie".into());
+                        }
+                        *sent = true;
+                        if case == 2 {
+                            return Err("cookie check failed after send".into());
+                        }
+                        Ok(())
+                    },
+                );
+                assert_eq!(calls, usize::from(case != 0), "no fallback or retry");
+                assert_eq!(dispatched, case >= 2);
+                assert_eq!(result.is_err(), case == 1 || case == 2);
+                if case == 0 || case == 3 {
+                    assert_eq!(result.unwrap(), case == 3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_observations_preserve_unrelated_attention_and_layer_atoms() {
+        let atoms = atoms();
+        let attention = 99;
+        let mut observed = observation();
+        observed.desktop = Evidence::Readable(7);
+        observed.current_desktop = Evidence::Readable(2);
+        observed.wm_state = WmState::Iconic;
+        observed.map_state = Evidence::Readable(MapState::Unmapped);
+        for hidden in [false, true, false] {
+            let mut state = vec![atoms.above, attention];
+            if hidden {
+                state.push(atoms.hidden);
+            }
+            observed.state = Evidence::Readable(state.clone());
+            let snapshot = atoms.snapshot(observed.clone(), true);
+            assert_eq!(snapshot.layer, LayerValue::Above);
+            assert_eq!(
+                snapshot.candidate.visibility,
+                if hidden {
+                    Visibility::Minimized
+                } else {
+                    Visibility::NotMinimizedElsewhere
+                }
+            );
+            assert_eq!(
+                snapshot.observation.unwrap().state,
+                Evidence::Readable(state)
+            );
+        }
+    }
 
     #[test]
     fn iconification_deadline_and_dispatch_errors_keep_exact_envelope_and_no_retry() {

@@ -1976,6 +1976,14 @@ trait VisibilityHost {
     /// True only after MapWindow dispatch/check; `dispatched` also retains any
     /// earlier user-time mutation, including on expiry or a native error.
     fn restore(&mut self, deadline: Instant, dispatched: &mut bool) -> Result<bool, HostError>;
+    /// One checked WM-directed HIDDEN request for Openbox off-workspace state.
+    /// True only after dispatch/check; neither ADD nor REMOVE implies success.
+    fn hidden(
+        &mut self,
+        hidden: bool,
+        deadline: Instant,
+        dispatched: &mut bool,
+    ) -> Result<bool, HostError>;
     fn placement(&mut self) -> Result<ShowPlacement, HostError>;
     fn correct(
         &mut self,
@@ -2070,13 +2078,31 @@ fn service_hide_with(
             return service_hide_final(operation, host);
         }
         if operation.hide.phase == HidePhase::Fenced && host.now() < operation.deadline {
-            operation.hide.phase = HidePhase::IconifyAttempted;
+            let elsewhere = snapshot.candidate.visibility == Visibility::NotMinimizedElsewhere;
+            operation.hide.phase = if elsewhere {
+                HidePhase::HiddenAddAttempted
+            } else {
+                HidePhase::IconifyAttempted
+            };
             operation.detail.reason = Reason::X11Failure;
-            if host.iconify(
-                operation.deadline,
-                &mut operation.detail.progress.host_mutation_dispatched,
-            )? {
-                operation.hide.phase = HidePhase::IconifyRequested;
+            let requested = if elsewhere {
+                host.hidden(
+                    true,
+                    operation.deadline,
+                    &mut operation.detail.progress.host_mutation_dispatched,
+                )?
+            } else {
+                host.iconify(
+                    operation.deadline,
+                    &mut operation.detail.progress.host_mutation_dispatched,
+                )?
+            };
+            if requested {
+                operation.hide.phase = if elsewhere {
+                    HidePhase::HiddenAddRequested
+                } else {
+                    HidePhase::IconifyRequested
+                };
             }
             if host.now() >= operation.deadline {
                 return service_hide_final(operation, host);
@@ -2349,15 +2375,32 @@ fn service_show_with(
             if operation.show.phase == ShowPhase::Fenced {
                 operation.detail.reason = Reason::X11Failure;
                 // Never retry, including on a checked native failure.
-                operation.show.phase = ShowPhase::RestoreAttempted;
-                let mapped = host.restore(
-                    operation.deadline,
-                    &mut operation.detail.progress.host_mutation_dispatched,
-                )?;
-                if mapped {
-                    operation.show.phase = ShowPhase::RestoreRequested;
+                let elsewhere = snapshot.evidence.workspace == control::Workspace::Other;
+                operation.show.phase = if elsewhere {
+                    ShowPhase::HiddenRemoveAttempted
+                } else {
+                    ShowPhase::RestoreAttempted
+                };
+                let requested = if elsewhere {
+                    host.hidden(
+                        false,
+                        operation.deadline,
+                        &mut operation.detail.progress.host_mutation_dispatched,
+                    )?
+                } else {
+                    host.restore(
+                        operation.deadline,
+                        &mut operation.detail.progress.host_mutation_dispatched,
+                    )?
+                };
+                if requested {
+                    operation.show.phase = if elsewhere {
+                        ShowPhase::HiddenRemoveRequested
+                    } else {
+                        ShowPhase::RestoreRequested
+                    };
                 }
-                if !mapped || host.now() >= operation.deadline {
+                if !requested || host.now() >= operation.deadline {
                     return service_show_final(operation, host);
                 }
                 // Checked requests may have buffered WM events. Let the loop drain
@@ -2637,6 +2680,24 @@ impl<C: Connection> VisibilityHost for NativeVisibility<'_, C> {
         }
         self.atoms
             .request_restore_before(self.conn, self.window.window, deadline, dispatched)
+    }
+    fn hidden(
+        &mut self,
+        hidden: bool,
+        deadline: Instant,
+        dispatched: &mut bool,
+    ) -> Result<bool, HostError> {
+        if !self.runtime.visibility_dispatch_eligible() {
+            return Err("Off-workspace visibility input fence is not settled".into());
+        }
+        self.atoms.request_hidden_before(
+            self.conn,
+            self.root,
+            self.window.window,
+            hidden,
+            deadline,
+            dispatched,
+        )
     }
     fn placement(&mut self) -> Result<ShowPlacement, HostError> {
         let layout = x11::monitors::query_control_layout(
@@ -6836,6 +6897,24 @@ mod show_tests {
             self.step("map")?;
             Ok(true) // acknowledgement alone deliberately changes no observation
         }
+        fn hidden(
+            &mut self,
+            hidden: bool,
+            deadline: Instant,
+            dispatched: &mut bool,
+        ) -> Result<bool, HostError> {
+            assert!(self.runtime.visibility_dispatch_eligible());
+            if self.now >= deadline {
+                return Ok(false);
+            }
+            *dispatched = true;
+            self.step(if hidden {
+                "add_hidden"
+            } else {
+                "remove_hidden"
+            })?;
+            Ok(true) // the WM's state must arrive through a later fresh observation
+        }
         fn placement(&mut self) -> Result<ShowPlacement, HostError> {
             self.step("geometry")?;
             Ok(ShowPlacement {
@@ -6932,6 +7011,7 @@ mod show_tests {
             Ordinary(&'static str),
             Visible,
             Minimized,
+            Observed(Reading),
         }
 
         #[derive(Default)]
@@ -7050,6 +7130,12 @@ mod show_tests {
                                 mark_visibility_observation(op, false);
                             }
                         }
+                        Queued::Observed(reading) => {
+                            self.host.current = reading;
+                            if let Some(op) = self.owner.active.as_mut() {
+                                mark_visibility_observation(op, false);
+                            }
+                        }
                         Queued::Request(_) => unreachable!("control event consumed"),
                     }
                     self.host.now += self.event_cost;
@@ -7083,6 +7169,152 @@ mod show_tests {
                 reply_xid: 88,
                 epoch: 7,
             })
+        }
+
+        fn off_workspace_loop(command: Command) -> Loop {
+            let mut s = Loop::new();
+            s.host.current = reading(
+                if command == Command::Hide {
+                    Visibility::NotMinimizedElsewhere
+                } else {
+                    Visibility::Minimized
+                },
+                L::Normal,
+                7,
+                2,
+            );
+            s
+        }
+
+        #[test]
+        fn off_workspace_only_event_dispatches_hidden_request_before_socket_wait() {
+            for command in [Command::Hide, Command::Show] {
+                let mut s = off_workspace_loop(command);
+                let admitted = s.host.now;
+                s.iteration(&mut VecDeque::from([request(command, 99)]))
+                    .unwrap();
+                let step = if command == Command::Hide {
+                    "add_hidden"
+                } else {
+                    "remove_hidden"
+                };
+                assert_eq!(s.host.count(step), 1);
+                let index = |step| s.host.log.iter().position(|s| *s == step).unwrap();
+                assert!(index(step) < index("wait"));
+                assert_eq!(
+                    s.waits,
+                    [Some(
+                        admitted
+                            + if command == Command::Hide {
+                                Duration::from_millis(1000)
+                            } else {
+                                Duration::from_millis(2500)
+                            }
+                    )]
+                );
+                assert!(s.owner.replies.is_empty());
+                for step in ["iconify", "user_time_zero", "map", "geometry", "enable"] {
+                    assert_eq!(s.host.count(step), 0);
+                }
+            }
+        }
+
+        #[test]
+        fn off_workspace_lookahead_dispatches_hidden_request_before_continue() {
+            for command in [Command::Hide, Command::Show] {
+                let mut s = off_workspace_loop(command);
+                let mut queue = VecDeque::from(vec![Queued::Ordinary("before"); 64]);
+                queue.push_back(request(command, 99));
+                s.iteration(&mut queue).unwrap();
+                let step = if command == Command::Hide {
+                    "add_hidden"
+                } else {
+                    "remove_hidden"
+                };
+                assert_eq!(s.host.log.last(), Some(&step));
+                assert_eq!(s.host.count(step), 1);
+                assert!(s.waits.is_empty());
+            }
+        }
+
+        #[test]
+        fn off_workspace_sustained_traffic_cannot_starve_or_reset_fixed_deadlines() {
+            for command in [Command::Hide, Command::Show] {
+                let mut s = off_workspace_loop(command);
+                let admitted = s.host.now;
+                s.event_cost = Duration::from_millis(10);
+                let mut queue = VecDeque::from([request(command, 99)]);
+                queue.extend(vec![Queued::Ordinary("traffic"); 400]);
+                while s.owner.replies.is_empty() {
+                    s.iteration(&mut queue).unwrap();
+                }
+                assert_eq!(
+                    s.owner.replies,
+                    [(
+                        command,
+                        Status::Failed,
+                        Reason::ConfirmationTimeout,
+                        admitted
+                            + if command == Command::Hide {
+                                Duration::from_millis(1000)
+                            } else {
+                                Duration::from_millis(2500)
+                            }
+                    )]
+                );
+                assert!(s.host.count("traffic") > 64);
+                assert!(!queue.is_empty());
+                assert!(s.waits.is_empty());
+                assert_eq!(
+                    s.host.count("add_hidden"),
+                    usize::from(command == Command::Hide)
+                );
+                assert_eq!(
+                    s.host.count("remove_hidden"),
+                    usize::from(command == Command::Show)
+                );
+                for step in ["iconify", "user_time_zero", "map", "geometry", "enable"] {
+                    assert_eq!(s.host.count(step), 0);
+                }
+            }
+        }
+
+        #[test]
+        fn off_workspace_last_batch_notification_confirms_before_wait_without_restart() {
+            for command in [Command::Hide, Command::Show] {
+                let mut s = off_workspace_loop(command);
+                let mut queue = VecDeque::from([request(command, 99)]);
+                queue.extend(vec![Queued::Ordinary("traffic"); 62]);
+                queue.push_back(Queued::Observed(reading(
+                    if command == Command::Hide {
+                        Visibility::Minimized
+                    } else {
+                        Visibility::NotMinimizedElsewhere
+                    },
+                    L::Normal,
+                    7,
+                    2,
+                )));
+                s.iteration(&mut queue).unwrap();
+                assert_eq!(
+                    s.owner.replies,
+                    [(command, Status::Success, Reason::None, s.host.now)]
+                );
+                assert!(s.owner.active.is_none());
+                assert_eq!(s.waits, [None]);
+                assert_eq!(
+                    s.host.count("add_hidden"),
+                    usize::from(command == Command::Hide)
+                );
+                assert_eq!(
+                    s.host.count("remove_hidden"),
+                    usize::from(command == Command::Show)
+                );
+                let observations = s.host.count("observe");
+                s.owner.service(&mut s.host).unwrap();
+                assert_eq!(s.host.count("observe"), observations);
+                assert_eq!(s.owner.replies.len(), 1);
+            }
         }
 
         #[test]
@@ -7546,6 +7778,7 @@ mod show_tests {
             let mut op = h.operation();
             assert_success(h.run(&mut op).unwrap(), false, false);
             assert_eq!(h.count("map"), 0);
+            assert_eq!(h.count("remove_hidden"), 0);
             assert_eq!(h.count("geometry"), 0);
             assert_eq!(h.count("correct"), 0);
             assert!(h.runtime.input_fence.blocked);
@@ -7557,11 +7790,250 @@ mod show_tests {
         let mut h = Fake::new(reading(Visibility::Minimized, L::Above, 7, 2));
         let mut op = h.operation();
         assert!(h.run(&mut op).is_none());
+        assert_eq!(op.show.phase, ShowPhase::HiddenRemoveRequested);
+        assert_eq!(h.count("remove_hidden"), 1);
+        assert_eq!(h.count("user_time_zero"), 0);
+        assert_eq!(h.count("map"), 0);
+        assert_eq!(h.runtime.pending_map_input, None);
+        assert!(h.run(&mut op).is_none()); // checked REMOVE is not confirmation
         h.current = reading(Visibility::NotMinimizedElsewhere, L::Above, 7, 2);
         assert_success(h.run(&mut op).unwrap(), false, true);
         assert_eq!(h.count("geometry"), 0);
         assert_eq!(h.count("enable"), 0);
+        assert_eq!(h.count("correct"), 0);
+        assert_eq!(h.count("remove_hidden"), 1);
+        assert!(h.runtime.input_fence.blocked);
+        assert!(!h.runtime.accepts_input());
         assert_eq!(op.show.baseline.unwrap().desktop, 7);
+    }
+
+    #[test]
+    fn off_workspace_remove_refusal_times_out_without_retry_map_or_input() {
+        let mut h = Fake::new(reading(Visibility::Minimized, L::Below, 7, 2));
+        let mut op = h.operation();
+        let deadline = op.deadline;
+        assert!(h.run(&mut op).is_none());
+        for _ in 0..3 {
+            mark_visibility_observation(&mut op, false);
+            assert!(h.run(&mut op).is_none());
+            assert_eq!(op.deadline, deadline);
+        }
+        h.now = deadline;
+        let result = h.run(&mut op).unwrap();
+        assert_eq!(result.status(), Status::Failed);
+        assert_eq!(result.detail().reason, Reason::ConfirmationTimeout);
+        assert_eq!(h.count("remove_hidden"), 1);
+        for step in ["user_time_zero", "map", "geometry", "correct", "enable"] {
+            assert_eq!(h.count(step), 0);
+        }
+        assert!(h.runtime.input_fence.blocked);
+    }
+
+    #[test]
+    fn off_workspace_show_needs_fresh_final_no_hidden_and_never_arms_map_shape_sync() {
+        let mut h = Fake::new(reading(Visibility::Minimized, L::Above, 7, 2));
+        let mut op = h.operation();
+        assert!(h.run(&mut op).is_none());
+        let remote = reading(Visibility::NotMinimizedElsewhere, L::Above, 7, 2);
+        h.reads = VecDeque::from([remote, h.current]);
+        assert!(h.run(&mut op).is_none()); // HIDDEN returned on the final fresh read
+        assert!(!op.detail.progress.not_minimized_confirmed);
+        assert_eq!(h.count("remove_hidden"), 1);
+        let event = MapNotifyEvent {
+            response_type: x11rb::protocol::xproto::MAP_NOTIFY_EVENT,
+            event: h.window.window,
+            window: h.window.window,
+            ..Default::default()
+        };
+        h.runtime
+            .synchronize_map_input_with(&event, h.window.window, 70001, || {
+                panic!("REMOVE-HIDDEN must not arm post-map SHAPE or enable remote input")
+            })
+            .unwrap();
+        assert_eq!(h.runtime.pending_map_input, None);
+        assert!(h.runtime.input_fence.blocked);
+        // Another approved coherent representation may finish without mapping.
+        h.current = remote;
+        h.current.evidence.wm_state = WmState::Normal;
+        h.current.evidence.map_state = Evidence::Readable(MapState::Unviewable);
+        assert_success(h.run(&mut op).unwrap(), false, true);
+        for step in ["map", "user_time_zero", "geometry", "enable"] {
+            assert_eq!(h.count(step), 0);
+        }
+    }
+
+    #[test]
+    fn off_workspace_checked_failures_consume_distinct_attempts_without_retry() {
+        for command in [Command::Hide, Command::Show] {
+            let (visibility, step) = if command == Command::Hide {
+                (Visibility::NotMinimizedElsewhere, "add_hidden")
+            } else {
+                (Visibility::Minimized, "remove_hidden")
+            };
+            let mut h = Fake::new(reading(visibility, L::Normal, 7, 2));
+            h.fail = Some(step);
+            let mut op = h.command_operation(command);
+            let deadline = op.deadline;
+            assert!(service_visibility_with(&mut op, &mut h).is_err());
+            if command == Command::Hide {
+                assert_eq!(op.hide.phase, control::HidePhase::HiddenAddAttempted);
+            } else {
+                assert_eq!(op.show.phase, ShowPhase::HiddenRemoveAttempted);
+            }
+            assert!(op.detail.progress.host_mutation_dispatched);
+            h.fail = None;
+            assert!(service_visibility_with(&mut op, &mut h).unwrap().is_none());
+            assert_eq!(h.count(step), 1);
+            assert_eq!(op.deadline, deadline);
+            for step in ["iconify", "user_time_zero", "map", "geometry", "enable"] {
+                assert_eq!(h.count(step), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn off_workspace_workspace_current_and_layer_drift_fail_without_compensation() {
+        for command in [Command::Hide, Command::Show] {
+            for case in 0..3 {
+                let before = if command == Command::Hide {
+                    Visibility::NotMinimizedElsewhere
+                } else {
+                    Visibility::Minimized
+                };
+                let after = if command == Command::Hide {
+                    Visibility::Minimized
+                } else {
+                    Visibility::NotMinimizedElsewhere
+                };
+                let mut h = Fake::new(reading(before, L::Above, 7, 2));
+                let mut op = h.command_operation(command);
+                assert!(service_visibility_with(&mut op, &mut h).unwrap().is_none());
+                h.current = match case {
+                    0 => reading(after, L::Above, 8, 2),
+                    1 => reading(after, L::Above, 7, 3),
+                    _ => reading(after, L::Below, 7, 2),
+                };
+                let result = service_visibility_with(&mut op, &mut h).unwrap().unwrap();
+                assert_eq!(result.status(), Status::Failed);
+                assert_eq!(
+                    result.detail().reason,
+                    if case == 2 {
+                        Reason::LayerChanged
+                    } else {
+                        Reason::LayoutChanged
+                    }
+                );
+                assert_eq!(h.count("add_hidden"), usize::from(command == Command::Hide));
+                assert_eq!(
+                    h.count("remove_hidden"),
+                    usize::from(command == Command::Show)
+                );
+                for step in [
+                    "iconify",
+                    "user_time_zero",
+                    "map",
+                    "geometry",
+                    "correct",
+                    "enable",
+                ] {
+                    assert_eq!(h.count(step), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn off_workspace_expiry_before_dispatch_never_sends_hidden_request() {
+        for command in [Command::Hide, Command::Show] {
+            for step in ["admission", "fence", "observe"] {
+                let visibility = if command == Command::Hide {
+                    Visibility::NotMinimizedElsewhere
+                } else {
+                    Visibility::Minimized
+                };
+                let mut h = Fake::new(reading(visibility, L::Normal, 7, 2));
+                let mut op = h.command_operation(command);
+                if step == "admission" {
+                    h.now = op.deadline;
+                } else {
+                    h.advance = Some((step, op.deadline.duration_since(h.now)));
+                }
+                let result = service_visibility_with(&mut op, &mut h).unwrap().unwrap();
+                assert_eq!(result.status(), Status::Failed);
+                assert_eq!(result.detail().reason, Reason::ConfirmationTimeout);
+                assert!(!result.detail().progress.host_mutation_dispatched);
+                for step in [
+                    "add_hidden",
+                    "remove_hidden",
+                    "iconify",
+                    "user_time_zero",
+                    "map",
+                    "enable",
+                ] {
+                    assert_eq!(h.count(step), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn off_workspace_fence_cancels_every_gesture_before_hidden_dispatch() {
+        for command in [Command::Hide, Command::Show] {
+            for gesture in 0..5 {
+                let visibility = if command == Command::Hide {
+                    Visibility::NotMinimizedElsewhere
+                } else {
+                    Visibility::Minimized
+                };
+                let mut h = Fake::new(reading(visibility, L::Normal, 7, 2));
+                h.runtime = visibility_fence_tests::runtime(gesture);
+                h.runtime.pending_move = Some(Point::new(200, 200));
+                h.runtime.final_target = Some(Point::new(210, 210));
+                let mut op = h.command_operation(command);
+                assert!(service_visibility_with(&mut op, &mut h).unwrap().is_none());
+                let request = if command == Command::Hide {
+                    "add_hidden"
+                } else {
+                    "remove_hidden"
+                };
+                let index = |step| h.log.iter().position(|s| *s == step).unwrap();
+                assert!(index("empty") < index("release"));
+                assert!(index("release") < index(request));
+                if gesture == 3 || gesture == 4 {
+                    assert!(index("popup") < index(request));
+                }
+                assert_eq!(h.count(request), 1);
+                assert!(h.runtime.visibility_dispatch_eligible());
+                assert!(h.runtime.input_fence.blocked);
+                assert!(!h.runtime.pointer.is_grabbed());
+                assert!(h.runtime.pending_move.is_none());
+                assert!(h.runtime.final_target.is_none());
+                assert_eq!(h.runtime.pending_map_input, None);
+            }
+        }
+    }
+
+    #[test]
+    fn off_workspace_fence_failure_blocks_both_hidden_requests() {
+        for command in [Command::Hide, Command::Show] {
+            for fail in ["empty", "release", "popup"] {
+                let visibility = if command == Command::Hide {
+                    Visibility::NotMinimizedElsewhere
+                } else {
+                    Visibility::Minimized
+                };
+                let mut h = Fake::new(reading(visibility, L::Normal, 7, 2));
+                h.runtime = visibility_fence_tests::runtime(4);
+                h.fail = Some(fail);
+                let mut op = h.command_operation(command);
+                assert!(service_visibility_with(&mut op, &mut h).is_err());
+                assert_eq!(h.count("popup"), 1);
+                assert_eq!(h.count("add_hidden"), 0);
+                assert_eq!(h.count("remove_hidden"), 0);
+                assert!(!op.detail.progress.host_mutation_dispatched);
+                assert!(!h.runtime.visibility_dispatch_eligible());
+            }
+        }
     }
     #[test]
     fn malformed_missing_unsupported_and_incoherent_evidence_never_dispatch() {
@@ -7878,18 +8350,19 @@ mod show_tests {
         assert_eq!(&h.log[before..], ["observe"]);
     }
     #[test]
-    fn expiry_after_user_time_can_only_succeed_from_stronger_fresh_elsewhere_evidence() {
+    fn expiry_after_remove_hidden_can_only_succeed_from_fresh_elsewhere_evidence() {
         let mut h = Fake::new(reading(Visibility::Minimized, L::Below, 7, 2));
         let mut op = h.operation();
-        h.advance = Some(("user_time_zero", op.deadline - h.now));
+        h.advance = Some(("remove_hidden", op.deadline - h.now));
         h.reads = VecDeque::from([
             h.current,
             h.current,
             reading(Visibility::NotMinimizedElsewhere, L::Below, 7, 2),
         ]);
         assert_success(h.run(&mut op).unwrap(), false, true);
-        assert_eq!(op.show.phase, ShowPhase::RestoreAttempted);
-        assert_eq!(h.count("user_time_zero"), 1);
+        assert_eq!(op.show.phase, ShowPhase::HiddenRemoveRequested);
+        assert_eq!(h.count("remove_hidden"), 1);
+        assert_eq!(h.count("user_time_zero"), 0);
         assert_eq!(h.count("map"), 0);
         assert_eq!(h.count("enable"), 0);
         assert_eq!(h.count("geometry"), 0);
@@ -8038,30 +8511,52 @@ mod show_tests {
     }
     #[test]
     fn completed_elsewhere_show_defers_then_ordinary_workspace_return_validates_before_input() {
-        let mut h = Fake::new(reading(Visibility::NotMinimizedElsewhere, L::Normal, 7, 2));
-        let mut op = h.operation();
-        assert_success(h.run(&mut op).unwrap(), false, false);
-        let maps = h.count("map");
-        restore_deferred_input(&mut h).unwrap();
-        assert_eq!(h.count("geometry"), 0);
-        // This is a later ordinary workspace event, with no active remote record.
-        h.current = reading(Visibility::NotMinimizedHere, L::Normal, 7, 7);
-        h.bounds = ValidOriginBounds::new(200, 500, 200, 500);
-        restore_deferred_input(&mut h).unwrap();
-        assert_eq!(h.count("ordinary_correct"), 1);
-        assert_eq!(h.count("enable"), 0);
-        restore_deferred_input(&mut h).unwrap();
-        assert_eq!(h.count("ordinary_correct"), 1);
-        let (_, deadline) = h.runtime.correction.unwrap();
-        h.runtime
-            .check_correction(deadline, h.geometry.origin(), &h.bounds)
-            .unwrap();
-        h.window.cancel_in_flight_moves();
-        restore_deferred_input(&mut h).unwrap();
-        assert_eq!(h.count("enable"), 1);
-        assert!(h.runtime.accepts_input());
-        assert_eq!(h.count("map"), maps);
-        assert!(op.detail.progress.placement_deferred); // old terminal result is unchanged
+        for was_minimized in [false, true] {
+            let mut h = Fake::new(reading(
+                if was_minimized {
+                    Visibility::Minimized
+                } else {
+                    Visibility::NotMinimizedElsewhere
+                },
+                L::Normal,
+                7,
+                2,
+            ));
+            let mut op = h.operation();
+            if was_minimized {
+                assert!(h.run(&mut op).is_none());
+                h.current = reading(Visibility::NotMinimizedElsewhere, L::Normal, 7, 2);
+            }
+            assert_success(h.run(&mut op).unwrap(), false, was_minimized);
+            assert_eq!(h.count("remove_hidden"), usize::from(was_minimized));
+            assert_eq!(h.runtime.pending_map_input, None);
+            let maps = h.count("map");
+            restore_deferred_input(&mut h).unwrap();
+            assert_eq!(h.count("geometry"), 0);
+            // This is a later ordinary workspace event, with no active remote record.
+            h.current = reading(Visibility::NotMinimizedHere, L::Normal, 7, 7);
+            h.bounds = ValidOriginBounds::new(200, 500, 200, 500);
+            restore_deferred_input(&mut h).unwrap();
+            assert_eq!(h.count("ordinary_correct"), 1);
+            assert_eq!(h.count("enable"), 0);
+            restore_deferred_input(&mut h).unwrap();
+            assert_eq!(h.count("ordinary_correct"), 1);
+            let (_, deadline) = h.runtime.correction.unwrap();
+            h.runtime
+                .check_correction(deadline, h.geometry.origin(), &h.bounds)
+                .unwrap();
+            h.window.cancel_in_flight_moves();
+            restore_deferred_input(&mut h).unwrap();
+            assert_eq!(h.count("enable"), 1);
+            assert!(h.runtime.accepts_input());
+            assert_eq!(h.count("map"), maps);
+            assert!(op.detail.progress.placement_deferred); // old terminal result is unchanged
+            restore_deferred_input(&mut h).unwrap();
+            assert_eq!(h.count("enable"), 1);
+            assert_eq!(h.count("user_time_zero"), 0);
+            assert_eq!(h.count("map"), 0);
+            assert_eq!(h.count("remove_hidden"), usize::from(was_minimized));
+        }
     }
     #[test]
     fn show_map_notify_cannot_consume_old_startup_allowance_or_enable_early() {
@@ -8227,6 +8722,7 @@ mod show_tests {
                 assert!(run(&mut h, &mut op).is_none());
                 assert_eq!(h.log, ["fence", "empty", "release", "observe", "iconify"]);
                 assert_eq!(op.hide.phase, HidePhase::IconifyRequested);
+                assert_eq!(h.count("add_hidden"), 0);
                 assert!(run(&mut h, &mut op).is_none()); // acknowledgement is not success
                 assert_eq!(h.count("iconify"), 1);
                 h.current = reading(Visibility::Minimized, L::Below, desktop, 2);
@@ -8251,7 +8747,10 @@ mod show_tests {
                 let mut op = h.command_operation(Command::Hide);
                 assert!(run(&mut h, &mut op).is_none());
                 assert!(run(&mut h, &mut op).is_none());
-                assert_eq!(h.count("iconify"), 1);
+                assert_eq!(op.hide.phase, HidePhase::HiddenAddRequested);
+                assert_eq!(h.count("add_hidden"), 1);
+                assert_eq!(h.count("iconify"), 0);
+                assert_eq!(h.count("map"), 0);
                 assert_eq!(h.count("geometry"), 0);
                 assert_eq!(h.count("correct"), 0);
                 h.current = reading(Visibility::Minimized, L::Above, 7, 2);
@@ -8276,7 +8775,8 @@ mod show_tests {
                 Visibility::NotMinimizedElsewhere
             );
             assert!(h.runtime.input_fence.blocked);
-            assert_eq!(h.count("iconify"), 1);
+            assert_eq!(h.count("add_hidden"), 1);
+            assert_eq!(h.count("iconify"), 0);
             assert_eq!(h.count("geometry"), 0);
         }
         #[test]
@@ -8658,6 +9158,78 @@ mod show_tests {
                 assert_eq!(h.count("iconify"), 20);
                 assert_eq!(h.count("map"), 20);
                 assert_eq!(h.count("correct"), 0);
+            }
+        }
+
+        #[test]
+        fn repeated_off_workspace_cycles_preserve_xid_layer_workspaces_and_fence() {
+            for layer in [L::Normal, L::Above, L::Below] {
+                let mut h = Fake::new(reading(Visibility::NotMinimizedElsewhere, layer, 7, 2));
+                let xid = h.window.window;
+                let geometry = h.geometry;
+                for _ in 0..20 {
+                    let mut hide = h.command_operation(Command::Hide);
+                    assert!(run(&mut h, &mut hide).is_none());
+                    h.current = reading(Visibility::Minimized, layer, 7, 2);
+                    assert_hidden(run(&mut h, &mut hide).unwrap(), true);
+                    let mut noop_hide = h.command_operation(Command::Hide);
+                    assert_hidden(run(&mut h, &mut noop_hide).unwrap(), false);
+                    let mut show = h.operation();
+                    assert!(run(&mut h, &mut show).is_none());
+                    h.current = reading(Visibility::NotMinimizedElsewhere, layer, 7, 2);
+                    assert_success(run(&mut h, &mut show).unwrap(), false, true);
+                    let mut noop_show = h.operation();
+                    assert_success(run(&mut h, &mut noop_show).unwrap(), false, false);
+                    assert_eq!((h.window.window, h.geometry), (xid, geometry));
+                    assert_eq!(
+                        (h.current.desktop, h.current.current, h.current.layer),
+                        (7, 2, layer)
+                    );
+                    assert!(h.runtime.input_fence.blocked);
+                    assert!(!h.runtime.accepts_input());
+                    assert!(!h.runtime.pointer.is_grabbed());
+                    assert!(h.runtime.menu.is_none());
+                    assert!(h.runtime.pending_move.is_none());
+                    assert!(h.runtime.final_target.is_none());
+                    assert_eq!(h.runtime.pending_map_input, None);
+                }
+                assert_eq!(h.count("add_hidden"), 20);
+                assert_eq!(h.count("remove_hidden"), 20);
+                for step in [
+                    "iconify",
+                    "user_time_zero",
+                    "map",
+                    "geometry",
+                    "correct",
+                    "enable",
+                ] {
+                    assert_eq!(h.count(step), 0);
+                }
+            }
+        }
+
+        #[test]
+        fn local_hide_then_manual_workspace_change_selects_remote_show() {
+            let mut h = Fake::new(visible());
+            let xid = h.window.window;
+            let mut hide = h.command_operation(Command::Hide);
+            assert!(run(&mut h, &mut hide).is_none());
+            h.current = reading(Visibility::Minimized, L::Normal, 2, 2);
+            assert_hidden(run(&mut h, &mut hide).unwrap(), true);
+            // The owner has completed Hide. The user changes workspace before
+            // admitting a new Show; its fresh baseline must select REMOVE-HIDDEN.
+            h.current = reading(Visibility::Minimized, L::Normal, 2, 7);
+            let mut show = h.operation();
+            assert!(run(&mut h, &mut show).is_none());
+            h.current = reading(Visibility::NotMinimizedElsewhere, L::Normal, 2, 7);
+            assert_success(run(&mut h, &mut show).unwrap(), false, true);
+            assert_eq!(h.count("iconify"), 1);
+            assert_eq!(h.count("remove_hidden"), 1);
+            assert_eq!(h.count("add_hidden"), 0);
+            assert_eq!(h.window.window, xid);
+            assert_eq!((h.current.desktop, h.current.current), (2, 7));
+            for step in ["user_time_zero", "map", "geometry", "enable"] {
+                assert_eq!(h.count(step), 0);
             }
         }
     }

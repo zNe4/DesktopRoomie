@@ -369,6 +369,10 @@ pub enum HidePhase {
     /// Consumed before dispatch, including a failed checked send. Never retry.
     IconifyAttempted,
     IconifyRequested,
+    /// Off-workspace ADD-HIDDEN attempt consumed before dispatch. Never retry.
+    HiddenAddAttempted,
+    /// ADD-HIDDEN dispatched and checked, awaiting fresh actual minimization.
+    HiddenAddRequested,
 }
 
 /// Only the progress matching `request.command` is serviced. Both commands share
@@ -392,6 +396,10 @@ pub enum ShowPhase {
     RestoreAttempted,
     /// MapWindow was dispatched and its check succeeded; WM readiness is pending.
     RestoreRequested,
+    /// Off-workspace REMOVE-HIDDEN attempt consumed before dispatch. Never retry.
+    HiddenRemoveAttempted,
+    /// REMOVE-HIDDEN dispatched and checked; no MapWindow was sent.
+    HiddenRemoveRequested,
     EnablingInput,
     InputRestored,
 }
