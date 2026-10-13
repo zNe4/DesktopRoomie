@@ -96,10 +96,9 @@ impl LayerAtoms {
         Ok(self.decode_body(&read()?))
     }
 
-    /// Inert G1 seam: observe the same body afresh, including repeated-read
+    /// Remote-only path: observe the same body afresh, including repeated-read
     /// coherence and BadWindow classification from the accepted visibility reader.
-    /// Each future layer reread must use this adapter again, never cached permission.
-    #[allow(dead_code)]
+    /// Each layer reread uses this adapter again, never cached permission.
     pub fn read_remote(
         &self,
         visibility: &VisibilityAtoms,
@@ -112,7 +111,7 @@ impl LayerAtoms {
         Ok(self.qualify_remote(&snapshot, baseline))
     }
 
-    fn qualify_remote(
+    pub fn qualify_remote(
         &self,
         snapshot: &VisibilitySnapshot,
         baseline: VisibilityBaseline,

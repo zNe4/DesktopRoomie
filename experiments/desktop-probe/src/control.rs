@@ -359,6 +359,24 @@ pub struct ActiveOperation {
     pub detail: Detail,
     pub show: ShowProgress,
     pub hide: HideProgress,
+    pub bring_top: BringTopProgress,
+}
+
+/// Composition facts only. The sole LayerController still owns its target,
+/// phase, observations and pending deadline. None of these facts are wire bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BringTopProgress {
+    pub visibility_cutoff: std::time::Instant,
+    pub minimized_at_start: bool,
+    pub restoration_confirmed: bool,
+    /// Fixes the budget even if the first qualified layer read is transitional.
+    pub layer_admitted: Option<std::time::Instant>,
+    pub layer_observe: bool,
+    pub layer_attempted: bool,
+    pub layer_dispatched: bool,
+    pub layer_checked: bool,
+    /// Controller completed; only terminal evidence revalidation may remain.
+    pub layer_finished: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -472,7 +490,7 @@ pub fn admit(
                 Command::Hide => 1000,
                 // Owner-approved Stage-E budget, including slower-host margin.
                 Command::Show => 2500,
-                Command::BringTop => 2000,
+                Command::BringTop => 3500,
             }),
         detail: preflight_detail(Reason::Unsupported, Stage::Preflight),
         show: ShowProgress {
@@ -482,6 +500,17 @@ pub fn admit(
         hide: HideProgress {
             observe: true,
             ..HideProgress::default()
+        },
+        bring_top: BringTopProgress {
+            visibility_cutoff: now + std::time::Duration::from_millis(2500),
+            minimized_at_start: false,
+            restoration_confirmed: false,
+            layer_admitted: None,
+            layer_observe: false,
+            layer_attempted: false,
+            layer_dispatched: false,
+            layer_checked: false,
+            layer_finished: false,
         },
     });
     Admission::Admitted
@@ -616,6 +645,33 @@ impl OperationResult {
         detail: Detail,
         confirmed: Confirmation,
     ) -> Result<Self, ResultError> {
+        Self::validated(command, status, detail, confirmed, false)
+    }
+
+    /// Constructor-only historical proof; current confirmation fields retain
+    /// their v1 meanings, including after evidence loss or body destruction.
+    pub fn bring_top(
+        status: Status,
+        detail: Detail,
+        confirmed: Confirmation,
+        progress: &BringTopProgress,
+    ) -> Result<Self, ResultError> {
+        Self::validated(
+            Command::BringTop,
+            status,
+            detail,
+            confirmed,
+            progress.minimized_at_start && progress.restoration_confirmed,
+        )
+    }
+
+    fn validated(
+        command: Command,
+        status: Status,
+        detail: Detail,
+        confirmed: Confirmation,
+        restoration_proven: bool,
+    ) -> Result<Self, ResultError> {
         let visibility = match confirmed.visibility {
             Some(ConfirmedVisibility::Minimized) => Some(Visibility::Minimized),
             Some(ConfirmedVisibility::NotMinimizedHere) => Some(Visibility::NotMinimizedHere),
@@ -684,10 +740,13 @@ impl OperationResult {
             }
         }
         // Partial is an explicitly observed result, never just a dispatched request.
-        if status == Status::Partial
-            && (!detail.progress.host_mutation_dispatched
-                || (confirmed.visibility.is_none() && !confirmed.above))
-        {
+        let partial_valid = if command == Command::BringTop {
+            restoration_proven
+        } else {
+            detail.progress.host_mutation_dispatched
+                && (confirmed.visibility.is_some() || confirmed.above)
+        };
+        if status == Status::Partial && !partial_valid {
             return Err(ResultError::InvalidPartial);
         }
         Ok(Self { status, detail })
@@ -1454,6 +1513,20 @@ mod tests {
             }
         }
     }
+    fn proven_restoration() -> BringTopProgress {
+        let mut active = None;
+        admit(
+            &mut active,
+            request(),
+            Lifecycle::Ready,
+            false,
+            std::time::Instant::now(),
+        );
+        let mut progress = active.unwrap().bring_top;
+        progress.minimized_at_start = true;
+        progress.restoration_confirmed = true;
+        progress
+    }
     #[test]
     fn confirmed_results_and_partial_progress_remain_distinct() {
         let d = Detail {
@@ -1521,7 +1594,7 @@ mod tests {
                 ..d
             };
             assert_eq!(
-                OperationResult::new(Command::BringTop, Status::Partial, partial, c)
+                OperationResult::bring_top(Status::Partial, partial, c, &proven_restoration())
                     .unwrap()
                     .exit_code(),
                 ExitCode::Partial
@@ -1718,6 +1791,126 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bring_top_partial_requires_actual_restoration_not_dispatch_or_current_visibility() {
+        let mut d = preflight_detail(Reason::ConfirmationTimeout, Stage::Layer);
+        d.visibility = Visibility::NotMinimizedHere;
+        d.workspace = Workspace::Current;
+        d.layer = LayerObservation::Normal;
+        d.progress.not_minimized_confirmed = true;
+        d.progress.host_mutation_dispatched = true;
+        let c = Confirmation {
+            visibility: Some(ConfirmedVisibility::NotMinimizedHere),
+            above: false,
+        };
+        assert_eq!(
+            OperationResult::new(Command::BringTop, Status::Partial, d, c),
+            Err(ResultError::InvalidPartial)
+        );
+        let mut proof = proven_restoration();
+        for (minimized, restored) in [(false, false), (false, true), (true, false)] {
+            proof.minimized_at_start = minimized;
+            proof.restoration_confirmed = restored;
+            assert_eq!(
+                OperationResult::bring_top(Status::Partial, d, c, &proof),
+                Err(ResultError::InvalidPartial)
+            );
+        }
+        proof.minimized_at_start = true;
+        proof.restoration_confirmed = true;
+        assert_eq!(
+            OperationResult::bring_top(Status::Partial, d, c, &proof)
+                .unwrap()
+                .exit_code(),
+            ExitCode::Partial
+        );
+        // History remains sufficient after current evidence is lost; wire bits
+        // keep current-state meaning and are not used as historical markers.
+        let unknown = preflight_detail(Reason::BodyDestroyed, Stage::Layer);
+        assert_eq!(
+            OperationResult::bring_top(Status::Partial, unknown, Confirmation::default(), &proof)
+                .unwrap()
+                .status(),
+            Status::Partial
+        );
+        assert_eq!(VERSION, 1);
+        assert_eq!(Detail::decode(unknown.encode()).unwrap(), unknown);
+    }
+    #[test]
+    fn owner_budgets_and_visibility_cutoff_are_admission_relative_and_duplicates_preserve_them() {
+        let t0 = std::time::Instant::now();
+        for (command, millis) in [
+            (Command::Hide, 1000),
+            (Command::Show, 2500),
+            (Command::BringTop, 3500),
+        ] {
+            let req = Request {
+                command,
+                ..request()
+            };
+            let mut active = None;
+            assert_eq!(
+                admit(&mut active, req, Lifecycle::Ready, false, t0),
+                Admission::Admitted
+            );
+            let original = active.unwrap();
+            assert_eq!(
+                original.deadline,
+                t0 + std::time::Duration::from_millis(millis)
+            );
+            assert_eq!(
+                original.bring_top.visibility_cutoff,
+                t0 + std::time::Duration::from_millis(2500)
+            );
+            assert_eq!(
+                admit(
+                    &mut active,
+                    req,
+                    Lifecycle::Ready,
+                    false,
+                    t0 + std::time::Duration::from_millis(100)
+                ),
+                Admission::Duplicate
+            );
+            assert_eq!(active, Some(original));
+        }
+    }
+    #[test]
+    fn all_remote_command_pairings_and_local_layer_busy_preserve_single_owner() {
+        let t0 = std::time::Instant::now();
+        for first in [Command::Hide, Command::Show, Command::BringTop] {
+            for second in [Command::Hide, Command::Show, Command::BringTop] {
+                let mut active = None;
+                admit(
+                    &mut active,
+                    Request {
+                        command: first,
+                        ..request()
+                    },
+                    Lifecycle::Ready,
+                    false,
+                    t0,
+                );
+                let original = active;
+                let other = Request {
+                    command: second,
+                    request_id: 123,
+                    ..request()
+                };
+                assert_eq!(
+                    admit(&mut active, other, Lifecycle::Ready, false, t0),
+                    Admission::Reply(Status::Busy, Reason::Busy, Stage::Preflight)
+                );
+                assert_eq!(active, original);
+            }
+        }
+        let mut active = None;
+        assert_eq!(
+            admit(&mut active, request(), Lifecycle::Ready, true, t0),
+            Admission::Reply(Status::Busy, Reason::Busy, Stage::Preflight)
+        );
+        assert!(active.is_none());
+    }
     #[test]
     fn terminal_and_cli_exit_mapping() {
         for (status, code) in [

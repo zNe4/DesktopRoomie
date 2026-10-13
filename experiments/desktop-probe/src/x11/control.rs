@@ -547,9 +547,45 @@ impl ControlWindow {
     }
 
     fn finish_remote_with(&mut self, host: &mut impl PeerHost) -> Result<()> {
-        let Some(operation) = self.active.as_ref() else {
+        let Some(operation) = self.active.as_mut() else {
             return Ok(());
         };
+        if operation.request.command == Command::BringTop {
+            operation.detail = control::Detail {
+                progress: control::Progress {
+                    host_mutation_dispatched: operation.detail.progress.host_mutation_dispatched,
+                    ..control::Progress::default()
+                },
+                ..control::preflight_detail(
+                    if self.owns_selection {
+                        Reason::Closing
+                    } else {
+                        Reason::OwnershipLost
+                    },
+                    Stage::Shutdown,
+                )
+            };
+            let result = control::OperationResult::bring_top(
+                if operation.bring_top.minimized_at_start
+                    && operation.bring_top.restoration_confirmed
+                {
+                    Status::Partial
+                } else {
+                    Status::Failed
+                },
+                operation.detail,
+                control::Confirmation::default(),
+                &operation.bring_top,
+            )
+            .expect("Shutdown retains restoration history without stale current evidence");
+            let response = TerminalResponse {
+                status: result.status(),
+                detail: result.detail(),
+                request_id: operation.request.request_id,
+                control_xid: self.descriptor.control_xid,
+            };
+            return finish_active(host, self.transport, &mut self.active, response);
+        }
         let response = TerminalResponse {
             status: Status::Closing,
             request_id: operation.request.request_id,
@@ -964,7 +1000,7 @@ fn route_request_with(
         Admission::Reply(status, reason, stage) => {
             (status, control::preflight_detail(reason, stage))
         }
-        Admission::Admitted if matches!(request.command, Command::Show | Command::Hide) => {
+        Admission::Admitted => {
             let operation = active.as_mut().unwrap();
             operation.stage = if request.command == Command::Hide {
                 Stage::Hide
@@ -974,7 +1010,6 @@ fn route_request_with(
             operation.detail = control::preflight_detail(Reason::None, operation.stage);
             return Ok(true);
         }
-        Admission::Admitted => (Status::Failed, active.as_ref().unwrap().detail),
     };
     let response = TerminalResponse {
         status,
@@ -982,11 +1017,7 @@ fn route_request_with(
         control_xid: owner.control_xid,
         detail,
     };
-    if admission == Admission::Admitted {
-        finish_active(host, atoms, active, response)?;
-    } else {
-        host.send(reply_event(atoms, request.reply_xid, response)?)?;
-    }
+    host.send(reply_event(atoms, request.reply_xid, response)?)?;
     Ok(true)
 }
 
@@ -1013,6 +1044,9 @@ impl CallerOutcome {
             Self::NoInstance => "no running instance".into(),
             Self::Protocol => "incompatible, stale, or malformed owner endpoint".into(),
             Self::Lifecycle(lifecycle) => format!("owner is {lifecycle:?}"),
+            Self::Terminal(response) if command == Command::BringTop => {
+                bring_top_diagnostic(response)
+            }
             Self::Terminal(response)
                 if command == Command::Hide && response.status == Status::Success =>
             {
@@ -1056,6 +1090,49 @@ impl CallerOutcome {
             Self::Unknown(reason) => format!("outcome unknown — {reason}"),
         };
         format!("{command}: {message}")
+    }
+}
+
+fn bring_top_diagnostic(response: &TerminalResponse) -> String {
+    use control::{LayerObservation, Visibility};
+    let d = response.detail;
+    let location =
+        if d.visibility == Visibility::NotMinimizedElsewhere || d.progress.placement_deferred {
+            "on another workspace"
+        } else {
+            "here"
+        };
+    let state = match d.layer {
+        LayerObservation::Unknown => "unverified",
+        LayerObservation::Normal => "Normal",
+        LayerObservation::Above => "Above",
+        LayerObservation::Below => "Below",
+        LayerObservation::Conflict => "conflicting Above + Below",
+    };
+    let reason = match d.reason {
+        Reason::ConfirmationTimeout => "confirmation timed out".into(),
+        Reason::Unsupported => "required WM support unavailable".into(),
+        Reason::Unverifiable => "state unverifiable".into(),
+        reason => format!("{reason:?}"),
+    };
+    match response.status {
+        Status::Success if !d.progress.host_mutation_dispatched => format!("already not minimized + Above {location}; original workspace preserved; no restoration/layer request needed{}",
+            if d.progress.placement_deferred { "; placement deferred, input unavailable" } else { "" }),
+        Status::Success => format!("not minimized + Above confirmed {location}; original workspace preserved{}",
+            if d.progress.placement_deferred { "; placement deferred, input unavailable" } else { "" }),
+        Status::Partial if !d.progress.not_minimized_confirmed => format!("partial — restoration was confirmed earlier; current state is unverified or no longer not minimized ({:?}); {reason}; current effective layer: {state}", d.visibility),
+        Status::Partial if d.reason == Reason::LayoutChanged => format!("partial — restoration was confirmed earlier; workspace/layout preservation failed; current body {location}; current effective layer: {state}"),
+        Status::Partial if d.progress.above_confirmed => format!("partial — restoration was confirmed; Above is currently confirmed {location}, but the operation failed; {reason}"),
+        Status::Partial if d.stage != Stage::Layer => format!("partial — restoration confirmed {location}, but visibility/input readiness failed; {reason}; current effective layer: {state}"),
+        Status::Partial => format!("partial — restoration confirmed {location}, but the complete Above contract failed; {reason}; current effective layer: {state}{}",
+            if d.progress.placement_deferred { "; original workspace preserved; placement deferred, input unavailable" } else { "" }),
+        Status::Failed if d.stage == Stage::Shutdown => format!("failed — operation ended during shutdown; {reason}; current effective layer: {state}"),
+        Status::Failed if d.progress.above_confirmed => format!("failed — Above is currently confirmed {location}, but the operation failed; {reason}"),
+        Status::Failed if d.stage != Stage::Layer => format!("failed — visibility readiness could not be confirmed before layer work; {reason}; current effective layer: {state}"),
+        Status::Failed => format!("failed — Above contract was not confirmed; {reason}; current effective layer: {state}{}",
+            if d.visibility == Visibility::NotMinimizedElsewhere { "; on another workspace" } else { "" }),
+        Status::Busy => "Busy — another remote or local layer/placement operation is active".into(),
+        status => format!("{status:?} — {reason} ({:?})", d.stage),
     }
 }
 
@@ -1225,6 +1302,13 @@ fn correlated_reply(
         .then_some(response)
 }
 
+fn caller_budget(command: Command) -> Duration {
+    Duration::from_millis(match command {
+        Command::Hide | Command::Show => 4000,
+        Command::BringTop => 5000,
+    })
+}
+
 fn caller_with(
     host: &mut impl CallerHost,
     root: u32,
@@ -1233,7 +1317,7 @@ fn caller_with(
     id: impl FnOnce() -> Result<u64>,
 ) -> Result<CallerOutcome> {
     // This begins before atom/selection discovery and never changes.
-    let deadline = host.now() + Duration::from_secs(4);
+    let deadline = host.now() + caller_budget(command);
     let operation = (|| {
         let (instance, atoms) = host.atoms(screen_num)?;
         let owner = match discover(host, root, screen_num, instance)? {
@@ -2255,6 +2339,182 @@ mod transport_tests {
     }
 
     #[test]
+    fn command_specific_caller_budget_starts_before_discovery_and_never_resends() {
+        for (command, millis) in [
+            (Command::Hide, 4000),
+            (Command::Show, 4000),
+            (Command::BringTop, 5000),
+        ] {
+            assert_eq!(caller_budget(command), Duration::from_millis(millis));
+            let mut h = Fake::new();
+            let t0 = h.now;
+            h.cost = Some(("atoms", Duration::from_millis(700)));
+            let outcome = caller_with(&mut h, ROOT, 0, command, || Ok(ID)).unwrap();
+            assert_eq!(outcome.exit_code(), ExitCode::OutcomeUnknown);
+            assert_eq!(h.waits, [t0 + Duration::from_millis(millis)]);
+            assert_eq!(h.sent.len(), 1);
+            assert_eq!(
+                Request::decode(&h.sent[0].data.as_data32())
+                    .unwrap()
+                    .command,
+                command
+            );
+            let mut h = Fake::new();
+            h.cost = Some(("atoms", Duration::from_millis(millis)));
+            assert_eq!(
+                caller_with(&mut h, ROOT, 0, command, || Ok(ID))
+                    .unwrap()
+                    .exit_code(),
+                ExitCode::OutcomeUnknown
+            );
+            assert!(h.sent.is_empty());
+        }
+    }
+    #[test]
+    fn bring_top_duplicates_busy_and_single_terminal_use_production_transport() {
+        let mut h = Fake::new();
+        let mut active = None;
+        let req = request(Command::BringTop);
+        for _ in 0..2 {
+            h.evidence
+                .push_back(Some(evidence(&marker(Command::BringTop).encode().unwrap())));
+            h.route(
+                &mut active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, req).unwrap(),
+            )
+            .unwrap();
+        }
+        let original = active;
+        assert!(h.sent.is_empty());
+        for command in [Command::Hide, Command::Show, Command::BringTop] {
+            let marker = CallerMarker {
+                command,
+                request_id: ID + 1,
+                ..marker(command)
+            };
+            let other = Request {
+                command,
+                request_id: ID + 1,
+                ..req
+            };
+            h.evidence
+                .push_back(Some(evidence(&marker.encode().unwrap())));
+            h.route(
+                &mut active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, other).unwrap(),
+            )
+            .unwrap();
+            let terminal =
+                TerminalResponse::decode(&h.sent.last().unwrap().data.as_data32()).unwrap();
+            assert_eq!(terminal.status, Status::Busy);
+            assert!(!terminal.detail.progress.host_mutation_dispatched);
+            assert_eq!(active, original);
+        }
+        finish_active(&mut h, atoms(), &mut active, response()).unwrap();
+        assert!(active.is_none());
+        assert_eq!(h.sent.len(), 4);
+    }
+    #[test]
+    fn bring_top_local_layer_pending_is_busy_without_admission() {
+        let mut h = Fake::new();
+        h.evidence
+            .push_back(Some(evidence(&marker(Command::BringTop).encode().unwrap())));
+        let mut active = None;
+        h.route(
+            &mut active,
+            Lifecycle::Ready,
+            true,
+            &request_event(atoms(), CONTROL, request(Command::BringTop)).unwrap(),
+        )
+        .unwrap();
+        assert!(active.is_none());
+        let response = TerminalResponse::decode(&h.sent[0].data.as_data32()).unwrap();
+        assert_eq!(response.status, Status::Busy);
+        assert!(!response.detail.progress.host_mutation_dispatched);
+    }
+    #[test]
+    fn bring_top_shutdown_retains_history_and_clears_stale_current_confirmations() {
+        for restored in [false, true] {
+            let mut h = Fake::new();
+            let mut endpoint = ControlWindow::candidate(0, CONTROL, 11, 50, 51, 52);
+            endpoint.transport = atoms();
+            endpoint.descriptor = owner();
+            control::admit(
+                &mut endpoint.active,
+                request(Command::BringTop),
+                Lifecycle::Ready,
+                false,
+                h.now,
+            );
+            let op = endpoint.active_mut().unwrap();
+            op.bring_top.minimized_at_start = restored;
+            op.bring_top.restoration_confirmed = restored;
+            op.detail.progress = control::Progress {
+                not_minimized_confirmed: true,
+                above_confirmed: true,
+                input_ready: true,
+                host_mutation_dispatched: true,
+                ..control::Progress::default()
+            };
+            endpoint.finish_remote_with(&mut h).unwrap();
+            endpoint.finish_remote_with(&mut h).unwrap();
+            assert_eq!(h.sent.len(), 1);
+            let response = TerminalResponse::decode(&h.sent[0].data.as_data32()).unwrap();
+            assert_eq!(
+                response.status,
+                if restored {
+                    Status::Partial
+                } else {
+                    Status::Failed
+                }
+            );
+            assert!(!response.detail.progress.not_minimized_confirmed);
+            assert!(!response.detail.progress.above_confirmed);
+            assert!(!response.detail.progress.input_ready);
+            assert!(response.detail.progress.host_mutation_dispatched);
+        }
+    }
+    #[test]
+    fn bring_top_diagnostics_qualify_location_history_and_current_layer() {
+        let mut response = response();
+        response.status = Status::Success;
+        response.detail = control::preflight_detail(Reason::None, Stage::Layer);
+        response.detail.progress.not_minimized_confirmed = true;
+        response.detail.progress.above_confirmed = true;
+        for elsewhere in [false, true] {
+            response.detail.progress.placement_deferred = elsewhere;
+            for dispatched in [false, true] {
+                response.detail.progress.host_mutation_dispatched = dispatched;
+                let text = CallerOutcome::Terminal(response).diagnostic(Command::BringTop);
+                assert_eq!(text.contains("another workspace"), elsewhere);
+                assert_eq!(
+                    text.contains("no restoration/layer request needed"),
+                    !dispatched
+                );
+                assert!(!text.contains("visible here"));
+            }
+        }
+        response.status = Status::Partial;
+        response.detail.reason = Reason::ConfirmationTimeout;
+        response.detail.layer = control::LayerObservation::Normal;
+        response.detail.progress.above_confirmed = false;
+        assert!(CallerOutcome::Terminal(response)
+            .diagnostic(Command::BringTop)
+            .contains("restoration confirmed on another workspace"));
+        response.detail.progress.not_minimized_confirmed = false;
+        assert!(CallerOutcome::Terminal(response)
+            .diagnostic(Command::BringTop)
+            .contains("confirmed earlier"));
+        response.status = Status::Failed;
+        let text = CallerOutcome::Terminal(response).diagnostic(Command::BringTop);
+        assert!(text.contains("current effective layer: Normal"));
+        assert!(!text.contains("restoration confirmed"));
+    }
+    #[test]
     fn discovery_lifecycle_and_absence_never_create_or_send() {
         for lifecycle in [Lifecycle::Starting, Lifecycle::Closing] {
             let mut host = Fake::new();
@@ -2547,7 +2807,7 @@ mod transport_tests {
         }
     }
     #[test]
-    fn bring_top_has_one_truthful_unsupported_reply_and_clears_active() {
+    fn bring_top_is_asynchronously_admitted_without_an_unsupported_reply() {
         let command = Command::BringTop;
         let mut host = Fake::new();
         host.evidence
@@ -2556,22 +2816,20 @@ mod transport_tests {
         let mut active = None;
         host.route(&mut active, Lifecycle::Ready, false, &event)
             .unwrap();
+        let op = active.unwrap();
+        assert_eq!(op.request.command, command);
+        assert_eq!(op.stage, Stage::Show);
+        assert_eq!(op.deadline, host.now + Duration::from_millis(3500));
+        assert_eq!(
+            op.bring_top.visibility_cutoff,
+            host.now + Duration::from_millis(2500)
+        );
+        assert!(host.sent.is_empty());
+        finish_active(&mut host, atoms(), &mut active, response()).unwrap();
         assert!(active.is_none());
         assert_eq!(host.sent.len(), 1);
-        let reply = host.sent[0];
-        assert_eq!(
-            (reply.window, reply.type_, reply.format),
-            (REPLY_WINDOW, atoms().reply, 32)
-        );
-        assert_eq!(
-            TerminalResponse::decode(&reply.data.as_data32()).unwrap(),
-            response()
-        );
-        assert_eq!(
-            reply.data.as_data32(),
-            [(1 << 16) | 1, ID as u32, (ID >> 32) as u32, CONTROL, 11]
-        );
-        assert_eq!(host.log, ["owner", "evidence", "owner", "send"]);
+        assert!(finish_active(&mut host, atoms(), &mut active, response()).is_err());
+        assert_eq!(host.sent.len(), 1);
     }
 
     #[test]
@@ -2972,7 +3230,7 @@ mod transport_tests {
         for (command, millis) in [
             (Command::Hide, 1000),
             (Command::Show, 2500),
-            (Command::BringTop, 2000),
+            (Command::BringTop, 3500),
         ] {
             let now = Instant::now();
             let req = request(command);

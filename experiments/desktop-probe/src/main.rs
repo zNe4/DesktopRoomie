@@ -23,7 +23,7 @@ use crate::x11::menu::{MenuPopup, PopupInputGate};
 use crate::x11::monitors::query_desktop_layout;
 use crate::x11::pointer::{grab_pointer, CaptureOwner, PointerCaptureTracker};
 use crate::x11::render::{Renderer, WINDOW_HEIGHT, WINDOW_WIDTH};
-use crate::x11::state::{LayerAtoms, LayerSupport, PropertyResult};
+use crate::x11::state::{LayerAtoms, LayerSupport, PropertyResult, RemoteLayerIssue};
 use crate::x11::visual::find_alpha_visual;
 use crate::x11::window::{ConfigureReconciliation, ManagedProbeWindow};
 
@@ -144,7 +144,7 @@ fn print_help() {
     println!("  --delay <SECONDS>       Delay in seconds before mapping window (for typing test)");
     println!("  --duration <SECONDS>    Run for a specified duration in seconds, then exit");
     println!(
-        "  --show       Restore the existing body without activation or workspace/layer changes\n  --hide       Minimize the existing body without workspace/layer changes\n  --bring-top  Unsupported (exit 7)"
+        "  --show       Restore the existing body without activation or workspace/layer changes\n  --hide       Minimize the existing body without workspace/layer changes\n  --bring-top  Ensure the existing body is not minimized and set Above on its existing workspace"
     );
 }
 
@@ -1691,6 +1691,30 @@ enum LayerOutcome {
     Busy,
 }
 
+fn layer_read_outcome(
+    layers: &mut LayerController,
+    issue: RemoteLayerIssue,
+    outer_deadline: Option<Instant>,
+    now: Instant,
+) -> LayerOutcome {
+    if issue == RemoteLayerIssue::Waiting {
+        if layers
+            .deadline()
+            .or(outer_deadline)
+            .is_some_and(|dl| now >= dl)
+        {
+            let phase = layers.abort().map_or(layer::Phase::AwaitFinal, |p| p.phase);
+            LayerOutcome::TimedOut(phase)
+        } else {
+            LayerOutcome::Waiting
+        }
+    } else if issue == RemoteLayerIssue::Unsupported {
+        LayerOutcome::Unsupported
+    } else {
+        LayerOutcome::Unverifiable
+    }
+}
+
 fn abort_layer(layers: &mut LayerController, reason: &str) -> Option<LayerOutcome> {
     let pending = layers.abort();
     if pending.is_some() {
@@ -1706,17 +1730,18 @@ fn abort_layer(layers: &mut LayerController, reason: &str) -> Option<LayerOutcom
 
 fn read_layer_with(
     layers: &mut LayerController,
-    read: &mut impl FnMut() -> Result<PropertyResult<ObservedLayer>, HostError>,
-) -> Result<Option<ObservedLayer>, HostError> {
+    read: &mut impl FnMut() -> Result<Result<ObservedLayer, RemoteLayerIssue>, HostError>,
+) -> Result<Result<ObservedLayer, RemoteLayerIssue>, HostError> {
     match read()? {
-        Ok(observed) => Ok(Some(observed)),
+        Ok(observed) => Ok(Ok(observed)),
+        Err(RemoteLayerIssue::Waiting) => Ok(Err(RemoteLayerIssue::Waiting)),
         Err(reason) => {
             eprintln!(
-                "[LAYER] Unverifiable state: {reason}; last readable={:?}",
+                "[LAYER] Unverifiable state: {reason:?}; last readable={:?}",
                 layers.observed
             );
-            abort_layer(layers, reason);
-            Ok(None)
+            abort_layer(layers, "layer qualification failed");
+            Ok(Err(reason))
         }
     }
 }
@@ -1761,6 +1786,38 @@ fn service_layer_bounded_with(
     request: Option<Layer>,
     outer_deadline: Option<Instant>,
     mut read: impl FnMut() -> Result<PropertyResult<ObservedLayer>, HostError>,
+    support: impl FnMut() -> Result<PropertyResult<LayerSupport>, HostError>,
+    send: impl FnMut(Mutation) -> Result<(), HostError>,
+    now: impl FnMut() -> Instant,
+) -> Result<LayerOutcome, HostError> {
+    service_qualified_layer_with(
+        layers,
+        request,
+        outer_deadline,
+        false,
+        || {
+            read().map(|r| {
+                r.map_err(|reason| {
+                    eprintln!("[LAYER] Property observation failed: {reason}");
+                    RemoteLayerIssue::Unverifiable
+                })
+            })
+        },
+        support,
+        send,
+        now,
+    )
+}
+
+/// Same G1 bounded adapter, with a narrow transient remote-read result. Local
+/// property errors still terminate as Unverifiable through the wrapper above.
+#[allow(clippy::too_many_arguments)]
+fn service_qualified_layer_with(
+    layers: &mut LayerController,
+    request: Option<Layer>,
+    outer_deadline: Option<Instant>,
+    remote: bool,
+    mut read: impl FnMut() -> Result<Result<ObservedLayer, RemoteLayerIssue>, HostError>,
     mut support: impl FnMut() -> Result<PropertyResult<LayerSupport>, HostError>,
     mut send: impl FnMut(Mutation) -> Result<(), HostError>,
     mut now: impl FnMut() -> Instant,
@@ -1777,10 +1834,14 @@ fn service_layer_bounded_with(
     }
     let accepted = now();
     let result = (|| {
-        let Some(observed) = read_layer_with(layers, &mut read)? else {
-            return Ok(LayerOutcome::Unverifiable);
+        let observed = match read_layer_with(layers, &mut read)? {
+            Ok(observed) => observed,
+            Err(issue) => return Ok(layer_read_outcome(layers, issue, outer_deadline, now())),
         };
         let previous = layers.observed;
+        if remote && remote_layer_interrupted(layers, observed) {
+            return Ok(abort_layer(layers, "incompatible remote layer change").unwrap());
+        }
         let mut step = match request {
             Some(target) => match outer_deadline {
                 Some(deadline) => layers.begin_bounded(target, observed, accepted, deadline),
@@ -1806,18 +1867,32 @@ fn service_layer_bounded_with(
                         }
                     }
                     if layers.deadline().is_some_and(|deadline| now() >= deadline) {
-                        let Some(observed) = read_layer_with(layers, &mut read)? else {
-                            return Ok(LayerOutcome::Unverifiable);
+                        let observed = match read_layer_with(layers, &mut read)? {
+                            Ok(observed) => observed,
+                            Err(issue) => {
+                                return Ok(layer_read_outcome(layers, issue, outer_deadline, now()))
+                            }
                         };
+                        if remote && remote_layer_interrupted(layers, observed) {
+                            return Ok(
+                                abort_layer(layers, "incompatible remote layer change").unwrap()
+                            );
+                        }
                         step = layers.observe(observed, now());
                         continue;
                     }
                     send(mutation)?;
                     println!("[LAYER] X11 checked {mutation:?}; awaiting fresh WM state");
-                    let Some(observed) = read_layer_with(layers, &mut read)? else {
-                        return Ok(LayerOutcome::Unverifiable);
+                    let observed = match read_layer_with(layers, &mut read)? {
+                        Ok(observed) => observed,
+                        Err(issue) => {
+                            return Ok(layer_read_outcome(layers, issue, outer_deadline, now()))
+                        }
                     };
                     println!("[LAYER] Fresh observed state: {observed:?}");
+                    if remote && remote_layer_interrupted(layers, observed) {
+                        return Ok(abort_layer(layers, "incompatible remote layer change").unwrap());
+                    }
                     step = layers.observe(observed, now());
                 }
                 Step::AlreadyMatches => {
@@ -1844,6 +1919,14 @@ fn service_layer_bounded_with(
         abort_layer(layers, "fatal X11 layer operation failure");
     }
     result
+}
+
+fn remote_layer_interrupted(layers: &LayerController, observed: ObservedLayer) -> bool {
+    layers
+        .pending()
+        .is_some_and(|p| p.phase == layer::Phase::AwaitFinal)
+        && layers.desired == Some(Layer::Above)
+        && observed == ObservedLayer::Below
 }
 
 fn service_layer(
@@ -1997,6 +2080,7 @@ fn interrupts_pending_movement(
 /// progress stay in ControlWindow; the native adapter owns no request or queue.
 trait VisibilityHost {
     fn now(&self) -> Instant;
+    fn layer_atoms(&self) -> LayerAtoms;
     fn observe(&mut self) -> Result<x11::visibility::VisibilitySnapshot, HostError>;
     fn noop_ready(&self) -> bool;
     fn placement_busy(&self) -> bool;
@@ -2198,7 +2282,7 @@ fn service_visibility_with(
             }
             Ok(outcome)
         }
-        control::Command::BringTop => unreachable!("BringTop remains immediate Unsupported"),
+        control::Command::BringTop => unreachable!("Bring Top uses the remote composition service"),
     }
 }
 
@@ -2227,11 +2311,10 @@ fn observe_visibility(
             &mut operation.hide.baseline,
             operation.hide.layout_interrupted,
         ),
-        control::Command::Show => (
+        control::Command::Show | control::Command::BringTop => (
             &mut operation.show.baseline,
             operation.show.layout_interrupted,
         ),
-        control::Command::BringTop => unreachable!("BringTop is not deferred"),
     };
     if layout_interrupted {
         return Ok((snapshot, Some(Reason::LayoutChanged)));
@@ -2245,7 +2328,8 @@ fn observe_visibility(
                     if desktop != baseline.desktop || current_desktop != baseline.current_desktop {
                         return Ok((snapshot, Some(Reason::LayoutChanged)));
                     }
-                    if snapshot.layer != LayerObservation::Unknown
+                    if operation.request.command != control::Command::BringTop
+                        && snapshot.layer != LayerObservation::Unknown
                         && snapshot.layer != baseline.layer
                     {
                         return Ok((snapshot, Some(Reason::LayerChanged)));
@@ -2262,7 +2346,16 @@ fn observe_visibility(
                             | LayerObservation::Above
                             | LayerObservation::Below
                     ) {
-                        return Ok((snapshot, Some(Reason::Unverifiable)));
+                        let reason = if operation.request.command == control::Command::BringTop {
+                            visibility_layer_issue(host, &snapshot).unwrap_or(Reason::Unverifiable)
+                        } else {
+                            Reason::Unverifiable
+                        };
+                        return Ok((snapshot, Some(reason)));
+                    }
+                    if operation.request.command == control::Command::BringTop {
+                        operation.bring_top.minimized_at_start =
+                            snapshot.candidate.visibility == Visibility::Minimized;
                     }
                     *baseline = Some(VisibilityBaseline {
                         desktop,
@@ -2273,7 +2366,48 @@ fn observe_visibility(
             }
         }
     }
+    if operation.request.command == control::Command::BringTop
+        && snapshot.evidence.coherent
+        && baseline.is_some()
+    {
+        if operation.bring_top.minimized_at_start
+            && matches!(
+                snapshot.candidate.visibility,
+                Visibility::NotMinimizedHere | Visibility::NotMinimizedElsewhere
+            )
+        {
+            operation.bring_top.restoration_confirmed = true;
+        }
+        if let Some(reason) = visibility_layer_issue(host, &snapshot) {
+            return Ok((snapshot, Some(reason)));
+        }
+    }
     Ok((snapshot, None))
+}
+
+fn visibility_layer_issue(
+    host: &impl VisibilityHost,
+    snapshot: &x11::visibility::VisibilitySnapshot,
+) -> Option<control::Reason> {
+    use control::{Evidence, LayerObservation, Reason};
+    let atoms = host.layer_atoms();
+    let Some(observation) = snapshot.observation.as_ref() else {
+        return Some(Reason::Unverifiable);
+    };
+    let Evidence::Readable(support) = &observation.supported else {
+        return Some(Reason::Unverifiable);
+    };
+    if ![atoms.state, atoms.above, atoms.below]
+        .iter()
+        .all(|a| support.contains(a))
+    {
+        return Some(Reason::Unsupported);
+    }
+    matches!(
+        snapshot.layer,
+        LayerObservation::Unknown | LayerObservation::Conflict
+    )
+    .then_some(Reason::Unverifiable)
 }
 
 fn visibility_observation_eligible(
@@ -2282,16 +2416,25 @@ fn visibility_observation_eligible(
 ) -> bool {
     let baseline = match operation.request.command {
         control::Command::Hide => operation.hide.baseline,
-        control::Command::Show => operation.show.baseline,
-        control::Command::BringTop => None,
+        control::Command::Show | control::Command::BringTop => operation.show.baseline,
     };
-    baseline.is_some_and(|b| snapshot.layer == b.layer)
-        && matches!(
-            snapshot.candidate.visibility,
-            control::Visibility::Minimized
-                | control::Visibility::NotMinimizedHere
-                | control::Visibility::NotMinimizedElsewhere
-        )
+    baseline.is_some_and(|b| {
+        if operation.request.command == control::Command::BringTop {
+            matches!(
+                snapshot.layer,
+                control::LayerObservation::Normal
+                    | control::LayerObservation::Above
+                    | control::LayerObservation::Below
+            )
+        } else {
+            snapshot.layer == b.layer
+        }
+    }) && matches!(
+        snapshot.candidate.visibility,
+        control::Visibility::Minimized
+            | control::Visibility::NotMinimizedHere
+            | control::Visibility::NotMinimizedElsewhere
+    )
 }
 
 fn validate_show_placement(
@@ -2324,45 +2467,102 @@ fn validate_show_placement(
 
 /// Each invocation is bounded and returns to the existing event loop. Relevant
 /// events only request re-observation; they never confirm a phase or extend time.
+#[derive(Debug, Clone, Copy)]
+enum VisibilityCompletion {
+    Ready(control::ConfirmedVisibility),
+    Failed(control::Status, control::Reason),
+}
+
+fn visibility_completion(
+    operation: &mut control::ActiveOperation,
+    status: control::Status,
+    reason: control::Reason,
+    confirmed: Option<control::ConfirmedVisibility>,
+) -> VisibilityCompletion {
+    operation.detail.reason = reason;
+    match confirmed {
+        Some(visibility) if status == control::Status::Success => {
+            VisibilityCompletion::Ready(visibility)
+        }
+        _ => VisibilityCompletion::Failed(status, reason),
+    }
+}
+
+fn visibility_cutoff(operation: &control::ActiveOperation) -> Instant {
+    if operation.request.command == control::Command::BringTop {
+        operation
+            .bring_top
+            .visibility_cutoff
+            .min(operation.deadline)
+    } else {
+        operation.deadline
+    }
+}
+
 fn service_show_with(
     operation: &mut control::ActiveOperation,
     host: &mut impl VisibilityHost,
 ) -> Result<Option<control::OperationResult>, HostError> {
+    service_visibility_stage_with(operation, host).map(|outcome| {
+        outcome.map(|completion| match completion {
+            VisibilityCompletion::Ready(visibility) => show_result(
+                operation,
+                control::Status::Success,
+                control::Reason::None,
+                Some(visibility),
+            ),
+            VisibilityCompletion::Failed(status, reason) => {
+                show_result(operation, status, reason, None)
+            }
+        })
+    })
+}
+
+fn service_visibility_stage_with(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl VisibilityHost,
+) -> Result<Option<VisibilityCompletion>, HostError> {
     use control::{ConfirmedVisibility, Reason, ShowPhase, Stage, Status, Visibility};
     operation.show.observe = false;
     if operation.show.phase == ShowPhase::Observe
         && host.placement_busy()
-        && host.now() < operation.deadline
+        && host.now() < visibility_cutoff(operation)
     {
         operation.detail.stage = Stage::Preflight;
-        return Ok(Some(show_result(
+        return Ok(Some(visibility_completion(
             operation,
             Status::Busy,
             Reason::Busy,
             None,
         )));
     }
-    let started_expired = host.now() >= operation.deadline;
+    let started_expired = host.now() >= visibility_cutoff(operation);
     let (mut snapshot, reason) = observe_visibility(operation, host)?;
     if let Some(reason) = reason {
-        return Ok(Some(show_result(operation, Status::Failed, reason, None)));
+        return Ok(Some(visibility_completion(
+            operation,
+            Status::Failed,
+            reason,
+            None,
+        )));
     }
     // If synchronous observation crossed expiry, this is the single final fresh
     // read. No subsequent visibility, geometry or enabling mutation is permitted.
-    let mut expired = host.now() >= operation.deadline;
+    let mut expired = host.now() >= visibility_cutoff(operation);
     if expired && !started_expired {
-        return service_show_final(operation, host);
+        return service_visibility_stage_final(operation, host);
     }
     if !visibility_observation_eligible(operation, &snapshot) {
-        return Ok(expired
-            .then(|| show_result(operation, Status::Failed, Reason::ConfirmationTimeout, None)));
+        return Ok(expired.then(|| {
+            visibility_completion(operation, Status::Failed, Reason::ConfirmationTimeout, None)
+        }));
     }
     if operation.show.phase == ShowPhase::Observe {
         let local_noop =
             snapshot.candidate.visibility == Visibility::NotMinimizedHere && host.noop_ready();
         if !local_noop && !host.fenced() {
             if expired {
-                return Ok(Some(show_result(
+                return Ok(Some(visibility_completion(
                     operation,
                     Status::Failed,
                     Reason::ConfirmationTimeout,
@@ -2376,15 +2576,25 @@ fn service_show_with(
             let (fresh, reason) = observe_visibility(operation, host)?;
             snapshot = fresh;
             if let Some(reason) = reason {
-                return Ok(Some(show_result(operation, Status::Failed, reason, None)));
+                return Ok(Some(visibility_completion(
+                    operation,
+                    Status::Failed,
+                    reason,
+                    None,
+                )));
             }
-            expired = host.now() >= operation.deadline;
+            expired = host.now() >= visibility_cutoff(operation);
             if expired {
-                return service_show_final(operation, host);
+                return service_visibility_stage_final(operation, host);
             }
             if !visibility_observation_eligible(operation, &snapshot) {
                 return Ok(expired.then(|| {
-                    show_result(operation, Status::Failed, Reason::ConfirmationTimeout, None)
+                    visibility_completion(
+                        operation,
+                        Status::Failed,
+                        Reason::ConfirmationTimeout,
+                        None,
+                    )
                 }));
             }
         } else if host.fenced() {
@@ -2398,7 +2608,7 @@ fn service_show_with(
     match snapshot.candidate.visibility {
         Visibility::Minimized => {
             if expired {
-                return Ok(Some(show_result(
+                return Ok(Some(visibility_completion(
                     operation,
                     Status::Failed,
                     Reason::ConfirmationTimeout,
@@ -2417,12 +2627,12 @@ fn service_show_with(
                 let requested = if elsewhere {
                     host.hidden(
                         false,
-                        operation.deadline,
+                        visibility_cutoff(operation),
                         &mut operation.detail.progress.host_mutation_dispatched,
                     )?
                 } else {
                     host.restore(
-                        operation.deadline,
+                        visibility_cutoff(operation),
                         &mut operation.detail.progress.host_mutation_dispatched,
                     )?
                 };
@@ -2433,8 +2643,8 @@ fn service_show_with(
                         ShowPhase::RestoreRequested
                     };
                 }
-                if !requested || host.now() >= operation.deadline {
-                    return service_show_final(operation, host);
+                if !requested || host.now() >= visibility_cutoff(operation) {
+                    return service_visibility_stage_final(operation, host);
                 }
                 // Checked requests may have buffered WM events. Let the loop drain
                 // them before another observation or any socket wait.
@@ -2445,21 +2655,27 @@ fn service_show_with(
         Visibility::NotMinimizedElsewhere => {
             let (fresh, reason) = observe_visibility(operation, host)?;
             if let Some(reason) = reason {
-                return Ok(Some(show_result(operation, Status::Failed, reason, None)));
+                return Ok(Some(visibility_completion(
+                    operation,
+                    Status::Failed,
+                    reason,
+                    None,
+                )));
             }
             if visibility_observation_eligible(operation, &fresh)
                 && fresh.candidate.visibility == Visibility::NotMinimizedElsewhere
                 && host.fence_settled()
             {
-                return Ok(Some(show_result(
+                return Ok(Some(visibility_completion(
                     operation,
                     Status::Success,
                     Reason::None,
                     Some(ConfirmedVisibility::NotMinimizedElsewhere),
                 )));
             }
-            Ok((host.now() >= operation.deadline)
-                .then(|| show_result(operation, Status::Failed, Reason::ConfirmationTimeout, None)))
+            Ok((host.now() >= visibility_cutoff(operation)).then(|| {
+                visibility_completion(operation, Status::Failed, Reason::ConfirmationTimeout, None)
+            }))
         }
         Visibility::NotMinimizedHere => {
             operation.stage = Stage::Geometry;
@@ -2467,11 +2683,16 @@ fn service_show_with(
             operation.detail.reason = Reason::X11Failure;
             let placement = host.placement()?;
             if let Some(reason) = validate_show_placement(operation, &placement)? {
-                return Ok(Some(show_result(operation, Status::Failed, reason, None)));
+                return Ok(Some(visibility_completion(
+                    operation,
+                    Status::Failed,
+                    reason,
+                    None,
+                )));
             }
             let now = host.now();
-            if now >= operation.deadline {
-                return service_show_final(operation, host);
+            if now >= visibility_cutoff(operation) {
+                return service_visibility_stage_final(operation, host);
             }
             if let Some((target, deadline)) = operation.show.correction {
                 if now < deadline {
@@ -2489,8 +2710,10 @@ fn service_show_with(
                 .bounds
                 .contains(placement.input.geometry.origin())
             {
-                if now >= operation.deadline || now + CONFIRMATION_TIMEOUT > operation.deadline {
-                    return Ok(Some(show_result(
+                if now >= visibility_cutoff(operation)
+                    || now + CONFIRMATION_TIMEOUT > visibility_cutoff(operation)
+                {
+                    return Ok(Some(visibility_completion(
                         operation,
                         Status::Failed,
                         Reason::ConfirmationTimeout,
@@ -2502,7 +2725,7 @@ fn service_show_with(
                 }
                 // A Ready no-op never cancels or moves an ongoing gesture.
                 if !host.fenced() {
-                    return Ok(Some(show_result(
+                    return Ok(Some(visibility_completion(
                         operation,
                         Status::Busy,
                         Reason::Busy,
@@ -2515,42 +2738,57 @@ fn service_show_with(
                     .clamp(placement.input.geometry.origin());
                 if let Some(confirmation) = host.correct(
                     target,
-                    operation.deadline,
+                    visibility_cutoff(operation),
                     &mut operation.detail.progress.host_mutation_dispatched,
                 )? {
                     operation.show.correction_sent = true;
                     operation.show.correction = Some((target, confirmation));
                 } else {
-                    return service_show_final(operation, host);
+                    return service_visibility_stage_final(operation, host);
                 }
-                if host.now() >= operation.deadline {
-                    return service_show_final(operation, host);
+                if host.now() >= visibility_cutoff(operation) {
+                    return service_visibility_stage_final(operation, host);
                 }
                 return Ok(None);
             }
             // Revalidate visibility/preservation after the synchronous geometry reads.
             let (fresh, reason) = observe_visibility(operation, host)?;
             if let Some(reason) = reason {
-                return Ok(Some(show_result(operation, Status::Failed, reason, None)));
+                return Ok(Some(visibility_completion(
+                    operation,
+                    Status::Failed,
+                    reason,
+                    None,
+                )));
             }
             if !visibility_observation_eligible(operation, &fresh)
                 || fresh.candidate.visibility != Visibility::NotMinimizedHere
             {
-                return Ok((host.now() >= operation.deadline).then(|| {
-                    show_result(operation, Status::Failed, Reason::ConfirmationTimeout, None)
+                return Ok((host.now() >= visibility_cutoff(operation)).then(|| {
+                    visibility_completion(
+                        operation,
+                        Status::Failed,
+                        Reason::ConfirmationTimeout,
+                        None,
+                    )
                 }));
             }
             if host.fenced() {
-                if host.now() >= operation.deadline {
-                    return service_show_final(operation, host);
+                if host.now() >= visibility_cutoff(operation) {
+                    return service_visibility_stage_final(operation, host);
                 }
                 operation.detail.reason = Reason::X11Failure;
                 let verified = host.placement()?;
                 if let Some(reason) = validate_show_placement(operation, &verified)? {
-                    return Ok(Some(show_result(operation, Status::Failed, reason, None)));
+                    return Ok(Some(visibility_completion(
+                        operation,
+                        Status::Failed,
+                        reason,
+                        None,
+                    )));
                 }
                 if verified.input.geometry != placement.input.geometry {
-                    return Ok(Some(show_result(
+                    return Ok(Some(visibility_completion(
                         operation,
                         Status::Failed,
                         Reason::LayoutChanged,
@@ -2558,20 +2796,20 @@ fn service_show_with(
                     )));
                 }
                 operation.show.phase = ShowPhase::EnablingInput;
-                if !host.enable(&fresh, &verified.input, Some(operation.deadline))? {
+                if !host.enable(&fresh, &verified.input, Some(visibility_cutoff(operation)))? {
                     operation.show.phase = ShowPhase::Fenced;
-                    return service_show_final(operation, host);
+                    return service_visibility_stage_final(operation, host);
                 }
                 operation.show.phase = ShowPhase::InputRestored;
             } else if !host.noop_ready() {
-                return Ok(Some(show_result(
+                return Ok(Some(visibility_completion(
                     operation,
                     Status::Busy,
                     Reason::Busy,
                     None,
                 )));
             }
-            service_show_final(operation, host)
+            service_visibility_stage_final(operation, host)
         }
         _ => unreachable!("eligible classification checked above"),
     }
@@ -2579,20 +2817,25 @@ fn service_show_with(
 
 /// Final read-only observation, also used at expiry. Success here requires input
 /// that was already safely enabled; expiry never creates new readiness.
-fn service_show_final(
+fn service_visibility_stage_final(
     operation: &mut control::ActiveOperation,
     host: &mut impl VisibilityHost,
-) -> Result<Option<control::OperationResult>, HostError> {
+) -> Result<Option<VisibilityCompletion>, HostError> {
     use control::{ConfirmedVisibility, Reason, Status, Visibility};
     let (snapshot, reason) = observe_visibility(operation, host)?;
     if let Some(reason) = reason {
-        return Ok(Some(show_result(operation, Status::Failed, reason, None)));
+        return Ok(Some(visibility_completion(
+            operation,
+            Status::Failed,
+            reason,
+            None,
+        )));
     }
     if visibility_observation_eligible(operation, &snapshot) {
         if snapshot.candidate.visibility == Visibility::NotMinimizedElsewhere
             && host.fence_settled()
         {
-            return Ok(Some(show_result(
+            return Ok(Some(visibility_completion(
                 operation,
                 Status::Success,
                 Reason::None,
@@ -2603,7 +2846,12 @@ fn service_show_final(
             operation.detail.reason = Reason::X11Failure;
             let placement = host.placement()?;
             if let Some(reason) = validate_show_placement(operation, &placement)? {
-                return Ok(Some(show_result(operation, Status::Failed, reason, None)));
+                return Ok(Some(visibility_completion(
+                    operation,
+                    Status::Failed,
+                    reason,
+                    None,
+                )));
             }
             if placement
                 .input
@@ -2613,12 +2861,17 @@ fn service_show_final(
             {
                 let (fresh, reason) = observe_visibility(operation, host)?;
                 if let Some(reason) = reason {
-                    return Ok(Some(show_result(operation, Status::Failed, reason, None)));
+                    return Ok(Some(visibility_completion(
+                        operation,
+                        Status::Failed,
+                        reason,
+                        None,
+                    )));
                 }
                 if visibility_observation_eligible(operation, &fresh)
                     && fresh.candidate.visibility == Visibility::NotMinimizedHere
                 {
-                    return Ok(Some(show_result(
+                    return Ok(Some(visibility_completion(
                         operation,
                         Status::Success,
                         Reason::None,
@@ -2628,16 +2881,378 @@ fn service_show_final(
             }
         }
     }
-    Ok(Some(show_result(
+    Ok(Some(visibility_completion(
         operation,
         Status::Failed,
-        if host.now() >= operation.deadline {
+        if host.now() >= visibility_cutoff(operation) {
             Reason::ConfirmationTimeout
         } else {
             Reason::Unverifiable
         },
         None,
     )))
+}
+
+/// Layer servicing is a host operation; it does not own a second request or
+/// controller. Fakes use the same bounded adapter as the native implementation.
+trait BringTopHost: VisibilityHost {
+    fn qualify_layer(
+        &self,
+        snapshot: &x11::visibility::VisibilitySnapshot,
+        baseline: control::VisibilityBaseline,
+    ) -> Result<ObservedLayer, RemoteLayerIssue>;
+    fn service_above(
+        &mut self,
+        operation: &mut control::ActiveOperation,
+    ) -> Result<(LayerOutcome, Option<RemoteLayerIssue>), HostError>;
+    fn abort_above(&mut self);
+    fn layer_deadline(&self) -> Option<Instant>;
+}
+
+fn bring_top_failure_status(operation: &control::ActiveOperation) -> control::Status {
+    if operation.bring_top.minimized_at_start && operation.bring_top.restoration_confirmed {
+        control::Status::Partial
+    } else {
+        control::Status::Failed
+    }
+}
+
+/// Current visibility is independent of historical restoration and of input
+/// readiness. Even a Partial after destruction must clear current proof bits.
+fn bring_top_confirmation(
+    snapshot: &x11::visibility::VisibilitySnapshot,
+) -> Option<control::ConfirmedVisibility> {
+    use control::{ConfirmedVisibility as C, Visibility as V};
+    if !snapshot.evidence.coherent {
+        return None;
+    }
+    match snapshot.candidate.visibility {
+        V::Minimized => Some(C::Minimized),
+        V::NotMinimizedHere => Some(C::NotMinimizedHere),
+        V::NotMinimizedElsewhere => Some(C::NotMinimizedElsewhere),
+        _ => None,
+    }
+}
+
+fn bring_top_workspace_preserved(
+    operation: &control::ActiveOperation,
+    snapshot: &x11::visibility::VisibilitySnapshot,
+) -> bool {
+    use control::Evidence;
+    snapshot.evidence.coherent
+        && operation.show.baseline.is_some_and(|baseline| {
+            snapshot.observation.as_ref().is_some_and(|observed| {
+                observed.desktop == Evidence::Readable(baseline.desktop)
+                    && observed.current_desktop == Evidence::Readable(baseline.current_desktop)
+            })
+        })
+}
+
+fn compose_bring_top_result(
+    operation: &mut control::ActiveOperation,
+    reason: control::Reason,
+    confirmed: control::Confirmation,
+    ready: bool,
+    allow_success: bool,
+) -> control::OperationResult {
+    use control::{ConfirmedVisibility as C, Reason, Status};
+    let p = &mut operation.detail.progress;
+    p.not_minimized_confirmed = matches!(
+        confirmed.visibility,
+        Some(C::NotMinimizedHere | C::NotMinimizedElsewhere)
+    );
+    p.above_confirmed = confirmed.above;
+    p.placement_deferred = confirmed.visibility == Some(C::NotMinimizedElsewhere) && ready;
+    p.input_ready = confirmed.visibility == Some(C::NotMinimizedHere) && ready;
+    let success = allow_success && ready && p.not_minimized_confirmed && confirmed.above;
+    let status = if success {
+        Status::Success
+    } else {
+        bring_top_failure_status(operation)
+    };
+    operation.detail.reason = if success { Reason::None } else { reason };
+    control::OperationResult::bring_top(status, operation.detail, confirmed, &operation.bring_top)
+        .expect("Bring Top result requires genuine restoration proof and fresh current evidence")
+}
+
+fn finish_bring_top_with(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl BringTopHost,
+    reason: control::Reason,
+    allow_success: bool,
+) -> Result<control::OperationResult, HostError> {
+    finish_bring_top_observed_with(operation, host, reason, allow_success).map(|(result, _)| result)
+}
+
+fn finish_bring_top_observed_with(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl BringTopHost,
+    reason: control::Reason,
+    allow_success: bool,
+) -> Result<(control::OperationResult, Option<RemoteLayerIssue>), HostError> {
+    use control::{ConfirmedVisibility as C, Reason};
+    let (mut snapshot, issue) = observe_visibility(operation, host)?;
+    let mut reason = issue.unwrap_or(reason);
+    let mut visibility = bring_top_confirmation(&snapshot);
+    let mut ready = visibility == Some(C::NotMinimizedElsewhere)
+        && host.fence_settled()
+        && bring_top_workspace_preserved(operation, &snapshot);
+    if visibility == Some(C::NotMinimizedHere)
+        && host.noop_ready()
+        && operation.show.correction.is_none()
+    {
+        operation.detail.reason = Reason::X11Failure;
+        let placement = host.placement()?;
+        if let Some(issue) = validate_show_placement(operation, &placement)? {
+            reason = issue;
+        } else if placement
+            .input
+            .bounds
+            .contains(placement.input.geometry.origin())
+        {
+            let (fresh, issue) = observe_visibility(operation, host)?;
+            snapshot = fresh;
+            visibility = bring_top_confirmation(&snapshot);
+            if let Some(issue) = issue {
+                reason = issue;
+            }
+            ready = visibility == Some(C::NotMinimizedHere) && host.noop_ready();
+        }
+    }
+    let layer = operation
+        .show
+        .baseline
+        .map(|baseline| host.qualify_layer(&snapshot, baseline));
+    let above = layer == Some(Ok(ObservedLayer::Above));
+    if reason == Reason::None && !(above && ready) {
+        reason = match layer {
+            Some(Err(issue)) => remote_layer_reason(issue),
+            Some(Ok(ObservedLayer::Normal | ObservedLayer::Below)) => Reason::LayerChanged,
+            _ => Reason::Unverifiable,
+        };
+    }
+    // Workspace/layout failure cannot be converted into Success by Above alone.
+    let eligible_success = allow_success
+        && !operation.show.layout_interrupted
+        && !matches!(
+            reason,
+            Reason::LayoutChanged
+                | Reason::LayerChanged
+                | Reason::OwnershipLost
+                | Reason::Closing
+                | Reason::X11Failure
+        );
+    Ok((
+        compose_bring_top_result(
+            operation,
+            reason,
+            control::Confirmation { visibility, above },
+            ready,
+            eligible_success,
+        ),
+        layer.and_then(Result::err),
+    ))
+}
+
+fn service_bring_top_final_with(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl BringTopHost,
+    reason: control::Reason,
+    allow_success: bool,
+) -> Result<Option<control::OperationResult>, HostError> {
+    let (result, issue) = finish_bring_top_observed_with(operation, host, reason, allow_success)?;
+    if operation.bring_top.layer_finished
+        && issue == Some(RemoteLayerIssue::Waiting)
+        && host.now() < remote_operation_deadline(operation)
+    {
+        // Fresh final evidence is transitional. Wait for an event or the fixed
+        // deadline; never restart the completed controller or send another request.
+        Ok(None)
+    } else {
+        Ok(Some(result))
+    }
+}
+
+fn remote_layer_reason(issue: RemoteLayerIssue) -> control::Reason {
+    use control::{Reason, Visibility};
+    match issue {
+        RemoteLayerIssue::Waiting => Reason::ConfirmationTimeout,
+        RemoteLayerIssue::Unsupported => Reason::Unsupported,
+        RemoteLayerIssue::Unverifiable => Reason::Unverifiable,
+        RemoteLayerIssue::WorkspaceChanged => Reason::LayoutChanged,
+        RemoteLayerIssue::Unavailable(Visibility::Destroyed) => Reason::BodyDestroyed,
+        RemoteLayerIssue::Unavailable(Visibility::Withdrawn) => Reason::Withdrawn,
+        RemoteLayerIssue::Unavailable(_) => Reason::Unverifiable,
+    }
+}
+
+fn service_bring_top_with(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl BringTopHost,
+) -> Result<Option<control::OperationResult>, HostError> {
+    use control::{Reason, Stage, Status};
+    if operation.stage != Stage::Layer {
+        let outcome = service_visibility_stage_with(operation, host);
+        let failed = matches!(
+            outcome,
+            Err(_) | Ok(Some(VisibilityCompletion::Failed(_, _)))
+        );
+        if failed
+            && matches!(
+                operation.show.phase,
+                control::ShowPhase::EnablingInput | control::ShowPhase::InputRestored
+            )
+        {
+            let cleanup = host.fence();
+            if let Err(error) = &cleanup {
+                eprintln!("[BRING TOP] Input safety cleanup: {error}");
+            }
+            // Retain original native failure priority, exactly as standalone Show.
+            if let Err(original) = outcome {
+                return Err(original);
+            }
+            cleanup?;
+        }
+        match outcome? {
+            None => return Ok(None),
+            Some(VisibilityCompletion::Failed(Status::Busy, reason)) => {
+                if operation.detail.progress.host_mutation_dispatched
+                    || operation.show.phase != control::ShowPhase::Observe
+                    || operation.bring_top.restoration_confirmed
+                {
+                    return finish_bring_top_with(operation, host, reason, false).map(Some);
+                }
+                // Busy is reserved for admission/readiness before operation work.
+                operation.detail.reason = reason;
+                return Ok(Some(
+                    control::OperationResult::bring_top(
+                        Status::Busy,
+                        operation.detail,
+                        control::Confirmation::default(),
+                        &operation.bring_top,
+                    )
+                    .unwrap(),
+                ));
+            }
+            Some(VisibilityCompletion::Failed(_, reason)) => {
+                return finish_bring_top_with(operation, host, reason, false).map(Some)
+            }
+            Some(VisibilityCompletion::Ready(_)) => {
+                if host.now() >= visibility_cutoff(operation) {
+                    // A final read may confirm the whole already-achieved
+                    // contract, but late readiness cannot start layer mutation.
+                    return finish_bring_top_with(
+                        operation,
+                        host,
+                        Reason::ConfirmationTimeout,
+                        true,
+                    )
+                    .map(Some);
+                }
+                operation.stage = Stage::Layer;
+                operation.detail.stage = Stage::Layer;
+                operation.bring_top.layer_admitted = Some(host.now());
+                operation.bring_top.layer_observe = true;
+            }
+        }
+    }
+    operation.bring_top.layer_observe = false;
+    if operation.show.layout_interrupted {
+        host.abort_above();
+        return finish_bring_top_with(operation, host, Reason::LayoutChanged, false).map(Some);
+    }
+    if operation.bring_top.layer_finished {
+        let reason = if host.now() >= remote_operation_deadline(operation) {
+            Reason::ConfirmationTimeout
+        } else {
+            Reason::None
+        };
+        return service_bring_top_final_with(operation, host, reason, true);
+    }
+    operation.detail.reason = Reason::X11Failure;
+    let (outcome, issue) = host.service_above(operation)?;
+    let reason = issue.map(remote_layer_reason).unwrap_or(match outcome {
+        LayerOutcome::AlreadyMatches | LayerOutcome::Confirmed => Reason::None,
+        LayerOutcome::Waiting | LayerOutcome::TimedOut(_) => Reason::ConfirmationTimeout,
+        LayerOutcome::Unsupported => Reason::Unsupported,
+        LayerOutcome::Unverifiable => Reason::Unverifiable,
+        LayerOutcome::Interrupted(_) => Reason::LayerChanged,
+        LayerOutcome::Busy => Reason::Busy,
+    });
+    if outcome == LayerOutcome::Waiting {
+        return Ok(None);
+    }
+    operation.bring_top.layer_finished = matches!(
+        outcome,
+        LayerOutcome::AlreadyMatches | LayerOutcome::Confirmed
+    );
+    host.abort_above();
+    service_bring_top_final_with(
+        operation,
+        host,
+        reason,
+        matches!(
+            outcome,
+            LayerOutcome::AlreadyMatches | LayerOutcome::Confirmed | LayerOutcome::TimedOut(_)
+        ),
+    )
+}
+
+fn service_remote_with(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl BringTopHost,
+) -> Result<Option<control::OperationResult>, HostError> {
+    if operation.request.command == control::Command::BringTop {
+        service_bring_top_with(operation, host)
+    } else {
+        service_visibility_with(operation, host)
+    }
+}
+
+/// Retains marked dispatch even when the native check fails. A transitional
+/// read cannot destroy a pending G1 controller; its original deadline still wins.
+#[allow(clippy::too_many_arguments)]
+fn service_remote_layer_with(
+    layers: &mut LayerController,
+    operation: &mut control::ActiveOperation,
+    mut read: impl FnMut() -> Result<Result<ObservedLayer, RemoteLayerIssue>, HostError>,
+    support: impl FnMut() -> Result<PropertyResult<LayerSupport>, HostError>,
+    mut send: impl FnMut(Mutation, &mut bool) -> Result<(), HostError>,
+    now: impl FnMut() -> Instant,
+) -> Result<(LayerOutcome, Option<RemoteLayerIssue>), HostError> {
+    let admitted = operation
+        .bring_top
+        .layer_admitted
+        .expect("Layer admission is fixed at visibility readiness");
+    let outer = (admitted + layer::CONFIRMATION_TIMEOUT).min(operation.deadline);
+    let issue = std::cell::Cell::new(None);
+    if layers.pending().is_none() && operation.bring_top.layer_attempted {
+        return Ok((LayerOutcome::Interrupted(layer::Phase::AwaitFinal), None));
+    }
+    let request = layers.pending().is_none().then_some(Layer::Above);
+    let result = service_qualified_layer_with(
+        layers,
+        request,
+        Some(outer),
+        true,
+        || {
+            let result = read()?;
+            issue.set(result.as_ref().err().copied());
+            Ok(result)
+        },
+        support,
+        |mutation| {
+            operation.bring_top.layer_attempted = true;
+            let mut dispatched = false;
+            let result = send(mutation, &mut dispatched);
+            operation.bring_top.layer_dispatched |= dispatched;
+            operation.detail.progress.host_mutation_dispatched |= dispatched;
+            operation.bring_top.layer_checked |= result.is_ok();
+            result
+        },
+        now,
+    );
+    result.map(|outcome| (outcome, issue.get()))
 }
 
 struct NativeVisibility<'a, C> {
@@ -2654,6 +3269,14 @@ struct NativeVisibility<'a, C> {
 impl<C: Connection> VisibilityHost for NativeVisibility<'_, C> {
     fn now(&self) -> Instant {
         Instant::now()
+    }
+    fn layer_atoms(&self) -> LayerAtoms {
+        LayerAtoms {
+            supported: self.atoms.supported,
+            state: self.atoms.state,
+            above: self.atoms.above,
+            below: self.atoms.below,
+        }
     }
     fn observe(&mut self) -> Result<x11::visibility::VisibilitySnapshot, HostError> {
         let snapshot = self
@@ -2788,6 +3411,56 @@ impl<C: Connection> VisibilityHost for NativeVisibility<'_, C> {
     }
 }
 
+impl<C: Connection> BringTopHost for NativeVisibility<'_, C> {
+    fn qualify_layer(
+        &self,
+        snapshot: &x11::visibility::VisibilitySnapshot,
+        baseline: control::VisibilityBaseline,
+    ) -> Result<ObservedLayer, RemoteLayerIssue> {
+        self.layer_atoms().qualify_remote(snapshot, baseline)
+    }
+    fn service_above(
+        &mut self,
+        operation: &mut control::ActiveOperation,
+    ) -> Result<(LayerOutcome, Option<RemoteLayerIssue>), HostError> {
+        let atoms = self.layer_atoms();
+        let baseline = operation
+            .show
+            .baseline
+            .expect("visibility readiness establishes baseline");
+        service_remote_layer_with(
+            &mut self.runtime.layers,
+            operation,
+            || {
+                atoms.read_remote(
+                    self.atoms,
+                    self.conn,
+                    self.root,
+                    self.window.window,
+                    baseline,
+                )
+            },
+            || atoms.read_support(self.conn, self.root),
+            |mutation, dispatched| {
+                atoms.send_marked(
+                    self.conn,
+                    self.root,
+                    self.window.window,
+                    mutation,
+                    dispatched,
+                )
+            },
+            Instant::now,
+        )
+    }
+    fn abort_above(&mut self) {
+        abort_layer(&mut self.runtime.layers, "remote operation ended");
+    }
+    fn layer_deadline(&self) -> Option<Instant> {
+        self.runtime.layers.deadline()
+    }
+}
+
 fn visibility_event(
     event: &Event,
     root: u32,
@@ -2817,40 +3490,73 @@ fn visibility_layout_interruption(
         || matches!(event, Event::PropertyNotify(e) if e.window == root && e.atom == layout.workarea)
 }
 
-fn visibility_deadline(owner: &ControlWindow) -> Option<Instant> {
-    owner.active().map(visibility_operation_deadline)
+fn remote_deadline(owner: &ControlWindow) -> Option<Instant> {
+    owner.active().map(remote_operation_deadline)
 }
 
-fn visibility_operation_deadline(operation: &control::ActiveOperation) -> Instant {
-    if operation.request.command != control::Command::Show {
-        return operation.deadline;
+fn remote_operation_deadline(operation: &control::ActiveOperation) -> Instant {
+    if remote_owns_layer(operation) {
+        return operation
+            .bring_top
+            .layer_admitted
+            .map_or(operation.deadline, |admitted| {
+                (admitted + layer::CONFIRMATION_TIMEOUT).min(operation.deadline)
+            });
+    }
+    let cutoff = visibility_cutoff(operation);
+    if operation.request.command == control::Command::Hide {
+        return cutoff;
     }
     operation
         .show
         .correction
-        .map_or(operation.deadline, |(_, dl)| dl.min(operation.deadline))
+        .map_or(cutoff, |(_, dl)| dl.min(cutoff))
 }
 
-fn visibility_service_due(operation: &control::ActiveOperation, now: Instant) -> bool {
+fn remote_owns_layer(operation: &control::ActiveOperation) -> bool {
+    operation.request.command == control::Command::BringTop
+        && operation.stage == control::Stage::Layer
+}
+
+/// G Layer owns evidence notifications, while body ConfigureNotify remains on
+/// the ordinary movement reconciliation path.
+fn remote_consumes_visibility_event(
+    operation: &control::ActiveOperation,
+    event: &Event,
+    body: u32,
+) -> bool {
+    !remote_owns_layer(operation) || !matches!(event, Event::ConfigureNotify(e) if e.window == body)
+}
+
+fn local_layer_service_allowed(operation: Option<&control::ActiveOperation>) -> bool {
+    !operation.is_some_and(remote_owns_layer)
+}
+
+fn remote_service_due(operation: &control::ActiveOperation, now: Instant) -> bool {
     let observe = match operation.request.command {
         control::Command::Show => operation.show.observe,
         control::Command::Hide => operation.hide.observe,
-        control::Command::BringTop => false,
+        control::Command::BringTop if remote_owns_layer(operation) => {
+            operation.bring_top.layer_observe
+        }
+        control::Command::BringTop => operation.show.observe,
     };
-    observe || now >= visibility_operation_deadline(operation)
+    observe || now >= remote_operation_deadline(operation)
 }
 
-fn mark_visibility_observation(operation: &mut control::ActiveOperation, layout_interrupted: bool) {
+fn mark_remote_observation(operation: &mut control::ActiveOperation, layout_interrupted: bool) {
     match operation.request.command {
-        control::Command::Show => {
+        control::Command::Show | control::Command::BringTop => {
             operation.show.observe = true;
             operation.show.layout_interrupted |= layout_interrupted;
+            if remote_owns_layer(operation) {
+                operation.bring_top.layer_observe = true;
+            }
         }
         control::Command::Hide => {
             operation.hide.observe = true;
             operation.hide.layout_interrupted |= layout_interrupted;
         }
-        control::Command::BringTop => unreachable!("BringTop is not deferred"),
     }
 }
 
@@ -2885,7 +3591,7 @@ fn route_owner_request<C: Connection>(
                 host.runtime.layers.pending().is_some(),
             )
         },
-        service_owner_visibility,
+        service_owner_operation,
     )
 }
 
@@ -2921,21 +3627,25 @@ fn service_show_safely_with(
     }
 }
 
-fn service_owner_visibility<C: Connection>(
+fn service_owner_operation<C: Connection>(
     owner: &mut ControlWindow,
     host: &mut NativeVisibility<'_, C>,
 ) -> Result<(), HostError> {
     let Some(operation) = owner.active_mut() else {
         return Ok(());
     };
-    if !visibility_service_due(operation, host.now()) {
+    if !remote_service_due(operation, host.now())
+        && !host
+            .layer_deadline()
+            .is_some_and(|dl| remote_owns_layer(operation) && host.now() >= dl)
+    {
         return Ok(());
     }
     owner.verify_active_ownership(host.conn)?;
     let operation = owner
         .active_mut()
-        .expect("active visibility operation checked above");
-    let outcome = service_visibility_with(operation, host);
+        .expect("active remote operation checked above");
+    let outcome = service_remote_with(operation, host);
     match outcome {
         Ok(Some(result)) => owner.complete(host.conn, result),
         Ok(None) => Ok(()),
@@ -2949,10 +3659,30 @@ fn service_owner_visibility<C: Connection>(
             };
             let result = match operation.request.command {
                 control::Command::Hide => hide_result(operation, control::Status::Failed, reason),
-                _ => show_result(operation, control::Status::Failed, reason, None),
+                control::Command::Show => {
+                    show_result(operation, control::Status::Failed, reason, None)
+                }
+                control::Command::BringTop => {
+                    host.abort_above();
+                    match finish_bring_top_with(operation, host, reason, false) {
+                        Ok(result) => result,
+                        Err(_) => {
+                            operation.detail.visibility = control::Visibility::Unknown;
+                            operation.detail.layer = control::LayerObservation::Unknown;
+                            operation.detail.workspace = control::Workspace::Unknown;
+                            compose_bring_top_result(
+                                operation,
+                                reason,
+                                control::Confirmation::default(),
+                                false,
+                                false,
+                            )
+                        }
+                    }
+                }
             };
             if let Err(reply) = owner.complete(host.conn, result) {
-                eprintln!("[VISIBILITY] Terminal reply after failure: {reply}");
+                eprintln!("[CONTROL] Terminal reply after failure: {reply}");
             }
             Err(error) // original owner-local failure has priority
         }
@@ -3006,7 +3736,7 @@ fn local_layer_after_menu_with(
     dispatch: impl FnOnce() -> Result<(), HostError>,
 ) -> Result<(), HostError> {
     if remote_busy {
-        eprintln!("[LAYER] Request {target:?} rejected: remote visibility operation is Busy");
+        eprintln!("[LAYER] Request {target:?} rejected: remote operation is Busy");
         Ok(())
     } else {
         dispatch()
@@ -3053,7 +3783,7 @@ fn run_probe(
         if let Some((Event::Error(error), _)) = &buffered_event {
             return Err(format!("Asynchronous X11 error: {error:?}").into());
         }
-        service_owner_visibility(
+        service_owner_operation(
             owner,
             &mut NativeVisibility {
                 conn,
@@ -3070,10 +3800,11 @@ fn run_probe(
         if runtime.body == BodyAvailability::Destroyed {
             return Ok(());
         }
-        if runtime
-            .layers
-            .deadline()
-            .is_some_and(|deadline| now >= deadline)
+        if local_layer_service_allowed(owner.active())
+            && runtime
+                .layers
+                .deadline()
+                .is_some_and(|deadline| now >= deadline)
         {
             service_layer(
                 conn,
@@ -3196,8 +3927,8 @@ fn run_probe(
             if let Event::Error(error) = &event {
                 return Err(format!("Asynchronous X11 error: {error:?}").into());
             }
-            if visibility_deadline(owner).is_some_and(|deadline| Instant::now() >= deadline) {
-                service_owner_visibility(
+            if remote_deadline(owner).is_some_and(|deadline| Instant::now() >= deadline) {
+                service_owner_operation(
                     owner,
                     &mut NativeVisibility {
                         conn,
@@ -3217,23 +3948,63 @@ fn run_probe(
             }
             if visibility_event(&event, root, window.window, &visibility_atoms, atoms) {
                 if let Some(operation) = owner.active_mut() {
-                    mark_visibility_observation(
+                    mark_remote_observation(
                         operation,
                         visibility_layout_interruption(&event, root, atoms),
                     );
-                    if matches!(&event, Event::UnmapNotify(e) if e.window == window.window) {
-                        runtime.cancel(
-                            conn,
-                            window,
-                            "body unavailable during visibility operation",
-                        )?;
-                        runtime.unavailable(false);
+                    if remote_owns_layer(operation) {
+                        if remote_consumes_visibility_event(operation, &event, window.window) {
+                            service_owner_operation(
+                                owner,
+                                &mut NativeVisibility {
+                                    conn,
+                                    root,
+                                    atoms: &visibility_atoms,
+                                    layout_atoms: atoms,
+                                    selected_monitor,
+                                    window,
+                                    runtime,
+                                    bounds: &mut bounds,
+                                    area: &mut usable_area,
+                                },
+                            )?;
+                            if runtime.body == BodyAvailability::Destroyed {
+                                return Ok(());
+                            }
+                            if matches!(&event, Event::UnmapNotify(e) if e.window == window.window)
+                            {
+                                // A delayed unmap is evidence, not unconditional
+                                // cancellation. Real unavailability still settles input.
+                                if !window.is_viewable(conn)? {
+                                    runtime.cancel(
+                                        conn,
+                                        window,
+                                        "body unavailable during remote layer operation",
+                                    )?;
+                                    runtime.body = BodyAvailability::Unavailable;
+                                    runtime.correction = None;
+                                }
+                                continue;
+                            }
+                            if !relevant_layout_event(&event, root, window.window, atoms) {
+                                continue;
+                            }
+                            // Ordinary layout safety still runs below.
+                        }
+                    } else {
+                        if matches!(&event, Event::UnmapNotify(e) if e.window == window.window) {
+                            runtime.cancel(
+                                conn,
+                                window,
+                                "body unavailable during visibility operation",
+                            )?;
+                            runtime.unavailable(false);
+                        }
+                        // E/F owns expected visibility and geometry notifications.
+                        continue;
                     }
-                    // The active command owns expected visibility/geometry progression. These
-                    // notifications cannot enable input or abort their own operation.
-                    continue;
                 }
-                if runtime.input_fence.blocked {
+                if owner.active().is_none() && runtime.input_fence.blocked {
                     restore_deferred_input(&mut NativeVisibility {
                         conn,
                         root,
@@ -3258,7 +4029,9 @@ fn run_probe(
             if let Event::Error(error) = &event {
                 return Err(format!("Asynchronous X11 error: {error:?}").into());
             }
-            if interrupts_layer(&event, root, window.window, atoms) {
+            if local_layer_service_allowed(owner.active())
+                && interrupts_layer(&event, root, window.window, atoms)
+            {
                 abort_layer(&mut runtime.layers, "layout or body lifecycle change");
             }
             if popup_lifecycle(
@@ -3319,10 +4092,12 @@ fn run_probe(
                 continue;
             }
             if layer_property_event(&event, window.window, &layer_atoms) {
-                if matches!(
-                    runtime.body,
-                    BodyAvailability::Ready | BodyAvailability::Validating
-                ) {
+                if local_layer_service_allowed(owner.active())
+                    && matches!(
+                        runtime.body,
+                        BodyAvailability::Ready | BodyAvailability::Validating
+                    )
+                {
                     service_layer(
                         conn,
                         &layer_atoms,
@@ -3336,6 +4111,9 @@ fn run_probe(
             }
             if matches!(&event, Event::PropertyNotify(ev) if ev.window == root && ev.atom == layer_atoms.supported)
             {
+                if !local_layer_service_allowed(owner.active()) {
+                    continue;
+                }
                 service_layer_support_event_with(
                     &mut runtime.layers,
                     || layer_atoms.read_support(conn, root),
@@ -3418,6 +4196,9 @@ fn run_probe(
             }
             match event {
                 Event::MapNotify(ev) if ev.window == window.window => {
+                    if owner.active().is_some_and(remote_owns_layer) {
+                        continue;
+                    }
                     runtime.cancel(conn, window, "map verification")?;
                     let layout = query_desktop_layout(conn, root, atoms, Some(selected_monitor))?;
                     usable_area = layout.usable_area;
@@ -3668,7 +4449,7 @@ fn run_probe(
 
         // Notifications in this batch can make visibility work actionable without leaving
         // another event to wake the socket. Settle that work before any wait.
-        service_owner_visibility(
+        service_owner_operation(
             owner,
             &mut NativeVisibility {
                 conn,
@@ -3751,7 +4532,7 @@ fn run_probe(
         }
         let timeout = probe_deadline(runtime, duration_deadline)
             .into_iter()
-            .chain(visibility_deadline(owner))
+            .chain(remote_deadline(owner))
             .min();
         wait_x11(conn, timeout)?;
     }
@@ -7029,6 +7810,10 @@ mod show_tests {
         fail: Option<&'static str>,
         advance: Option<(&'static str, Duration)>,
         refuse_correction: bool,
+        layer_mode: u8, // 0 immediate, 1 unchanged, 2 removal only, 3 spontaneous Above
+        layer_issue: Option<RemoteLayerIssue>,
+        layer_support: LayerSupport,
+        mutations: Vec<Mutation>,
     }
     impl Fake {
         fn new(current: Reading) -> Self {
@@ -7049,6 +7834,14 @@ mod show_tests {
                 fail: None,
                 advance: None,
                 refuse_correction: false,
+                layer_mode: 0,
+                layer_issue: None,
+                layer_support: LayerSupport {
+                    state: true,
+                    above: true,
+                    below: true,
+                },
+                mutations: vec![],
             }
         }
         fn step(&mut self, name: &'static str) -> Result<(), HostError> {
@@ -7098,6 +7891,9 @@ mod show_tests {
         }
     }
     impl VisibilityHost for Fake {
+        fn layer_atoms(&self) -> LayerAtoms {
+            fake_layer_atoms()
+        }
         fn now(&self) -> Instant {
             self.now
         }
@@ -7299,6 +8095,75 @@ mod show_tests {
             Ok(true)
         }
     }
+    impl BringTopHost for Fake {
+        fn qualify_layer(
+            &self,
+            snapshot: &x11::visibility::VisibilitySnapshot,
+            baseline: control::VisibilityBaseline,
+        ) -> Result<ObservedLayer, RemoteLayerIssue> {
+            fake_layer_atoms().qualify_remote(snapshot, baseline)
+        }
+        fn service_above(
+            &mut self,
+            operation: &mut ActiveOperation,
+        ) -> Result<(LayerOutcome, Option<RemoteLayerIssue>), HostError> {
+            let baseline = operation.show.baseline.unwrap();
+            let mut layers = std::mem::take(&mut self.runtime.layers);
+            let host = RefCell::new(&mut *self);
+            let result = service_remote_layer_with(
+                &mut layers,
+                operation,
+                || {
+                    let mut h = host.borrow_mut();
+                    h.step("layer_read")?;
+                    if let Some(issue) = h.layer_issue {
+                        return Ok(Err(issue));
+                    }
+                    let snapshot = h.observe()?;
+                    Ok(fake_layer_atoms().qualify_remote(&snapshot, baseline))
+                },
+                || {
+                    let mut h = host.borrow_mut();
+                    h.step("layer_support")?;
+                    Ok(Ok(h.layer_support))
+                },
+                |mutation, dispatched| {
+                    let mut h = host.borrow_mut();
+                    *dispatched = true;
+                    h.mutations.push(mutation);
+                    h.step(match mutation {
+                        Mutation::Remove(_) => "remove_below",
+                        Mutation::AddAbove => "add_above",
+                        Mutation::AddBelow => panic!("G targets only Above"),
+                    })?;
+                    match mutation {
+                        Mutation::Remove(_) if h.layer_mode == 3 => h.current.layer = L::Above,
+                        Mutation::Remove(_) if h.layer_mode != 1 => h.current.layer = L::Normal,
+                        Mutation::AddAbove if h.layer_mode == 0 => h.current.layer = L::Above,
+                        _ => {}
+                    }
+                    Ok(())
+                },
+                || host.borrow().now,
+            );
+            self.runtime.layers = layers;
+            result
+        }
+        fn abort_above(&mut self) {
+            self.runtime.layers.abort();
+        }
+        fn layer_deadline(&self) -> Option<Instant> {
+            self.runtime.layers.deadline()
+        }
+    }
+    fn fake_layer_atoms() -> LayerAtoms {
+        LayerAtoms {
+            state: 12,
+            supported: 18,
+            above: 16,
+            below: 17,
+        }
+    }
     fn minimized() -> Fake {
         Fake::new(reading(Visibility::Minimized, L::Normal, 2, 2))
     }
@@ -7325,6 +8190,759 @@ mod show_tests {
         control::Detail::decode(d.encode()).unwrap();
     }
 
+    mod bring_top {
+        use super::*;
+        use control::{ExitCode, Stage};
+
+        fn run(h: &mut Fake, op: &mut ActiveOperation) -> Option<control::OperationResult> {
+            service_bring_top_with(op, h).unwrap()
+        }
+        fn setup(minimized: bool, layer: L, elsewhere: bool) -> (Fake, ActiveOperation) {
+            let h = Fake::new(reading(
+                if minimized {
+                    Visibility::Minimized
+                } else if elsewhere {
+                    Visibility::NotMinimizedElsewhere
+                } else {
+                    Visibility::NotMinimizedHere
+                },
+                layer,
+                if elsewhere { 7 } else { 2 },
+                2,
+            ));
+            let op = h.command_operation(Command::BringTop);
+            (h, op)
+        }
+        fn restore(h: &mut Fake, op: &mut ActiveOperation, elsewhere: bool) {
+            assert!(run(h, op).is_none());
+            assert!(op.bring_top.minimized_at_start);
+            assert!(!op.bring_top.restoration_confirmed);
+            assert!(h.mutations.is_empty());
+            h.current = reading(
+                if elsewhere {
+                    Visibility::NotMinimizedElsewhere
+                } else {
+                    Visibility::NotMinimizedHere
+                },
+                h.current.layer,
+                h.current.desktop,
+                h.current.current,
+            );
+            mark_remote_observation(op, false);
+        }
+        fn expected_mutations(layer: L) -> Vec<Mutation> {
+            match layer {
+                L::Above => vec![],
+                L::Normal => vec![Mutation::AddAbove],
+                L::Below => vec![
+                    Mutation::Remove(layer::Flags {
+                        above: false,
+                        below: true,
+                    }),
+                    Mutation::AddAbove,
+                ],
+                _ => unreachable!(),
+            }
+        }
+        fn assert_prohibitions(h: &Fake, elsewhere: bool) {
+            for name in [
+                "workspace_write",
+                "current_desktop_request",
+                "active_window",
+                "set_input_focus",
+                "map_raised",
+                "restack",
+                "second_body",
+                "retry",
+                "direct_state_write",
+            ] {
+                assert_eq!(h.count(name), 0, "prohibited {name}");
+            }
+            if elsewhere {
+                for name in [
+                    "map",
+                    "user_time_zero",
+                    "geometry",
+                    "correct",
+                    "ordinary_correct",
+                    "enable",
+                ] {
+                    assert_eq!(h.count(name), 0, "off-workspace {name}");
+                }
+            }
+            assert!(h.mutations.iter().all(|m| matches!(
+                m,
+                Mutation::AddAbove
+                    | Mutation::Remove(layer::Flags {
+                        above: false,
+                        below: true
+                    })
+            )));
+        }
+
+        #[test]
+        fn local_visible_normal_below_above_matrix_preserves_ready_interaction() {
+            for layer in [L::Normal, L::Below, L::Above] {
+                let (mut h, mut op) = setup(false, layer, false);
+                h.runtime.interaction.handle_left_press(
+                    Point::new(180, 180),
+                    (80, 80),
+                    100,
+                    Point::new(100, 100),
+                );
+                h.runtime.interaction.on_grab_acquired();
+                h.runtime
+                    .pointer
+                    .acquire_with(CaptureOwner::BodyLeft, || Ok((GrabStatus::SUCCESS, 5)))
+                    .unwrap();
+                let result = run(&mut h, &mut op).unwrap();
+                assert_success(result, true, layer != L::Above);
+                assert!(result.detail().progress.above_confirmed);
+                assert_eq!(h.mutations, expected_mutations(layer));
+                assert_eq!(h.count("fence"), 0);
+                assert_eq!(h.count("map"), 0);
+                assert!(h.runtime.pointer.is_grabbed());
+                assert!(h.runtime.interaction.has_left_gesture());
+                assert!(!op.bring_top.restoration_confirmed);
+                assert_prohibitions(&h, false);
+            }
+        }
+        #[test]
+        fn local_minimized_normal_below_above_restore_then_compose_matrix() {
+            for layer in [L::Normal, L::Below, L::Above] {
+                let (mut h, mut op) = setup(true, layer, false);
+                restore(&mut h, &mut op, false);
+                let result = run(&mut h, &mut op).unwrap();
+                assert_success(result, true, true);
+                assert!(op.bring_top.restoration_confirmed);
+                assert!(result.detail().progress.above_confirmed);
+                assert_eq!(h.mutations, expected_mutations(layer));
+                for name in ["fence", "map", "user_time_zero", "enable"] {
+                    assert_eq!(h.count(name), 1);
+                }
+                if layer != L::Above {
+                    let index = |name| h.log.iter().position(|s| *s == name).unwrap();
+                    assert!(index("enable") < index("add_above"));
+                }
+                assert_prohibitions(&h, false);
+            }
+        }
+        #[test]
+        fn off_workspace_visible_three_layer_matrix_no_visibility_or_local_mutation() {
+            for layer in [L::Normal, L::Below, L::Above] {
+                let (mut h, mut op) = setup(false, layer, true);
+                let result = run(&mut h, &mut op).unwrap();
+                assert_success(result, false, layer != L::Above);
+                assert_eq!(h.mutations, expected_mutations(layer));
+                assert_eq!(h.count("remove_hidden"), 0);
+                assert_eq!((h.current.desktop, h.current.current), (7, 2));
+                assert!(h.runtime.input_fence.blocked);
+                assert_prohibitions(&h, true);
+            }
+        }
+        #[test]
+        fn off_workspace_minimized_three_layer_matrix_remove_hidden_then_above() {
+            for layer in [L::Normal, L::Below, L::Above] {
+                let (mut h, mut op) = setup(true, layer, true);
+                restore(&mut h, &mut op, true);
+                let result = run(&mut h, &mut op).unwrap();
+                assert_success(result, false, true);
+                assert!(op.bring_top.restoration_confirmed);
+                assert_eq!(h.count("remove_hidden"), 1);
+                assert_eq!(h.mutations, expected_mutations(layer));
+                assert_eq!((h.current.desktop, h.current.current), (7, 2));
+                let response = control::TerminalResponse {
+                    status: result.status(),
+                    detail: result.detail(),
+                    request_id: 99,
+                    control_xid: 50,
+                };
+                let diagnostic =
+                    x11::control::CallerOutcome::Terminal(response).diagnostic(Command::BringTop);
+                assert!(diagnostic.contains("another workspace"));
+                assert!(!diagnostic.contains("visible here"));
+                assert_prohibitions(&h, true);
+            }
+        }
+        #[test]
+        fn approved_normal_nonviewable_elsewhere_variants_are_deterministic_only() {
+            for map in [MapState::Unmapped, MapState::Unviewable] {
+                let (mut h, mut op) = setup(false, L::Normal, true);
+                h.current.evidence.wm_state = WmState::Normal;
+                h.current.evidence.map_state = Evidence::Readable(map);
+                let result = run(&mut h, &mut op).unwrap();
+                assert_success(result, false, true);
+                assert_eq!(h.mutations, [Mutation::AddAbove]);
+                assert_prohibitions(&h, true);
+            }
+        }
+        #[test]
+        fn restoration_timeout_never_starts_layer_or_creates_partial() {
+            for elsewhere in [false, true] {
+                let (mut h, mut op) = setup(true, L::Normal, elsewhere);
+                assert!(run(&mut h, &mut op).is_none());
+                h.now = op.bring_top.visibility_cutoff;
+                let result = run(&mut h, &mut op).unwrap();
+                assert_eq!(result.exit_code(), ExitCode::OperationFailed);
+                assert!(!op.bring_top.restoration_confirmed);
+                assert_eq!(h.count("layer_read"), 0);
+                assert!(h.mutations.is_empty());
+                assert_eq!(h.count(if elsewhere { "remove_hidden" } else { "map" }), 1);
+            }
+        }
+        #[test]
+        fn layer_timeout_is_partial_only_after_actual_restoration() {
+            for minimized in [false, true] {
+                for elsewhere in [false, true] {
+                    let (mut h, mut op) = setup(minimized, L::Normal, elsewhere);
+                    if minimized {
+                        restore(&mut h, &mut op, elsewhere);
+                    }
+                    h.layer_mode = 1;
+                    assert!(run(&mut h, &mut op).is_none());
+                    assert_eq!(op.stage, Stage::Layer);
+                    h.now = h.runtime.layers.deadline().unwrap();
+                    let result = run(&mut h, &mut op).unwrap();
+                    assert_eq!(
+                        result.status(),
+                        if minimized {
+                            Status::Partial
+                        } else {
+                            Status::Failed
+                        }
+                    );
+                    assert_eq!(result.detail().reason, Reason::ConfirmationTimeout);
+                    assert!(result.detail().progress.not_minimized_confirmed);
+                    assert!(!result.detail().progress.above_confirmed);
+                    assert_eq!(result.detail().layer, L::Normal);
+                    assert_eq!(h.mutations, [Mutation::AddAbove]);
+                    assert!(h.runtime.layers.pending().is_none());
+                    assert_prohibitions(&h, elsewhere);
+                }
+            }
+        }
+        #[test]
+        fn layer_unsupported_and_unverifiable_use_restoration_proof() {
+            for minimized in [false, true] {
+                for issue in [
+                    RemoteLayerIssue::Unsupported,
+                    RemoteLayerIssue::Unverifiable,
+                ] {
+                    let (mut h, mut op) = setup(minimized, L::Normal, false);
+                    if minimized {
+                        restore(&mut h, &mut op, false);
+                    }
+                    h.layer_issue = Some(issue);
+                    let result = run(&mut h, &mut op).unwrap();
+                    assert_eq!(
+                        result.status(),
+                        if minimized {
+                            Status::Partial
+                        } else {
+                            Status::Failed
+                        }
+                    );
+                    assert_eq!(result.detail().reason, remote_layer_reason(issue));
+                    assert!(h.mutations.is_empty());
+                }
+            }
+        }
+        #[test]
+        fn below_removal_then_checked_add_error_is_failed_or_partial_without_rollback() {
+            for minimized in [false, true] {
+                let (mut h, mut op) = setup(minimized, L::Below, false);
+                if minimized {
+                    restore(&mut h, &mut op, false);
+                }
+                h.fail = Some("add_above");
+                let original = service_bring_top_with(&mut op, &mut h).unwrap_err();
+                assert_eq!(original.to_string(), "injected add_above");
+                assert_eq!(h.current.layer, L::Normal);
+                assert!(h.runtime.layers.pending().is_none());
+                assert!(
+                    op.bring_top.layer_attempted
+                        && op.bring_top.layer_dispatched
+                        && op.bring_top.layer_checked
+                );
+                assert!(op.detail.progress.host_mutation_dispatched);
+                let result =
+                    finish_bring_top_with(&mut op, &mut h, Reason::X11Failure, false).unwrap();
+                assert_eq!(
+                    result.status(),
+                    if minimized {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    }
+                );
+                assert_eq!(result.detail().layer, L::Normal);
+                assert!(!result.detail().progress.above_confirmed);
+                assert_eq!(h.mutations, expected_mutations(L::Below));
+                assert_prohibitions(&h, false);
+            }
+        }
+        #[test]
+        fn checked_first_layer_error_preserves_dispatch_uncertainty_and_native_priority() {
+            let (mut h, mut op) = setup(true, L::Normal, false);
+            restore(&mut h, &mut op, false);
+            h.fail = Some("add_above");
+            assert!(service_bring_top_with(&mut op, &mut h).is_err());
+            assert!(op.bring_top.layer_dispatched);
+            assert!(!op.bring_top.layer_checked);
+            let result = finish_bring_top_with(&mut op, &mut h, Reason::X11Failure, false).unwrap();
+            assert_eq!(result.status(), Status::Partial);
+            assert!(result.detail().progress.host_mutation_dispatched);
+            assert!(!result.detail().progress.above_confirmed);
+        }
+        #[test]
+        fn restoration_proof_precedes_geometry_failure_and_layer_is_never_started() {
+            for failure in ["geometry", "enable", "shape"] {
+                let (mut h, mut op) = setup(true, L::Normal, false);
+                restore(&mut h, &mut op, false);
+                h.fail = Some(failure);
+                let original = service_bring_top_with(&mut op, &mut h).unwrap_err();
+                assert!(original.to_string().contains(failure));
+                assert!(op.bring_top.restoration_confirmed);
+                h.fail = None;
+                let result =
+                    finish_bring_top_with(&mut op, &mut h, Reason::X11Failure, false).unwrap();
+                assert_eq!(result.status(), Status::Partial);
+                assert!(result.detail().progress.not_minimized_confirmed);
+                assert!(!result.detail().progress.input_ready);
+                assert_eq!(h.count("layer_read"), 0);
+                assert_eq!(h.count("fence"), if failure == "geometry" { 1 } else { 2 });
+            }
+        }
+        #[test]
+        fn geometry_correction_and_input_enable_finish_before_layer() {
+            let (mut h, mut op) = setup(true, L::Normal, false);
+            restore(&mut h, &mut op, false);
+            h.bounds = ValidOriginBounds::new(200, 500, 200, 500);
+            assert!(run(&mut h, &mut op).is_none());
+            let deadline = op.show.correction.unwrap().1;
+            assert_eq!(deadline, h.now + Duration::from_millis(150));
+            assert_eq!(h.count("layer_read"), 0);
+            h.now = deadline;
+            assert_success(run(&mut h, &mut op).unwrap(), true, true);
+            let index = |name| h.log.iter().position(|s| *s == name).unwrap();
+            assert!(index("correct") < index("enable"));
+            assert!(index("enable") < index("add_above"));
+        }
+        #[test]
+        fn insufficient_geometry_budget_is_partial_with_no_correction_or_layer() {
+            let (mut h, mut op) = setup(true, L::Normal, false);
+            restore(&mut h, &mut op, false);
+            h.bounds = ValidOriginBounds::new(200, 500, 200, 500);
+            h.now = op.bring_top.visibility_cutoff - Duration::from_millis(149);
+            let result = run(&mut h, &mut op).unwrap();
+            assert_eq!(result.status(), Status::Partial);
+            assert_eq!(result.detail().reason, Reason::ConfirmationTimeout);
+            assert_eq!(h.count("correct"), 0);
+            assert_eq!(h.count("layer_read"), 0);
+        }
+        #[test]
+        fn g_allows_coherent_layer_change_during_visibility_but_show_does_not() {
+            for command in [Command::Show, Command::BringTop] {
+                let (mut h, _) = setup(true, L::Below, false);
+                let mut op = h.command_operation(command);
+                assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                h.current = reading(Visibility::NotMinimizedHere, L::Above, 2, 2);
+                let result = service_remote_with(&mut op, &mut h).unwrap().unwrap();
+                assert_eq!(
+                    result.status(),
+                    if command == Command::Show {
+                        Status::Failed
+                    } else {
+                        Status::Success
+                    }
+                );
+                assert_eq!(
+                    result.detail().reason,
+                    if command == Command::Show {
+                        Reason::LayerChanged
+                    } else {
+                        Reason::None
+                    }
+                );
+                assert!(h.mutations.is_empty());
+            }
+        }
+        #[test]
+        fn workspace_drift_during_either_phase_is_terminal_without_compensation() {
+            for minimized in [false, true] {
+                for phase in [Stage::Show, Stage::Layer] {
+                    let (mut h, mut op) = setup(minimized, L::Normal, false);
+                    if minimized {
+                        restore(&mut h, &mut op, false);
+                    }
+                    if phase == Stage::Layer {
+                        h.layer_mode = 1;
+                        assert!(run(&mut h, &mut op).is_none());
+                    }
+                    if phase == Stage::Show && !minimized {
+                        observe_visibility(&mut op, &mut h).unwrap();
+                    }
+                    h.current.current = 3;
+                    h.current.evidence.workspace = Workspace::Other;
+                    h.current.evidence.wm_state = WmState::Iconic;
+                    h.current.evidence.map_state = Evidence::Readable(MapState::Unmapped);
+                    let result = run(&mut h, &mut op).unwrap();
+                    assert_eq!(result.detail().reason, Reason::LayoutChanged);
+                    assert_eq!(
+                        result.status(),
+                        if minimized && phase == Stage::Layer {
+                            Status::Partial
+                        } else {
+                            Status::Failed
+                        }
+                    );
+                    assert!(result.detail().progress.not_minimized_confirmed);
+                    assert!(!result.detail().progress.placement_deferred);
+                    assert!(!result.detail().progress.above_confirmed);
+                    assert_prohibitions(&h, false);
+                }
+            }
+        }
+        #[test]
+        fn historical_restoration_survives_evidence_loss_without_stale_current_bits() {
+            for final_visibility in [
+                Visibility::Destroyed,
+                Visibility::Withdrawn,
+                Visibility::Minimized,
+            ] {
+                let (mut h, mut op) = setup(true, L::Normal, false);
+                restore(&mut h, &mut op, false);
+                h.layer_mode = 1;
+                assert!(run(&mut h, &mut op).is_none());
+                h.current = reading(final_visibility, L::Normal, 2, 2);
+                let result = run(&mut h, &mut op).unwrap();
+                assert_eq!(result.status(), Status::Partial);
+                assert!(!result.detail().progress.not_minimized_confirmed);
+                assert!(!result.detail().progress.above_confirmed);
+                assert!(!result.detail().progress.input_ready);
+                assert!(!result.detail().progress.placement_deferred);
+            }
+        }
+        #[test]
+        fn spontaneous_above_after_removal_skips_redundant_addition() {
+            let (mut h, mut op) = setup(false, L::Below, false);
+            h.layer_mode = 3;
+            assert_eq!(run(&mut h, &mut op).unwrap().status(), Status::Success);
+            assert_eq!(h.mutations.len(), 1);
+            assert_eq!(h.count("add_above"), 0);
+        }
+        #[test]
+        fn below_reappearance_after_removal_and_conflict_are_terminal() {
+            for layer in [L::Below, L::Conflict] {
+                let (mut h, mut op) = setup(false, L::Below, false);
+                h.layer_mode = 2;
+                assert!(run(&mut h, &mut op).is_none());
+                h.current.layer = layer;
+                let result = run(&mut h, &mut op).unwrap();
+                assert_eq!(result.status(), Status::Failed);
+                assert_eq!(
+                    result.detail().reason,
+                    if layer == L::Below {
+                        Reason::LayerChanged
+                    } else {
+                        Reason::Unverifiable
+                    }
+                );
+                assert_eq!(h.mutations.len(), 2);
+                assert!(!result.detail().progress.above_confirmed);
+                assert!(h.runtime.layers.pending().is_none());
+            }
+        }
+        #[test]
+        fn layer_admission_caps_one_second_and_never_resets_owner_deadline() {
+            for millis in [0, 2400, 2499] {
+                let (mut h, mut op) = setup(true, L::Normal, false);
+                let t0 = h.now;
+                restore(&mut h, &mut op, false);
+                h.now = t0 + Duration::from_millis(millis);
+                h.layer_mode = 1;
+                assert!(run(&mut h, &mut op).is_none());
+                assert_eq!(op.deadline, t0 + Duration::from_millis(3500));
+                assert_eq!(
+                    op.bring_top.visibility_cutoff,
+                    t0 + Duration::from_millis(2500)
+                );
+                assert_eq!(
+                    h.layer_deadline(),
+                    Some((h.now + Duration::from_millis(1000)).min(op.deadline))
+                );
+                for _ in 0..3 {
+                    mark_remote_observation(&mut op, false);
+                    assert!(run(&mut h, &mut op).is_none());
+                    assert_eq!(op.deadline, t0 + Duration::from_millis(3500));
+                }
+            }
+        }
+        #[test]
+        fn late_layer_entry_is_capped_by_total_owner_budget() {
+            let (mut h, mut op) = setup(false, L::Normal, false);
+            op.stage = Stage::Layer;
+            op.detail.stage = Stage::Layer;
+            op.show.baseline = Some(control::VisibilityBaseline {
+                desktop: 2,
+                current_desktop: 2,
+                layer: L::Normal,
+            });
+            h.now += Duration::from_millis(3100);
+            op.bring_top.layer_admitted = Some(h.now);
+            h.layer_mode = 1;
+            assert!(run(&mut h, &mut op).is_none());
+            assert_eq!(h.layer_deadline(), Some(op.deadline));
+            h.now = op.deadline;
+            let result = run(&mut h, &mut op).unwrap();
+            assert_eq!(result.status(), Status::Failed);
+            assert_eq!(h.mutations.len(), 1);
+        }
+        #[test]
+        fn visibility_cutoff_allows_final_reads_but_no_new_mutation_or_layer_start() {
+            for minimized in [false, true] {
+                for layer in [L::Normal, L::Above] {
+                    let (mut h, mut op) = setup(minimized, layer, false);
+                    h.now = op.bring_top.visibility_cutoff;
+                    let result = run(&mut h, &mut op).unwrap();
+                    assert_eq!(
+                        result.status(),
+                        if !minimized && layer == L::Above {
+                            Status::Success
+                        } else {
+                            Status::Failed
+                        }
+                    );
+                    for name in ["fence", "map", "user_time_zero", "correct", "enable"] {
+                        assert_eq!(h.count(name), 0);
+                    }
+                    assert!(h.mutations.is_empty());
+                }
+            }
+        }
+        #[test]
+        fn final_layer_read_at_cutoff_can_confirm_achieved_above_without_resend() {
+            let (mut h, mut op) = setup(false, L::Normal, false);
+            h.layer_mode = 1;
+            assert!(run(&mut h, &mut op).is_none());
+            h.now = h.layer_deadline().unwrap();
+            h.current.layer = L::Above;
+            assert_eq!(run(&mut h, &mut op).unwrap().status(), Status::Success);
+            assert_eq!(h.mutations, [Mutation::AddAbove]);
+        }
+        #[test]
+        fn transient_qualification_preserves_pending_controller_and_fixed_deadline() {
+            let (mut h, mut op) = setup(false, L::Normal, false);
+            h.layer_mode = 1;
+            assert!(run(&mut h, &mut op).is_none());
+            let pending = h.runtime.layers.pending();
+            h.layer_issue = Some(RemoteLayerIssue::Waiting);
+            h.now += Duration::from_millis(200);
+            assert!(run(&mut h, &mut op).is_none());
+            assert_eq!(h.runtime.layers.pending(), pending);
+            h.now = pending.unwrap().deadline;
+            let result = run(&mut h, &mut op).unwrap();
+            assert_eq!(result.detail().reason, Reason::ConfirmationTimeout);
+            assert_eq!(h.mutations, [Mutation::AddAbove]);
+        }
+        #[test]
+        fn layer_property_evidence_schedules_remote_read_and_configure_stays_ordinary() {
+            use x11rb::protocol::xproto::{ConfigureNotifyEvent, PropertyNotifyEvent};
+            let (mut h, mut op) = setup(false, L::Normal, false);
+            h.layer_mode = 1;
+            assert!(run(&mut h, &mut op).is_none());
+            let event = Event::PropertyNotify(PropertyNotifyEvent {
+                window: 100,
+                atom: 12,
+                ..Default::default()
+            });
+            assert!(remote_consumes_visibility_event(&op, &event, 100));
+            mark_remote_observation(&mut op, false);
+            assert!(remote_service_due(&op, h.now));
+            let reads = h.count("layer_read");
+            h.current.layer = L::Above;
+            assert_eq!(run(&mut h, &mut op).unwrap().status(), Status::Success);
+            assert!(h.count("layer_read") > reads);
+            // The production route leaves ConfigureNotify on the existing
+            // translated-root movement reconciliation path while G owns Layer.
+            let event = ConfigureNotifyEvent {
+                window: 100,
+                width: 160,
+                height: 160,
+                ..Default::default()
+            };
+            assert!(!remote_consumes_visibility_event(
+                &op,
+                &Event::ConfigureNotify(event),
+                100
+            ));
+            let target = Point::new(150, 160);
+            h.window.in_flight_moves.push_back(target);
+            h.window.requested_origin = target;
+            assert!(
+                matches!(h.window.handle_configure_notify_with(&event, || Ok(target)).unwrap(), ConfigureReconciliation::Confirmed {origin,..} if origin == target)
+            );
+            assert!(h.window.in_flight_moves.is_empty());
+        }
+        #[test]
+        fn local_menu_cleanup_precedes_busy_and_cannot_steal_g_controller() {
+            let (mut h, mut op) = setup(false, L::Normal, false);
+            h.layer_mode = 1;
+            assert!(run(&mut h, &mut op).is_none());
+            let pending = h.runtime.layers.pending();
+            h.runtime
+                .acquire_menu_with(MenuPopup::test_popup(10, 1), Point::new(0, 0), || {
+                    Ok((GrabStatus::SUCCESS, 100))
+                })
+                .unwrap();
+            let log = RefCell::new(vec![]);
+            h.runtime
+                .complete_menu_with(
+                    &mut h.window,
+                    MenuOutcome::SetLayer(Layer::Below),
+                    |p| {
+                        log.borrow_mut().push("release");
+                        p.release_with(|| Ok(())).map(|_| ())
+                    },
+                    |_| {
+                        log.borrow_mut().push("destroy");
+                        Ok(())
+                    },
+                    |_, target| {
+                        log.borrow_mut().push("busy");
+                        local_layer_after_menu_with(true, target, || {
+                            panic!("remote controller must not be stolen")
+                        })
+                    },
+                )
+                .unwrap();
+            assert_eq!(*log.borrow(), ["release", "destroy", "busy"]);
+            assert_eq!(h.runtime.layers.pending(), pending);
+            assert!(!h.runtime.pointer.is_grabbed());
+            assert!(h.runtime.menu.is_none());
+        }
+        #[test]
+        fn an_aborted_remote_controller_never_restarts_or_retries() {
+            let (mut h, mut op) = setup(false, L::Normal, false);
+            h.layer_mode = 1;
+            assert!(run(&mut h, &mut op).is_none());
+            h.runtime.layers.abort();
+            let result = run(&mut h, &mut op).unwrap();
+            assert_eq!(result.status(), Status::Failed);
+            assert_eq!(result.detail().reason, Reason::LayerChanged);
+            assert_eq!(h.mutations, [Mutation::AddAbove]);
+        }
+        #[test]
+        fn already_ready_popup_is_preserved_by_layer_only_g() {
+            let (mut h, mut op) = setup(false, L::Normal, false);
+            h.runtime
+                .acquire_menu_with(MenuPopup::test_popup(10, 1), Point::new(0, 0), || {
+                    Ok((GrabStatus::SUCCESS, 100))
+                })
+                .unwrap();
+            assert_eq!(run(&mut h, &mut op).unwrap().status(), Status::Success);
+            assert!(h.runtime.menu.is_some());
+            assert!(h.runtime.pointer.is_grabbed());
+            assert_eq!(h.count("fence"), 0);
+        }
+        #[test]
+        fn expiry_during_layer_support_or_removal_never_sends_late_addition() {
+            for step in ["layer_support", "remove_below"] {
+                let (mut h, mut op) = setup(false, L::Below, false);
+                h.advance = Some((step, Duration::from_millis(1000)));
+                let result = run(&mut h, &mut op).unwrap();
+                assert_eq!(result.status(), Status::Failed);
+                assert_eq!(result.detail().reason, Reason::ConfirmationTimeout);
+                assert_eq!(h.count("add_above"), 0);
+                assert_eq!(h.count("remove_below"), usize::from(step == "remove_below"));
+                assert!(!result.detail().progress.above_confirmed);
+            }
+        }
+        #[test]
+        fn visibility_read_crossing_cutoff_cannot_enable_input_or_start_layer() {
+            let (mut h, mut op) = setup(true, L::Normal, false);
+            restore(&mut h, &mut op, false);
+            h.advance = Some(("geometry", op.bring_top.visibility_cutoff - h.now));
+            let result = run(&mut h, &mut op).unwrap();
+            assert_eq!(result.status(), Status::Partial);
+            assert_eq!(result.detail().reason, Reason::ConfirmationTimeout);
+            assert_eq!(h.count("enable"), 0);
+            assert!(h.mutations.is_empty());
+        }
+        #[test]
+        fn placement_busy_is_preflight_busy_without_any_g_mutation() {
+            let (mut h, mut op) = setup(false, L::Normal, false);
+            h.runtime.correction = Some((Point::new(200, 200), h.now + CONFIRMATION_TIMEOUT));
+            let result = run(&mut h, &mut op).unwrap();
+            assert_eq!(result.status(), Status::Busy);
+            assert!(!result.detail().progress.host_mutation_dispatched);
+            assert!(h.mutations.is_empty());
+            assert_eq!(h.count("fence"), 0);
+            assert_eq!(h.count("observe"), 0);
+        }
+        #[test]
+        fn all_desktop_body_follows_local_path_and_preserves_desktop_sentinel() {
+            let (mut h, mut op) = setup(true, L::Below, false);
+            h.current.desktop = u32::MAX;
+            h.current.evidence.workspace = Workspace::AllDesktops;
+            assert!(run(&mut h, &mut op).is_none());
+            h.current = reading(Visibility::NotMinimizedHere, L::Below, u32::MAX, 2);
+            let result = run(&mut h, &mut op).unwrap();
+            assert_success(result, true, true);
+            assert_eq!(result.detail().workspace, Workspace::AllDesktops);
+            assert_eq!(op.show.baseline.unwrap().desktop, u32::MAX);
+            assert_eq!(h.count("map"), 1);
+            assert_eq!(h.count("remove_hidden"), 0);
+        }
+        #[test]
+        fn transitional_final_read_keeps_operation_without_restarting_completed_layer() {
+            let (mut h, mut op) = setup(false, L::Above, false);
+            let above = h.current;
+            let mut transitional = above;
+            transitional.evidence.coherent = false;
+            transitional.layer = L::Unknown;
+            h.reads = VecDeque::from([above, above, above, above, above, transitional]);
+            assert!(run(&mut h, &mut op).is_none());
+            assert!(op.bring_top.layer_finished);
+            assert!(h.runtime.layers.pending().is_none());
+            assert!(!remote_service_due(&op, h.now));
+            assert_eq!(h.count("layer_read"), 1);
+            h.current = above;
+            mark_remote_observation(&mut op, false);
+            let result = run(&mut h, &mut op).unwrap();
+            assert_eq!(result.status(), Status::Success);
+            assert_eq!(h.count("layer_read"), 1);
+            assert!(h.mutations.is_empty());
+        }
+        #[test]
+        fn final_layer_drift_cannot_report_failed_with_reason_none() {
+            let (mut h, mut op) = setup(false, L::Above, false);
+            observe_visibility(&mut op, &mut h).unwrap();
+            op.stage = Stage::Layer;
+            op.detail.stage = Stage::Layer;
+            h.current.layer = L::Normal;
+            let result = finish_bring_top_with(&mut op, &mut h, Reason::None, true).unwrap();
+            assert_eq!(result.status(), Status::Failed);
+            assert_eq!(result.detail().reason, Reason::LayerChanged);
+            assert_eq!(result.detail().layer, L::Normal);
+            assert!(result.detail().progress.not_minimized_confirmed);
+            assert!(!result.detail().progress.above_confirmed);
+        }
+        #[test]
+        fn local_layer_deadline_route_is_excluded_only_for_remote_layer_phase() {
+            let (mut h, mut op) = setup(false, L::Normal, false);
+            assert!(local_layer_service_allowed(None));
+            assert!(local_layer_service_allowed(Some(&op)));
+            h.layer_mode = 1;
+            assert!(run(&mut h, &mut op).is_none());
+            assert!(!local_layer_service_allowed(Some(&op)));
+            assert_eq!(remote_operation_deadline(&op), h.layer_deadline().unwrap());
+            assert_ne!(
+                remote_operation_deadline(&op),
+                op.bring_top.visibility_cutoff
+            );
+        }
+    }
     mod scheduling {
         use super::*;
 
@@ -7351,9 +8969,7 @@ mod show_tests {
                 };
                 host.step("request")?;
                 match control::admit(&mut self.active, request, Lifecycle::Ready, false, host.now) {
-                    control::Admission::Admitted
-                        if matches!(request.command, Command::Show | Command::Hide) =>
-                    {
+                    control::Admission::Admitted => {
                         host.step("admit")?;
                         let op = self.active.as_mut().unwrap();
                         op.stage = if request.command == Command::Hide {
@@ -7362,15 +8978,6 @@ mod show_tests {
                             control::Stage::Show
                         };
                         op.detail = control::preflight_detail(Reason::None, op.stage);
-                    }
-                    control::Admission::Admitted => {
-                        self.active = None;
-                        self.replies.push((
-                            request.command,
-                            Status::Failed,
-                            Reason::Unsupported,
-                            host.now,
-                        ));
                     }
                     control::Admission::Duplicate => host.step("duplicate")?,
                     control::Admission::Reply(status, reason, _) => {
@@ -7384,10 +8991,10 @@ mod show_tests {
                 let Some(op) = self.active.as_mut() else {
                     return Ok(());
                 };
-                if !visibility_service_due(op, host.now) {
+                if !remote_service_due(op, host.now) {
                     return Ok(());
                 }
-                if let Some(result) = service_visibility_with(op, host)? {
+                if let Some(result) = service_remote_with(op, host)? {
                     self.replies.push((
                         op.request.command,
                         result.status(),
@@ -7437,7 +9044,7 @@ mod show_tests {
                         .owner
                         .active
                         .as_ref()
-                        .is_some_and(|op| self.host.now >= visibility_operation_deadline(op))
+                        .is_some_and(|op| self.host.now >= remote_operation_deadline(op))
                     {
                         self.owner.service(&mut self.host)?;
                     }
@@ -7450,13 +9057,13 @@ mod show_tests {
                                 reading(Visibility::Minimized, L::Normal, 2, 2)
                             };
                             if let Some(op) = self.owner.active.as_mut() {
-                                mark_visibility_observation(op, false);
+                                mark_remote_observation(op, false);
                             }
                         }
                         Queued::Observed(reading) => {
                             self.host.current = reading;
                             if let Some(op) = self.owner.active.as_mut() {
-                                mark_visibility_observation(op, false);
+                                mark_remote_observation(op, false);
                             }
                         }
                         Queued::Request(_) => unreachable!("control event consumed"),
@@ -7472,12 +9079,7 @@ mod show_tests {
                 }
                 let deadline = probe_deadline(&self.host.runtime, None)
                     .into_iter()
-                    .chain(
-                        self.owner
-                            .active
-                            .as_ref()
-                            .map(visibility_operation_deadline),
-                    )
+                    .chain(self.owner.active.as_ref().map(remote_operation_deadline))
                     .min();
                 self.host.step("wait")?;
                 self.waits.push(deadline);
@@ -7509,6 +9111,115 @@ mod show_tests {
             s
         }
 
+        #[test]
+        fn bring_top_lookahead_begins_before_outer_continue() {
+            let mut s = Loop::new();
+            let mut queue = VecDeque::from(vec![Queued::Ordinary("before"); 64]);
+            queue.push_back(request(Command::BringTop, 99));
+            s.iteration(&mut queue).unwrap();
+            assert_eq!(s.host.count("map"), 1);
+            assert!(s.waits.is_empty());
+            assert_eq!(s.host.log.last(), Some(&"map"));
+            assert_eq!(s.owner.active.unwrap().request.command, Command::BringTop);
+        }
+        #[test]
+        fn bring_top_visibility_ready_and_immediate_layer_complete_in_same_service() {
+            for layer in [L::Normal, L::Below, L::Above] {
+                let mut s = Loop::new();
+                s.host.current.layer = layer;
+                s.iteration(&mut VecDeque::from([
+                    request(Command::BringTop, 99),
+                    Queued::Observed(reading(Visibility::NotMinimizedHere, layer, 2, 2)),
+                ]))
+                .unwrap();
+                assert!(s.owner.active.is_none());
+                assert_eq!(
+                    s.owner.replies,
+                    [(Command::BringTop, Status::Success, Reason::None, s.host.now)]
+                );
+                assert_eq!(s.waits, [None]);
+                assert_eq!(s.host.count("map"), 1);
+                assert_eq!(s.host.count("enable"), 1);
+                assert_eq!(s.host.count("add_above"), usize::from(layer != L::Above));
+            }
+        }
+        #[test]
+        fn already_ready_g_layer_work_needs_no_future_event_or_poll() {
+            for layer in [L::Normal, L::Below, L::Above] {
+                let mut s = Loop::new();
+                s.host.current = reading(Visibility::NotMinimizedHere, layer, 2, 2);
+                s.iteration(&mut VecDeque::from([request(Command::BringTop, 99)]))
+                    .unwrap();
+                assert!(s.owner.active.is_none());
+                assert_eq!(s.owner.replies[0].1, Status::Success);
+                assert_eq!(s.waits, [None]);
+                assert_eq!(s.host.count("fence"), 0);
+                let count = s.host.count("observe");
+                s.iteration(&mut VecDeque::new()).unwrap();
+                assert_eq!(s.host.count("observe"), count);
+            }
+        }
+        #[test]
+        fn g_retains_identity_across_visibility_layer_and_competitors_are_busy() {
+            let mut s = Loop::new();
+            s.host.layer_mode = 1;
+            let t0 = s.host.now;
+            s.iteration(&mut VecDeque::from([
+                request(Command::BringTop, 99),
+                Queued::Visible,
+            ]))
+            .unwrap();
+            let original = s.owner.active.unwrap();
+            assert_eq!(original.request.command, Command::BringTop);
+            assert_eq!(original.stage, control::Stage::Layer);
+            assert_eq!(original.deadline, t0 + Duration::from_millis(3500));
+            assert!(s.owner.replies.is_empty());
+            s.host.now += Duration::from_millis(100);
+            s.iteration(&mut VecDeque::from([
+                request(Command::BringTop, 99),
+                request(Command::BringTop, 100),
+                request(Command::Hide, 101),
+                request(Command::Show, 102),
+            ]))
+            .unwrap();
+            assert_eq!(s.owner.active, Some(original));
+            assert_eq!(s.host.count("duplicate"), 1);
+            assert!(s.owner.replies.iter().all(|r| r.1 == Status::Busy));
+            assert_eq!(s.host.count("map"), 1);
+            assert_eq!(s.host.count("add_above"), 1);
+            s.host.current.layer = L::Above;
+            mark_remote_observation(s.owner.active.as_mut().unwrap(), false);
+            s.owner.service(&mut s.host).unwrap();
+            s.owner.service(&mut s.host).unwrap();
+            assert_eq!(
+                s.owner
+                    .replies
+                    .iter()
+                    .filter(|r| r.0 == Command::BringTop && r.1 == Status::Success)
+                    .count(),
+                1
+            );
+        }
+        #[test]
+        fn last_batch_layer_evidence_completes_g_before_socket_wait() {
+            let mut s = Loop::new();
+            s.host.current = visible();
+            s.host.layer_mode = 1;
+            s.iteration(&mut VecDeque::from([request(Command::BringTop, 99)]))
+                .unwrap();
+            let mut queue = VecDeque::from(vec![Queued::Ordinary("traffic"); 63]);
+            queue.push_back(Queued::Observed(reading(
+                Visibility::NotMinimizedHere,
+                L::Above,
+                2,
+                2,
+            )));
+            s.iteration(&mut queue).unwrap();
+            assert!(s.owner.active.is_none());
+            assert_eq!(s.owner.replies[0].1, Status::Success);
+            assert_eq!(s.waits.last(), Some(&None));
+            assert_eq!(s.host.count("add_above"), 1);
+        }
         #[test]
         fn off_workspace_only_event_dispatches_hidden_request_before_socket_wait() {
             for command in [Command::Hide, Command::Show] {
@@ -7786,11 +9497,11 @@ mod show_tests {
                 let h = Fake::new(visible());
                 let mut op = h.command_operation(Command::Hide);
                 op.hide.observe = false;
-                mark_visibility_observation(
+                mark_remote_observation(
                     &mut op,
                     visibility_layout_interruption(&event, 1, &layout),
                 );
-                assert!(visibility_service_due(&op, h.now));
+                assert!(remote_service_due(&op, h.now));
                 assert!(!op.hide.layout_interrupted);
             }
         }
@@ -7874,22 +9585,22 @@ mod show_tests {
         }
 
         #[test]
-        fn bring_top_still_replies_unsupported_without_visibility_mutations() {
+        fn bring_top_request_only_batch_starts_restore_before_wait() {
             let mut scheduler = Loop::new();
-            let mut queue = VecDeque::from([request(Command::BringTop, 2)]);
-            scheduler.iteration(&mut queue).unwrap();
-            assert_eq!(scheduler.owner.replies.len(), 1);
-            for (reply, command) in scheduler.owner.replies.iter().zip([Command::BringTop]) {
-                assert_eq!(
-                    (reply.0, reply.1, reply.2),
-                    (command, Status::Failed, Reason::Unsupported)
-                );
-                assert_eq!(reply.1.exit_code() as i32, 7);
-            }
-            assert!(scheduler.owner.active.is_none());
-            assert_eq!(scheduler.host.count("map"), 0);
-            assert_eq!(scheduler.host.count("user_time_zero"), 0);
-            assert_eq!(scheduler.waits, [None]);
+            let admitted = scheduler.host.now;
+            scheduler
+                .iteration(&mut VecDeque::from([request(Command::BringTop, 2)]))
+                .unwrap();
+            let op = scheduler.owner.active.unwrap();
+            assert_eq!(op.request.command, Command::BringTop);
+            assert_eq!(op.deadline, admitted + Duration::from_millis(3500));
+            assert_eq!(scheduler.host.count("map"), 1);
+            assert!(scheduler.host.mutations.is_empty());
+            assert_eq!(
+                scheduler.waits,
+                [Some(admitted + Duration::from_millis(2500))]
+            );
+            assert!(scheduler.owner.replies.is_empty());
         }
 
         #[test]
@@ -7928,7 +9639,7 @@ mod show_tests {
             assert_eq!(scheduler.waits, [None, Some(deadline), Some(deadline)]);
             assert_eq!(scheduler.host.count("observe"), observations);
             assert_eq!(scheduler.host.count("map"), 1);
-            assert!(!visibility_service_due(
+            assert!(!remote_service_due(
                 scheduler.owner.active.as_ref().unwrap(),
                 scheduler.host.now
             ));
@@ -7967,7 +9678,7 @@ mod show_tests {
             assert_eq!(scheduler.waits, [Some(confirmation)]);
             assert_eq!(scheduler.host.count("enable"), 0);
             scheduler.host.now = confirmation - Duration::from_millis(1);
-            assert!(!visibility_service_due(&op, scheduler.host.now));
+            assert!(!remote_service_due(&op, scheduler.host.now));
             scheduler.host.now = confirmation;
             scheduler.iteration(&mut VecDeque::new()).unwrap();
             assert!(scheduler.owner.active.is_none());
@@ -7979,7 +9690,7 @@ mod show_tests {
         }
 
         #[test]
-        fn sustained_batches_cannot_starve_fixed_visibility_deadline() {
+        fn sustained_batches_cannot_starve_fixed_remote_deadline() {
             let mut scheduler = Loop::new();
             let admission = scheduler.host.now;
             scheduler.event_cost = Duration::from_millis(10);
@@ -8137,7 +9848,7 @@ mod show_tests {
         let deadline = op.deadline;
         assert!(h.run(&mut op).is_none());
         for _ in 0..3 {
-            mark_visibility_observation(&mut op, false);
+            mark_remote_observation(&mut op, false);
             assert!(h.run(&mut op).is_none());
             assert_eq!(op.deadline, deadline);
         }
@@ -8783,7 +10494,7 @@ mod show_tests {
         assert_eq!(h.count("enable"), 0);
     }
     #[test]
-    fn buffered_traffic_over_64_events_cannot_starve_visibility_deadline() {
+    fn buffered_traffic_over_64_events_cannot_starve_remote_deadline() {
         let mut h = minimized();
         let mut op = h.operation();
         assert!(h.run(&mut op).is_none());
@@ -9202,10 +10913,10 @@ mod show_tests {
             h.current.evidence.coherent = false;
             let mut op = h.command_operation(Command::Hide);
             assert!(run(&mut h, &mut op).is_none());
-            assert!(!visibility_service_due(&op, h.now));
+            assert!(!remote_service_due(&op, h.now));
             h.current = visible();
-            mark_visibility_observation(&mut op, false);
-            assert!(visibility_service_due(&op, h.now));
+            mark_remote_observation(&mut op, false);
+            assert!(remote_service_due(&op, h.now));
             assert!(run(&mut h, &mut op).is_none());
             assert_eq!(h.count("iconify"), 1);
             assert_eq!(h.count("fence"), 1);
@@ -9299,7 +11010,7 @@ mod show_tests {
                     0 => h.current.layer = L::Above,
                     1 => h.current.desktop = 3,
                     2 => h.current.current = 3,
-                    _ => mark_visibility_observation(&mut op, true),
+                    _ => mark_remote_observation(&mut op, true),
                 }
                 let result = run(&mut h, &mut op).unwrap();
                 assert_eq!(result.status(), Status::Failed);
