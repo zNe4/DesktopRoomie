@@ -1678,7 +1678,20 @@ mod visibility_fence_tests {
     }
 }
 
-fn abort_layer(layers: &mut LayerController, reason: &str) {
+/// Internal service evidence, not a remote OperationResult or a WM acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerOutcome {
+    AlreadyMatches,
+    Waiting,
+    Confirmed,
+    Unsupported,
+    Unverifiable,
+    TimedOut(layer::Phase),
+    Interrupted(layer::Phase),
+    Busy,
+}
+
+fn abort_layer(layers: &mut LayerController, reason: &str) -> Option<LayerOutcome> {
     let pending = layers.abort();
     if pending.is_some() {
         eprintln!(
@@ -1688,6 +1701,7 @@ fn abort_layer(layers: &mut LayerController, reason: &str) {
             pending.map(|p| p.phase)
         );
     }
+    pending.map(|p| LayerOutcome::Interrupted(p.phase))
 }
 
 fn read_layer_with(
@@ -1710,19 +1724,21 @@ fn read_layer_with(
 fn validate_layer_support(
     layers: &mut LayerController,
     advertised: PropertyResult<LayerSupport>,
-) -> bool {
-    let Some(pending) = layers.pending() else {
-        return true;
-    };
+) -> Option<LayerOutcome> {
+    let pending = layers.pending()?;
     match advertised {
-        Ok(support) if support.allows(pending.required) => true,
+        Ok(support) if support.allows(pending.required) => None,
         support => {
             eprintln!(
                 "[LAYER] Required advertised support {:?} unavailable: {support:?}",
                 pending.required
             );
             abort_layer(layers, "unsupported or malformed _NET_SUPPORTED");
-            false
+            Some(if support.is_ok() {
+                LayerOutcome::Unsupported
+            } else {
+                LayerOutcome::Unverifiable
+            })
         }
     }
 }
@@ -1732,29 +1748,44 @@ fn validate_layer_support(
 fn service_layer_with(
     layers: &mut LayerController,
     request: Option<Layer>,
+    read: impl FnMut() -> Result<PropertyResult<ObservedLayer>, HostError>,
+    support: impl FnMut() -> Result<PropertyResult<LayerSupport>, HostError>,
+    send: impl FnMut(Mutation) -> Result<(), HostError>,
+    now: impl FnMut() -> Instant,
+) -> Result<LayerOutcome, HostError> {
+    service_layer_bounded_with(layers, request, None, read, support, send, now)
+}
+
+fn service_layer_bounded_with(
+    layers: &mut LayerController,
+    request: Option<Layer>,
+    outer_deadline: Option<Instant>,
     mut read: impl FnMut() -> Result<PropertyResult<ObservedLayer>, HostError>,
     mut support: impl FnMut() -> Result<PropertyResult<LayerSupport>, HostError>,
     mut send: impl FnMut(Mutation) -> Result<(), HostError>,
     mut now: impl FnMut() -> Instant,
-) -> Result<(), HostError> {
+) -> Result<LayerOutcome, HostError> {
     if let Some(target) = request {
         if layers.pending().is_some() {
             println!(
                 "[LAYER] Request {target:?} rejected: busy with {:?}",
                 layers.desired
             );
-            return Ok(());
+            return Ok(LayerOutcome::Busy);
         }
         println!("[LAYER] Requested {target:?}");
     }
     let accepted = now();
     let result = (|| {
         let Some(observed) = read_layer_with(layers, &mut read)? else {
-            return Ok(());
+            return Ok(LayerOutcome::Unverifiable);
         };
         let previous = layers.observed;
         let mut step = match request {
-            Some(target) => layers.begin(target, observed, accepted),
+            Some(target) => match outer_deadline {
+                Some(deadline) => layers.begin_bounded(target, observed, accepted, deadline),
+                None => layers.begin(target, observed, accepted),
+            },
             None => layers.observe(observed, now()),
         };
         if previous != Some(observed) {
@@ -1768,15 +1799,15 @@ fn service_layer_with(
                     // If time expires during a read/check, only a final read is allowed.
                     if !layers.deadline().is_some_and(|deadline| now() >= deadline) {
                         let advertised = support()?;
-                        if !layers.deadline().is_some_and(|deadline| now() >= deadline)
-                            && !validate_layer_support(layers, advertised)
-                        {
-                            return Ok(());
+                        if !layers.deadline().is_some_and(|deadline| now() >= deadline) {
+                            if let Some(outcome) = validate_layer_support(layers, advertised) {
+                                return Ok(outcome);
+                            }
                         }
                     }
                     if layers.deadline().is_some_and(|deadline| now() >= deadline) {
                         let Some(observed) = read_layer_with(layers, &mut read)? else {
-                            return Ok(());
+                            return Ok(LayerOutcome::Unverifiable);
                         };
                         step = layers.observe(observed, now());
                         continue;
@@ -1784,7 +1815,7 @@ fn service_layer_with(
                     send(mutation)?;
                     println!("[LAYER] X11 checked {mutation:?}; awaiting fresh WM state");
                     let Some(observed) = read_layer_with(layers, &mut read)? else {
-                        return Ok(());
+                        return Ok(LayerOutcome::Unverifiable);
                     };
                     println!("[LAYER] Fresh observed state: {observed:?}");
                     step = layers.observe(observed, now());
@@ -1794,17 +1825,18 @@ fn service_layer_with(
                         "[LAYER] Already matches {:?}; no mutation or support proof",
                         layers.desired
                     );
-                    return Ok(());
+                    return Ok(LayerOutcome::AlreadyMatches);
                 }
                 Step::Confirmed => {
                     println!("[LAYER] Confirmed property state {:?}; visual stacking requires owner observation", layers.observed);
-                    return Ok(());
+                    return Ok(LayerOutcome::Confirmed);
                 }
                 Step::TimedOut(phase) => {
                     eprintln!("[LAYER] Timeout: target={:?}, last readable={:?}, phase={phase:?}; no retry", layers.desired, layers.observed);
-                    return Ok(());
+                    return Ok(LayerOutcome::TimedOut(phase));
                 }
-                Step::Busy | Step::Waiting => return Ok(()),
+                Step::Busy => return Ok(LayerOutcome::Busy),
+                Step::Waiting => return Ok(LayerOutcome::Waiting),
             }
         }
     })();
@@ -1830,6 +1862,7 @@ fn service_layer(
         |mutation| atoms.send(conn, root, body, mutation),
         Instant::now,
     )
+    .map(|_| ())
 }
 
 fn layer_property_event(event: &Event, body: u32, atoms: &LayerAtoms) -> bool {
@@ -5581,6 +5614,294 @@ mod layer_runtime_tests {
         below: true,
     };
 
+    #[test]
+    fn structured_layer_outcomes_distinguish_already_waiting_and_fresh_confirmation() {
+        let now = Instant::now();
+        let mut layers = LayerController::default();
+        assert_eq!(
+            service_layer_with(
+                &mut layers,
+                Some(Layer::Above),
+                || Ok(Ok(ObservedLayer::Above)),
+                || panic!("already matches"),
+                |_| panic!("already matches"),
+                || now,
+            )
+            .unwrap(),
+            LayerOutcome::AlreadyMatches
+        );
+        let sends = Cell::new(0);
+        assert_eq!(
+            service_layer_with(
+                &mut layers,
+                Some(Layer::Above),
+                || Ok(Ok(ObservedLayer::Normal)),
+                || Ok(Ok(SUPPORT)),
+                |mutation| {
+                    assert_eq!(mutation, Mutation::AddAbove);
+                    sends.set(sends.get() + 1);
+                    Ok(())
+                },
+                || now,
+            )
+            .unwrap(),
+            LayerOutcome::Waiting
+        );
+        assert_eq!(sends.get(), 1);
+        let pending = layers.pending();
+        assert_eq!(
+            service_layer_with(
+                &mut layers,
+                Some(Layer::Below),
+                || panic!("busy must not read"),
+                || panic!("busy"),
+                |_| panic!("busy"),
+                || now,
+            )
+            .unwrap(),
+            LayerOutcome::Busy
+        );
+        assert_eq!(layers.pending(), pending);
+        assert_eq!(
+            service_layer_with(
+                &mut layers,
+                None,
+                || Ok(Ok(ObservedLayer::Above)),
+                || panic!("confirmation"),
+                |_| panic!("confirmation"),
+                || now,
+            )
+            .unwrap(),
+            LayerOutcome::Confirmed
+        );
+        assert!(layers.pending().is_none());
+    }
+
+    #[test]
+    fn structured_support_and_property_failures_are_distinct_and_stop_mutation() {
+        let now = Instant::now();
+        for (support, expected) in [
+            (
+                Ok(LayerSupport {
+                    above: false,
+                    ..SUPPORT
+                }),
+                LayerOutcome::Unsupported,
+            ),
+            (Err("malformed support"), LayerOutcome::Unverifiable),
+        ] {
+            let mut layers = LayerController::default();
+            assert_eq!(
+                service_layer_with(
+                    &mut layers,
+                    Some(Layer::Above),
+                    || Ok(Ok(ObservedLayer::Below)),
+                    || Ok(support),
+                    |_| panic!("no removal before complete support"),
+                    || now,
+                )
+                .unwrap(),
+                expected
+            );
+            assert!(layers.pending().is_none());
+        }
+        let mut layers = LayerController::default();
+        pending_above(&mut layers, now);
+        assert_eq!(
+            service_layer_with(
+                &mut layers,
+                None,
+                || Ok(Err("malformed state")),
+                || panic!("unverifiable"),
+                |_| panic!("unverifiable"),
+                || now,
+            )
+            .unwrap(),
+            LayerOutcome::Unverifiable
+        );
+        assert!(layers.pending().is_none());
+    }
+
+    #[test]
+    fn contradictory_layer_flags_never_produce_structured_above_confirmation() {
+        let now = Instant::now();
+        let mut layers = LayerController::default();
+        service_layer_with(
+            &mut layers,
+            Some(Layer::Above),
+            || Ok(Ok(ObservedLayer::Normal)),
+            || Ok(Ok(SUPPORT)),
+            |_| Ok(()),
+            || now,
+        )
+        .unwrap();
+        let deadline = layers.deadline().unwrap();
+        for (time, expected) in [
+            (now, LayerOutcome::Waiting),
+            (deadline, LayerOutcome::TimedOut(Phase::AwaitFinal)),
+        ] {
+            assert_eq!(
+                service_layer_with(
+                    &mut layers,
+                    None,
+                    || Ok(Ok(ObservedLayer::Conflict)),
+                    || panic!("no retry or conflict repair after dispatch"),
+                    |_| panic!("no retry"),
+                    || time,
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn structured_timeout_and_external_interruption_retain_the_controller_phase() {
+        let now = Instant::now();
+        for removal_done in [false, true] {
+            let mut layers = LayerController::default();
+            pending_above(&mut layers, now);
+            if removal_done {
+                service_layer_with(
+                    &mut layers,
+                    None,
+                    || Ok(Ok(ObservedLayer::Normal)),
+                    || Ok(Ok(SUPPORT)),
+                    |_| Ok(()),
+                    || now,
+                )
+                .unwrap();
+            }
+            let phase = layers.pending().unwrap().phase;
+            let deadline = layers.deadline().unwrap();
+            assert_eq!(
+                service_layer_with(
+                    &mut layers,
+                    None,
+                    || Ok(Ok(ObservedLayer::Normal)),
+                    || panic!("deadline"),
+                    |_| panic!("deadline"),
+                    || deadline,
+                )
+                .unwrap(),
+                LayerOutcome::TimedOut(phase)
+            );
+            assert!(layers.pending().is_none());
+            pending_above(&mut layers, now);
+            assert_eq!(
+                abort_layer(&mut layers, "external lifecycle interruption"),
+                Some(LayerOutcome::Interrupted(Phase::AwaitRemoval))
+            );
+            assert!(layers.pending().is_none());
+            assert_eq!(abort_layer(&mut layers, "already aborted"), None);
+        }
+    }
+
+    #[test]
+    fn bounded_service_expiry_never_sends_and_final_fresh_read_can_confirm() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(200);
+        for achieved in [false, true] {
+            let mut layers = LayerController::default();
+            let clock = Cell::new(now);
+            let reads = Cell::new(0);
+            assert_eq!(
+                service_layer_bounded_with(
+                    &mut layers,
+                    Some(Layer::Above),
+                    Some(deadline),
+                    || {
+                        reads.set(reads.get() + 1);
+                        Ok(Ok(if achieved && reads.get() == 2 {
+                            ObservedLayer::Above
+                        } else {
+                            ObservedLayer::Below
+                        }))
+                    },
+                    || {
+                        clock.set(deadline);
+                        Ok(Ok(SUPPORT))
+                    },
+                    |_| panic!("support read exhausted the outer budget"),
+                    || clock.get(),
+                )
+                .unwrap(),
+                if achieved {
+                    LayerOutcome::Confirmed
+                } else {
+                    LayerOutcome::TimedOut(Phase::AwaitRemoval)
+                }
+            );
+            assert_eq!(reads.get(), 2);
+            assert!(layers.pending().is_none());
+        }
+        let mut layers = LayerController::default();
+        assert_eq!(
+            service_layer_bounded_with(
+                &mut layers,
+                Some(Layer::Above),
+                Some(now),
+                || Ok(Ok(ObservedLayer::Normal)),
+                || panic!("expired entry"),
+                |_| panic!("expired entry"),
+                || now,
+            )
+            .unwrap(),
+            LayerOutcome::TimedOut(Phase::AwaitFinal)
+        );
+    }
+
+    #[test]
+    fn fresh_above_after_removal_skips_addition_and_checked_error_cannot_retry() {
+        let now = Instant::now();
+        let mut layers = LayerController::default();
+        let mut reads = VecDeque::from([ObservedLayer::Below, ObservedLayer::Above]);
+        let sends = Cell::new(0);
+        assert_eq!(
+            service_layer_with(
+                &mut layers,
+                Some(Layer::Above),
+                || Ok(Ok(reads.pop_front().unwrap())),
+                || Ok(Ok(SUPPORT)),
+                |mutation| {
+                    assert!(matches!(mutation, Mutation::Remove(_)));
+                    sends.set(sends.get() + 1);
+                    Ok(())
+                },
+                || now,
+            )
+            .unwrap(),
+            LayerOutcome::Confirmed
+        );
+        assert_eq!(sends.get(), 1);
+        let result = service_layer_with(
+            &mut layers,
+            Some(Layer::Above),
+            || Ok(Ok(ObservedLayer::Below)),
+            || Ok(Ok(SUPPORT)),
+            |_| {
+                sends.set(sends.get() + 1);
+                Err("checked native failure".into())
+            },
+            || now,
+        );
+        assert_eq!(result.unwrap_err().to_string(), "checked native failure");
+        assert!(layers.pending().is_none());
+        assert_eq!(
+            service_layer_with(
+                &mut layers,
+                None,
+                || Ok(Ok(ObservedLayer::Normal)),
+                || panic!("no second request after uncertainty"),
+                |_| panic!("no second request"),
+                || now,
+            )
+            .unwrap(),
+            LayerOutcome::Waiting
+        );
+        assert_eq!(sends.get(), 2);
+    }
+
     fn captured_menu() -> ProbeRuntime {
         let mut runtime = ProbeRuntime::new();
         runtime.body = BodyAvailability::Ready;
@@ -5850,6 +6171,7 @@ mod layer_runtime_tests {
                             |_| panic!("no mutation"),
                             || now,
                         )
+                        .map(|_| ())
                     },
                 )
                 .unwrap();
@@ -5981,7 +6303,7 @@ mod layer_runtime_tests {
             || now,
         );
         let cleanup_attempted = Cell::new(false);
-        let outcome = finish_probe_with(result, || {
+        let outcome = finish_probe_with(result.map(|_| ()), || {
             runtime.cancel_menu_with(
                 &mut tests::test_window(),
                 |pointer| {
@@ -6148,6 +6470,7 @@ mod layer_runtime_tests {
                         |_| panic!("final body observation must not send a mutation"),
                         || handled_at,
                     )
+                    .map(|_| ())
                 },
                 || handled_at,
             )

@@ -96,6 +96,17 @@ impl LayerController {
         self.pending.take()
     }
     pub fn begin(&mut self, target: Layer, observed: ObservedLayer, accepted: Instant) -> Step {
+        self.begin_bounded(target, observed, accepted, accepted + CONFIRMATION_TIMEOUT)
+    }
+    /// The ordinary layer budget, capped by an enclosing operation's fixed deadline.
+    /// Neither subsequent observations nor phase changes can renew this budget.
+    pub fn begin_bounded(
+        &mut self,
+        target: Layer,
+        observed: ObservedLayer,
+        accepted: Instant,
+        outer_deadline: Instant,
+    ) -> Step {
         if self.pending.is_some() {
             return Step::Busy;
         }
@@ -127,9 +138,13 @@ impl LayerController {
             Layer::Below => (Phase::AwaitFinal, Mutation::AddBelow),
             Layer::Normal => (Phase::AwaitFinal, Mutation::Remove(required)),
         };
+        let deadline = (accepted + CONFIRMATION_TIMEOUT).min(outer_deadline);
+        if accepted >= deadline {
+            return Step::TimedOut(phase);
+        }
         self.pending = Some(PendingLayer {
             phase,
-            deadline: accepted + CONFIRMATION_TIMEOUT,
+            deadline,
             required,
         });
         Step::Send(mutation)
@@ -167,6 +182,132 @@ impl LayerController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_and_bounded_entries_keep_the_one_second_budget_or_exact_earlier_cap() {
+        let accepted = Instant::now();
+        for (outer, expected_millis) in [
+            (None, 1000),
+            (Some(accepted + Duration::from_secs(5)), 1000),
+            (Some(accepted + Duration::from_millis(237)), 237),
+        ] {
+            let mut controller = LayerController::default();
+            let step = match outer {
+                None => controller.begin(Layer::Above, ObservedLayer::Normal, accepted),
+                Some(deadline) => controller.begin_bounded(
+                    Layer::Above,
+                    ObservedLayer::Normal,
+                    accepted,
+                    deadline,
+                ),
+            };
+            assert_eq!(step, Step::Send(Mutation::AddAbove));
+            assert_eq!(
+                controller.deadline(),
+                Some(accepted + Duration::from_millis(expected_millis))
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_duplicates_observations_and_serialized_phases_cannot_extend_deadline() {
+        let accepted = Instant::now();
+        let deadline = accepted + Duration::from_millis(300);
+        let mut controller = LayerController::default();
+        assert_eq!(
+            controller.begin_bounded(Layer::Above, ObservedLayer::Below, accepted, deadline),
+            Step::Send(Mutation::Remove(Flags {
+                above: false,
+                below: true
+            }))
+        );
+        for millis in 1..150 {
+            let time = accepted + Duration::from_millis(millis);
+            assert_eq!(
+                controller.observe(ObservedLayer::Below, time),
+                Step::Waiting
+            );
+            assert_eq!(
+                controller.begin_bounded(
+                    Layer::Above,
+                    ObservedLayer::Normal,
+                    time,
+                    time + CONFIRMATION_TIMEOUT
+                ),
+                Step::Busy
+            );
+            assert_eq!(controller.deadline(), Some(deadline));
+        }
+        assert_eq!(
+            controller.observe(ObservedLayer::Normal, accepted + Duration::from_millis(150)),
+            Step::Send(Mutation::AddAbove)
+        );
+        assert_eq!(controller.pending().unwrap().phase, Phase::AwaitFinal);
+        for millis in 151..300 {
+            assert_eq!(
+                controller.observe(
+                    ObservedLayer::Normal,
+                    accepted + Duration::from_millis(millis)
+                ),
+                Step::Waiting
+            );
+            assert_eq!(controller.deadline(), Some(deadline));
+        }
+        assert_eq!(
+            controller.observe(ObservedLayer::Normal, deadline),
+            Step::TimedOut(Phase::AwaitFinal)
+        );
+        assert_eq!(
+            controller.observe(ObservedLayer::Above, deadline),
+            Step::Waiting
+        );
+    }
+
+    #[test]
+    fn expired_bounded_entry_never_mutates_but_reports_an_already_satisfied_target() {
+        let now = Instant::now();
+        for target in [Layer::Above, Layer::Normal, Layer::Below] {
+            for observed in [
+                ObservedLayer::Above,
+                ObservedLayer::Normal,
+                ObservedLayer::Below,
+                ObservedLayer::Conflict,
+            ] {
+                let mut controller = LayerController::default();
+                let step =
+                    controller.begin_bounded(target, observed, now, now - Duration::from_millis(1));
+                if observed.matches(target) {
+                    assert_eq!(step, Step::AlreadyMatches);
+                } else {
+                    assert!(matches!(step, Step::TimedOut(_)));
+                }
+                assert!(controller.pending().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn capped_final_read_can_confirm_above_or_time_out_removal_without_late_add() {
+        let accepted = Instant::now();
+        let deadline = accepted + Duration::from_millis(100);
+        for observed in [
+            ObservedLayer::Normal,
+            ObservedLayer::Above,
+            ObservedLayer::Conflict,
+        ] {
+            let mut controller = LayerController::default();
+            controller.begin_bounded(Layer::Above, ObservedLayer::Below, accepted, deadline);
+            assert_eq!(
+                controller.observe(observed, deadline),
+                if observed == ObservedLayer::Above {
+                    Step::Confirmed
+                } else {
+                    Step::TimedOut(Phase::AwaitRemoval)
+                }
+            );
+            assert!(controller.pending().is_none());
+        }
+    }
 
     #[test]
     fn all_targets_and_observations_produce_absolute_bounded_transitions() {
