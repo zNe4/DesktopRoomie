@@ -2,7 +2,7 @@
 
 **Status (2026-10-09): OWNER-APPROVED STAGE DECOMPOSITION; IMPLEMENTATION NOT AUTHORIZED.** This document allocates the approved M03.2 design into eight independently reviewed implementation checkpoints (A–H). Publishing this roadmap **does not authorize M03.2-A**, any Rust changes, subsequent stages, host-configuration edits, or M03.3. A separately approved, bounded Codex assignment is required for every stage.
 
-**Execution checkpoint (2026-10-10):** stages A–E are accepted. Stage E Show is accepted at `174d8a92574e16768330fb3c315578b105e4b698` with [CI 38085985756](https://github.com/zNe4/DesktopRoomie/actions/runs/38085985756), 299 tests, after dual-monitor host/scheduler correction; [STATUS](STATUS.md) has the full evidence and Stage D click-through history. Stage-F candidate `2424c8887d83d1e503caba326cd512d036639c3e` passed source/CI review ([38089949879](https://github.com/zNe4/DesktopRoomie/actions/runs/38089949879), 332 passed, 0 failed) and initial same-workspace host checks, but failed H15/off-workspace Hide. **F is not accepted; G remains blocked.** The owner-approved [Openbox amendment](host/OPENBOX.md#openbox-off-workspace-visibility-amendment-2026-10-10) requires a narrow F correction, including genuinely minimized off-workspace Show. No correction is implemented or authorized by this docs-only checkpoint; no final M03.2 acceptance exists.
+**Execution checkpoint (recorded 2026-10-13):** stages A–F are accepted. Latest accepted executable is `ccd01915bef13850067391f70f1524362a6440dc`, matching [CI 38349035176](https://github.com/zNe4/DesktopRoomie/actions/runs/38349035176), 347 passed, 0 failed. The substantive off-workspace correction is `5ed75d7124c10bde0a72a1bc14b4075c09633922`; final `ccd0191…` changes only stale CLI help. [Stage-F evidence](host/OPENBOX.md#stage-f-acceptance-recorded-2026-10-13) distinguishes independent ChatGPT source/CI review, owner native acceptance, historical failed candidate `2424c8887d83d1e503caba326cd512d036639c3e` and manual experiments. [STATUS](STATUS.md) preserves Stage D/E correction history. **G is unblocked for separate planning/assignment**, requiring its own model/effort decision and bounded authorization; Bring Top remains Unsupported (exit 7). **H remains blocked on G**; no final M03.2 acceptance exists and this checkpoint authorizes no further implementation.
 
 **Technical authority:** [Approved M03.2 implementation plan](DesktopRoomie-A00-M03.2-approved-implementation-plan.md). Its protocol, classification, lifecycle, tests (Section 12), stop rules (Section 14), and host matrix H01–H28 (Section 13) remain authoritative. This roadmap assigns work; it does not replace or silently revise that technical contract. Follow [AGENTS.md](../AGENTS.md), [WORKFLOW.md](WORKFLOW.md), [INVARIANTS.md](INVARIANTS.md), and [STATUS.md](STATUS.md) for execution and acceptance. The original plan's Section 16 is an earlier sequencing proposal; the stage allocation below supersedes **only that implementation ordering**.
 
@@ -115,7 +115,7 @@ Every stage receives **one explicitly approved Codex prompt**, with:
 
 ### M03.2-F — Hide (safe only after Show accepted)
 
-**Deliver (amended Openbox design; correction pending):** real `--hide` under D input fence, using checked `WM_CHANGE_STATE / IconicState` for current/all-desktop cases and checked root-directed EWMH ADD-HIDDEN ClientMessage for off-workspace cases, then fresh confirmed minimization (`Iconic + Unmapped + HIDDEN`). Correct off-workspace genuinely minimized Show to checked EWMH REMOVE-HIDDEN without MapWindow. Preserve accepted local Show. Off-workspace not-minimized cases **must request** actual minimization even if their ICCCM state says Iconic. Already minimized is idempotent only after settling input obligations; the same control owner remains available.
+**Deliver (implemented and accepted):** real `--hide` under D input fence, using checked `WM_CHANGE_STATE / IconicState` for current/all-desktop cases and checked root-directed EWMH ADD-HIDDEN ClientMessage for off-workspace cases, then fresh confirmed minimization (`Iconic + Unmapped + HIDDEN`). Correct off-workspace genuinely minimized Show to checked EWMH REMOVE-HIDDEN without MapWindow or user-time mutation. Preserve accepted local Show. Off-workspace not-minimized cases **must request** actual minimization even if their ICCCM state says Iconic. Already minimized is idempotent only after settling input obligations; the same control owner remains available.
 
 **Candidate paths:** `src/main.rs`, `src/control.rs`, `src/x11/visibility.rs`, `src/x11/pointer.rs` and narrow tests.
 
@@ -123,11 +123,13 @@ Every stage receives **one explicitly approved Codex prompt**, with:
 
 **Acceptance:** owner performs H04, H06–H09, H15, H16 (corrected off-workspace Show), H17, H20 and applicable H22. The complete independent Show path remains usable after hiding; focused tests confirm no orphan capture or focus theft, including partial failures.
 
-**Failed gate and approved response:** original ICCCM-only candidate failed H15 (`HIDE=7`, no HIDDEN); manual ADD-HIDDEN succeeded, existing off-workspace MapWindow Show failed (`SHOW=7`), then manual REMOVE-HIDDEN succeeded. See the Openbox guide for exact observations and root cause. F requires the narrow approved correction and independent review + matching CI + owner native acceptance before G.
+**Failed gate and accepted correction:** original ICCCM-only candidate `2424c8887d83d1e503caba326cd512d036639c3e` passed source/CI and initial local checks but failed H15 (`HIDE=7`, Iconic + IsUnMapped + no HIDDEN, body desktop 0/current desktop 1). Manual ADD-HIDDEN succeeded, old off-workspace MapWindow Show failed (`SHOW=7`), then manual REMOVE-HIDDEN succeeded. These historical observations remain failures/experiments. Correction `5ed75d7…` implemented the approved requests; help-only `ccd0191…` is the final accepted executable. Independent source/CI review and owner H04, H06–H09, H15–H17, H20/H22 passed; see the [detailed acceptance record](host/OPENBOX.md#stage-f-acceptance-recorded-2026-10-13). **F is ACCEPTED**, unblocking G for separate planning/assignment only.
 
 **Stop:** cannot confirm off-workspace Hide/Show via the amended Openbox request matrix, or Hide can strand a body due to unresolved input cleanup. Return for architecture review; do not invent further hiding mechanisms or generalize these host semantics to other WMs.
 
 ### M03.2-G — Bring Top via existing M03.1 layer controller
+
+**Current gate:** unblocked for planning/assignment after F acceptance. A separate model/effort decision and bounded authorization are required before implementation. Bring Top is still Failed / Unsupported / Preflight (exit 7).
 
 **Deliver:** `--bring-top` = ensure-not-minimized shared E/F visibility stage + existing absolute Above transition. Convert current layer orchestration's log-only distinctions into **structured** remote outcomes without rewriting its state machine. Add a **narrow** off-workspace managed/not-minimized layer reader, leaving ordinary local-menu Viewable requirement intact; cap existing layer deadline under remote total deadline.
 
@@ -140,6 +142,8 @@ Every stage receives **one explicitly approved Codex prompt**, with:
 **Stop:** off-workspace Above requires weaker state verification, new layer controller, forbidden workspace movement or compensating restack loop.
 
 ### M03.2-H — Full integration, evidence and mission acceptance
+
+**Current gate:** blocked on G acceptance. No final M03.2 acceptance exists; the Stage-F record does not complete this integrated gate.
 
 **Deliver:** full Section 12 regression reconciliation; all applicable H01–H28 owner host instructions/results; CLI usability and optionally owner-managed Openbox Execute smoke; precise source/CI/review/owner acceptance evidence. Create `experiments/desktop-probe/M03.2-IMPLEMENTATION.md`, `experiments/desktop-probe/ACCEPTANCE-M03.2.md`, and update `docs/STATUS.md`, `docs/ARCHITECTURE.md`, `docs/INDEX.md`, `docs/host/OPENBOX.md` within explicit assignment scope. Preserve prior reports without rewriting historical observations.
 
