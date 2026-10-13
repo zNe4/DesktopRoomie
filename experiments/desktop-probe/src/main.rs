@@ -130,7 +130,7 @@ where
 }
 
 fn print_help() {
-    println!("DesktopRoomie - A00-M03.1: Desktop Probe");
+    println!("DesktopRoomie - A00-M03.2: Desktop Probe");
     println!();
     println!("Left click toggles color; left drag moves the body.");
     println!("Right click opens Above/Normal/Below/Dismiss/Quit after release. Outside left click dismisses.");
@@ -144,7 +144,7 @@ fn print_help() {
     println!("  --delay <SECONDS>       Delay in seconds before mapping window (for typing test)");
     println!("  --duration <SECONDS>    Run for a specified duration in seconds, then exit");
     println!(
-        "  --show  Restore the existing body without activation or workspace/layer changes\n  --hide | --bring-top  Unsupported (exit 7)"
+        "  --show       Restore the existing body without activation or workspace/layer changes\n  --hide       Minimize the existing body without workspace/layer changes\n  --bring-top  Unsupported (exit 7)"
     );
 }
 
