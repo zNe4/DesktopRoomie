@@ -632,6 +632,7 @@ pub enum ResultError {
     UnconfirmedSuccess,
     InconsistentConfirmation,
     InvalidPartial,
+    InconsistentStatus,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OperationResult {
@@ -690,6 +691,14 @@ impl OperationResult {
             || detail.progress.not_minimized_confirmed != not_minimized
             || detail.progress.above_confirmed != confirmed.above
             || (confirmed.above && detail.layer != LayerObservation::Above)
+            || command == Command::BringTop
+                && ((confirmed.above && !not_minimized)
+                    || (detail.progress.input_ready
+                        && confirmed.visibility != Some(ConfirmedVisibility::NotMinimizedHere))
+                    || (detail.progress.placement_deferred
+                        && confirmed.visibility
+                            != Some(ConfirmedVisibility::NotMinimizedElsewhere))
+                    || (detail.progress.input_ready && detail.progress.placement_deferred))
             || matches!(
                 confirmed.visibility,
                 Some(ConfirmedVisibility::NotMinimizedHere)
@@ -748,6 +757,13 @@ impl OperationResult {
         };
         if status == Status::Partial && !partial_valid {
             return Err(ResultError::InvalidPartial);
+        }
+        if command == Command::BringTop
+            && ((status == Status::Failed && restoration_proven)
+                || (status == Status::Busy
+                    && (restoration_proven || detail.progress.host_mutation_dispatched)))
+        {
+            return Err(ResultError::InconsistentStatus);
         }
         Ok(Self { status, detail })
     }
@@ -1910,6 +1926,257 @@ mod tests {
             Admission::Reply(Status::Busy, Reason::Busy, Stage::Preflight)
         );
         assert!(active.is_none());
+    }
+    #[test]
+    fn bring_top_busy_and_failed_status_cannot_discard_known_operation_progress() {
+        let mut proof = proven_restoration();
+        let mut d = preflight_detail(Reason::Busy, Stage::Preflight);
+        assert!(
+            OperationResult::bring_top(Status::Busy, d, Confirmation::default(), &proof).is_err()
+        );
+        assert!(
+            OperationResult::bring_top(Status::Failed, d, Confirmation::default(), &proof).is_err()
+        );
+        proof.minimized_at_start = false;
+        proof.restoration_confirmed = false;
+        d.progress.host_mutation_dispatched = true;
+        assert!(
+            OperationResult::bring_top(Status::Busy, d, Confirmation::default(), &proof).is_err()
+        );
+    }
+    #[test]
+    fn bring_top_result_cross_product_preserves_success_and_current_evidence_invariants() {
+        let mut proof = proven_restoration();
+        for status in [
+            Status::Success,
+            Status::Partial,
+            Status::Failed,
+            Status::Busy,
+        ] {
+            for reason in [Reason::None, Reason::ConfirmationTimeout] {
+                for stage in [
+                    Stage::Preflight,
+                    Stage::Show,
+                    Stage::Geometry,
+                    Stage::Layer,
+                    Stage::Shutdown,
+                ] {
+                    for vis in [
+                        None,
+                        Some(ConfirmedVisibility::Minimized),
+                        Some(ConfirmedVisibility::NotMinimizedHere),
+                        Some(ConfirmedVisibility::NotMinimizedElsewhere),
+                    ] {
+                        for workspace in [
+                            Workspace::Unknown,
+                            Workspace::Current,
+                            Workspace::Other,
+                            Workspace::AllDesktops,
+                        ] {
+                            for layer in [
+                                LayerObservation::Unknown,
+                                LayerObservation::Normal,
+                                LayerObservation::Above,
+                                LayerObservation::Below,
+                                LayerObservation::Conflict,
+                            ] {
+                                for bits in 0..32_u32 {
+                                    let p = Progress {
+                                        not_minimized_confirmed: bits & 1 != 0,
+                                        above_confirmed: bits & 2 != 0,
+                                        placement_deferred: bits & 4 != 0,
+                                        host_mutation_dispatched: bits & 8 != 0,
+                                        input_ready: bits & 16 != 0,
+                                    };
+                                    let visibility = match vis {
+                                        None => Visibility::Unknown,
+                                        Some(ConfirmedVisibility::Minimized) => {
+                                            Visibility::Minimized
+                                        }
+                                        Some(ConfirmedVisibility::NotMinimizedHere) => {
+                                            Visibility::NotMinimizedHere
+                                        }
+                                        Some(ConfirmedVisibility::NotMinimizedElsewhere) => {
+                                            Visibility::NotMinimizedElsewhere
+                                        }
+                                    };
+                                    let d = Detail {
+                                        reason,
+                                        stage,
+                                        visibility,
+                                        workspace,
+                                        layer,
+                                        progress: p,
+                                    };
+                                    for above in [false, true] {
+                                        for history in 0..4 {
+                                            proof.minimized_at_start = history & 1 != 0;
+                                            proof.restoration_confirmed = history & 2 != 0;
+                                            if let Ok(r) = OperationResult::bring_top(
+                                                status,
+                                                d,
+                                                Confirmation {
+                                                    visibility: vis,
+                                                    above,
+                                                },
+                                                &proof,
+                                            ) {
+                                                assert_eq!(r.detail(), d);
+                                                assert_eq!(Detail::decode(d.encode()).unwrap(), d);
+                                                assert_eq!(p.not_minimized_confirmed,matches!(vis,Some(ConfirmedVisibility::NotMinimizedHere|ConfirmedVisibility::NotMinimizedElsewhere)));
+                                                assert_eq!(p.above_confirmed, above);
+                                                if above {
+                                                    assert_eq!(layer, LayerObservation::Above);
+                                                    assert!(p.not_minimized_confirmed);
+                                                }
+                                                if p.input_ready {
+                                                    assert_eq!(
+                                                        vis,
+                                                        Some(ConfirmedVisibility::NotMinimizedHere)
+                                                    );
+                                                    assert!(matches!(
+                                                        workspace,
+                                                        Workspace::Current | Workspace::AllDesktops
+                                                    ));
+                                                    assert!(!p.placement_deferred);
+                                                }
+                                                if p.placement_deferred {
+                                                    assert_eq!(vis,Some(ConfirmedVisibility::NotMinimizedElsewhere));
+                                                    assert_eq!(workspace, Workspace::Other);
+                                                    assert!(!p.input_ready);
+                                                }
+                                                match status {
+                                                    Status::Success => {
+                                                        assert_eq!(reason, Reason::None);
+                                                        assert!(above && p.not_minimized_confirmed);
+                                                        assert!(
+                                                            p.input_ready || p.placement_deferred
+                                                        );
+                                                    }
+                                                    Status::Partial => assert_eq!(history, 3),
+                                                    Status::Failed => assert_ne!(history, 3),
+                                                    Status::Busy => {
+                                                        assert_ne!(history, 3);
+                                                        assert!(!p.host_mutation_dispatched);
+                                                    }
+                                                    _ => unreachable!(),
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn historical_proof_not_current_state_or_aggregate_dispatch_is_the_only_partial_authority() {
+        let mut proof = proven_restoration();
+        for history in 0..4 {
+            for dispatched in [false, true] {
+                for current in [
+                    Visibility::Unknown,
+                    Visibility::Minimized,
+                    Visibility::NotMinimizedHere,
+                    Visibility::NotMinimizedElsewhere,
+                ] {
+                    proof.minimized_at_start = history & 1 != 0;
+                    proof.restoration_confirmed = history & 2 != 0;
+                    let vis = match current {
+                        Visibility::Minimized => Some(ConfirmedVisibility::Minimized),
+                        Visibility::NotMinimizedHere => Some(ConfirmedVisibility::NotMinimizedHere),
+                        Visibility::NotMinimizedElsewhere => {
+                            Some(ConfirmedVisibility::NotMinimizedElsewhere)
+                        }
+                        _ => None,
+                    };
+                    let not_minimized = matches!(
+                        current,
+                        Visibility::NotMinimizedHere | Visibility::NotMinimizedElsewhere
+                    );
+                    for above in [false, true]
+                        .into_iter()
+                        .filter(|above| !*above || not_minimized)
+                    {
+                        let d = Detail {
+                            visibility: current,
+                            workspace: if current == Visibility::NotMinimizedElsewhere {
+                                Workspace::Other
+                            } else {
+                                Workspace::Current
+                            },
+                            layer: if above {
+                                LayerObservation::Above
+                            } else {
+                                LayerObservation::Normal
+                            },
+                            progress: Progress {
+                                not_minimized_confirmed: not_minimized,
+                                above_confirmed: above,
+                                host_mutation_dispatched: dispatched,
+                                ..Progress::default()
+                            },
+                            ..preflight_detail(Reason::ConfirmationTimeout, Stage::Layer)
+                        };
+                        assert_eq!(
+                            OperationResult::bring_top(
+                                Status::Partial,
+                                d,
+                                Confirmation {
+                                    visibility: vis,
+                                    above
+                                },
+                                &proof
+                            )
+                            .is_ok(),
+                            history == 3
+                        );
+                        assert_eq!(
+                            OperationResult::new(
+                                Command::BringTop,
+                                Status::Partial,
+                                d,
+                                Confirmation {
+                                    visibility: vis,
+                                    above
+                                }
+                            ),
+                            Err(ResultError::InvalidPartial)
+                        );
+                        assert_eq!(d.encode() & 0xff00_0000, 0);
+                    }
+                }
+            }
+        }
+        assert_eq!(VERSION, 1);
+    }
+    #[test]
+    fn bring_top_failed_results_cannot_claim_unqualified_current_readiness_or_above() {
+        let mut d = preflight_detail(Reason::Unverifiable, Stage::Layer);
+        let proof = proven_restoration();
+        for status in [Status::Failed, Status::Partial] {
+            for bit in [0, 1, 2] {
+                d.progress = Progress::default();
+                d.layer = LayerObservation::Above;
+                let mut c = Confirmation::default();
+                match bit {
+                    0 => {
+                        d.progress.above_confirmed = true;
+                        c.above = true;
+                    }
+                    1 => d.progress.input_ready = true,
+                    _ => d.progress.placement_deferred = true,
+                }
+                assert_eq!(
+                    OperationResult::bring_top(status, d, c, &proof),
+                    Err(ResultError::InconsistentConfirmation),
+                    "status={status:?} bit={bit}"
+                );
+            }
+        }
     }
     #[test]
     fn terminal_and_cli_exit_mapping() {

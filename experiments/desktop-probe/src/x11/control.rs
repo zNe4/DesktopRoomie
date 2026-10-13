@@ -1380,7 +1380,13 @@ fn caller_with(
             if host.now() >= deadline {
                 return Ok(CallerOutcome::Unknown("caller deadline expired"));
             }
-            match host.next()? {
+            let event = host.next()?;
+            // A synchronous read may consume the remaining fixed budget. Its
+            // return does not renew the caller's permission to accept a reply.
+            if host.now() >= deadline {
+                return Ok(CallerOutcome::Unknown("caller deadline expired"));
+            }
+            match event {
                 Some(event) => {
                     if let Some(response) = correlated_reply(&event, atoms, owner, correlation) {
                         return Ok(CallerOutcome::Terminal(response));
@@ -2338,6 +2344,317 @@ mod transport_tests {
         }
     }
 
+    #[test]
+    fn g_shutdown_at_every_progression_snapshot_replies_once_and_cleans_pending_layer() {
+        for (name, op, mut layers) in crate::show_tests::g3_hardening::lifecycle_fixtures() {
+            for peer_failure in [0, 1, 2] {
+                let mut h = Fake::new();
+                if peer_failure == 1 {
+                    h.send_ok = false;
+                } else if peer_failure == 2 {
+                    h.failure = Some("send");
+                }
+                let mut endpoint = ControlWindow::candidate(0, CONTROL, 11, 50, 51, 52);
+                endpoint.transport = atoms();
+                endpoint.descriptor = owner();
+                endpoint.owns_selection = true;
+                endpoint.active = Some(op);
+                endpoint.closing_with(|| Ok(CONTROL), |_| Ok(())).unwrap();
+                let result = endpoint.finish_remote_with(&mut h);
+                assert_eq!(result.is_err(), peer_failure == 2, "{name}");
+                if peer_failure == 2 {
+                    assert_eq!(
+                        crate::finish_probe_with(Err("original G native error".into()), || result)
+                            .unwrap_err()
+                            .to_string(),
+                        "original G native error"
+                    );
+                }
+                endpoint.finish_remote_with(&mut h).unwrap();
+                assert!(endpoint.active.is_none());
+                assert_eq!(h.sent.len(), 1);
+                let response = TerminalResponse::decode(&h.sent[0].data.as_data32()).unwrap();
+                assert_eq!(
+                    response.status,
+                    if op.bring_top.restoration_confirmed {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    },
+                    "{name}"
+                );
+                assert_eq!(
+                    (response.detail.reason, response.detail.stage),
+                    (Reason::Closing, Stage::Shutdown)
+                );
+                assert_eq!(
+                    response.detail.progress,
+                    control::Progress {
+                        host_mutation_dispatched: op.detail.progress.host_mutation_dispatched,
+                        ..control::Progress::default()
+                    }
+                );
+                assert_eq!(response.request_id, op.request.request_id);
+                assert_eq!(h.sent[0].type_, atoms().reply);
+                assert_eq!(h.log.iter().filter(|s| **s == "send").count(), 1);
+            }
+            let pending = layers.pending().is_some();
+            assert_eq!(
+                crate::abort_layer(&mut layers, "shutdown").is_some(),
+                pending
+            );
+            assert!(crate::abort_layer(&mut layers, "shutdown again").is_none());
+            assert!(layers.pending().is_none());
+        }
+    }
+    #[test]
+    fn g_selection_or_endpoint_loss_across_phases_never_continues_under_replacement() {
+        use x11rb::protocol::xproto::SelectionClearEvent;
+        for (name, op, mut layers) in crate::show_tests::g3_hardening::lifecycle_fixtures() {
+            for destroyed_endpoint in [false, true] {
+                let mut endpoint = ControlWindow::candidate(0, CONTROL, 11, 50, 51, 52);
+                endpoint.transport = atoms();
+                endpoint.descriptor = owner();
+                endpoint.owns_selection = true;
+                endpoint.active = Some(op);
+                let event = if destroyed_endpoint {
+                    destroyed(false)
+                } else {
+                    Event::SelectionClear(SelectionClearEvent {
+                        owner: CONTROL,
+                        selection: 50,
+                        ..Default::default()
+                    })
+                };
+                assert!(
+                    endpoint
+                        .handle_event_with(&event, || Ok(CONTROL + 1))
+                        .unwrap(),
+                    "{name}"
+                );
+                assert!(!endpoint.owns_selection);
+                assert_eq!(
+                    endpoint
+                        .handle_event_with(&event, || panic!(
+                            "no reacquisition or second ownership query"
+                        ))
+                        .unwrap(),
+                    destroyed_endpoint
+                );
+                let mut h = Fake::new();
+                endpoint.finish_remote_with(&mut h).unwrap();
+                endpoint.finish_remote_with(&mut h).unwrap();
+                let reply = TerminalResponse::decode(&h.sent[0].data.as_data32()).unwrap();
+                assert_eq!(h.sent.len(), 1);
+                assert_eq!(
+                    (reply.detail.reason, reply.detail.stage),
+                    (Reason::OwnershipLost, Stage::Shutdown)
+                );
+                assert_eq!(
+                    reply.status,
+                    if op.bring_top.restoration_confirmed {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    }
+                );
+                assert!(!reply.detail.progress.not_minimized_confirmed);
+                assert!(!reply.detail.progress.above_confirmed);
+                endpoint
+                    .closing_with(
+                        || panic!("lost owner must not query/reclaim"),
+                        |_| panic!("must not publish to replacement"),
+                    )
+                    .unwrap();
+                let _ = crate::abort_layer(&mut layers, "lost owner");
+                assert!(layers.pending().is_none());
+            }
+        }
+    }
+    #[test]
+    fn g_caller_disappearance_and_reply_loss_do_not_undo_host_progress() {
+        for (_, op, _) in crate::show_tests::g3_hardening::lifecycle_fixtures()
+            .into_iter()
+            .filter(|(name, _, _)| *name == "layer-confirmed-before-reply")
+        {
+            let mut h = Fake::new();
+            h.send_ok = false;
+            let response = TerminalResponse {
+                status: if op.bring_top.layer_checked {
+                    Status::Success
+                } else {
+                    Status::Partial
+                },
+                request_id: op.request.request_id,
+                control_xid: CONTROL,
+                detail: op.detail,
+            };
+            let mut active = Some(op);
+            finish_active(&mut h, atoms(), &mut active, response).unwrap();
+            assert!(active.is_none());
+            assert_eq!(h.sent.len(), 1);
+            assert!(op.bring_top.restoration_confirmed);
+            assert!(op.bring_top.layer_dispatched);
+        }
+        let mut h = Fake::new();
+        h.evidence.push_back(None);
+        let mut active = None;
+        h.route(
+            &mut active,
+            Lifecycle::Ready,
+            false,
+            &request_event(atoms(), CONTROL, request(Command::BringTop)).unwrap(),
+        )
+        .unwrap();
+        assert!(active.is_none());
+        assert!(h.sent.is_empty());
+    }
+    #[test]
+    fn g_caller_death_reply_order_replacement_and_traffic_keep_five_second_budget() {
+        for events in [
+            vec![destroyed(false)],
+            vec![destroyed(false), terminal()],
+            vec![terminal(), destroyed(false)],
+        ] {
+            let expected_terminal = events.len() == 2;
+            let mut h = Fake::new();
+            h.events = events.into();
+            let outcome = caller_with(&mut h, ROOT, 0, Command::BringTop, || Ok(ID)).unwrap();
+            assert_eq!(
+                matches!(outcome, CallerOutcome::Terminal(_)),
+                expected_terminal
+            );
+            if !expected_terminal {
+                assert_eq!(outcome.exit_code(), ExitCode::OutcomeUnknown);
+            }
+            assert_eq!(h.sent.len(), 1);
+            assert!(h.waits.is_empty());
+        }
+        let mut h = Fake::new();
+        h.cost = Some(("next", Duration::from_millis(10)));
+        h.endless_events = true;
+        let t0 = h.now;
+        assert_eq!(
+            caller_with(&mut h, ROOT, 0, Command::BringTop, || Ok(ID))
+                .unwrap()
+                .exit_code(),
+            ExitCode::OutcomeUnknown
+        );
+        assert_eq!(h.now, t0 + Duration::from_millis(5000));
+        assert_eq!(h.sent.len(), 1);
+        assert!(h.waits.is_empty());
+        for replacement in [0, CONTROL + 1] {
+            let mut h = Fake::new();
+            h.owners = VecDeque::from([CONTROL, CONTROL, replacement]);
+            if replacement != 0 {
+                h.evidence = VecDeque::from([
+                    Some(evidence(&owner().encode().unwrap())),
+                    Some(evidence(
+                        &OwnerDescriptor {
+                            control_xid: replacement,
+                            ..owner()
+                        }
+                        .encode()
+                        .unwrap(),
+                    )),
+                ]);
+            }
+            assert!(!matches!(
+                caller_with(&mut h, ROOT, 0, Command::BringTop, || Ok(ID)).unwrap(),
+                CallerOutcome::Terminal(_)
+            ));
+            assert!(h.sent.is_empty());
+        }
+        let mut h = Fake::new();
+        h.send_ok = false;
+        assert_eq!(
+            caller_with(&mut h, ROOT, 0, Command::BringTop, || Ok(ID))
+                .unwrap()
+                .exit_code(),
+            ExitCode::OutcomeUnknown
+        );
+        assert_eq!(h.sent.len(), 1);
+    }
+    #[test]
+    fn g_stale_reply_ids_and_epoch_change_never_redirect_or_resend() {
+        let mut h = Fake::new();
+        let mut stale = response();
+        stale.request_id = ID + 1;
+        h.events.push_back(Event::ClientMessage(
+            reply_event(atoms(), REPLY_WINDOW, stale).unwrap(),
+        ));
+        h.events
+            .push_back(Event::ClientMessage(ClientMessageEvent::new(
+                32,
+                REPLY_WINDOW,
+                atoms().reply + 1,
+                [0; 5],
+            )));
+        h.events.push_back(terminal());
+        h.cost = Some(("next", Duration::from_millis(10)));
+        assert_eq!(
+            caller_with(&mut h, ROOT, 0, Command::BringTop, || Ok(ID)).unwrap(),
+            CallerOutcome::Terminal(response())
+        );
+        assert_eq!(h.sent.len(), 1);
+        assert_eq!(h.log.iter().filter(|s| **s == "next").count(), 3);
+        let mut h = Fake::new();
+        h.evidence = VecDeque::from([
+            Some(evidence(&owner().encode().unwrap())),
+            Some(evidence(
+                &OwnerDescriptor {
+                    epoch: 78,
+                    ..owner()
+                }
+                .encode()
+                .unwrap(),
+            )),
+        ]);
+        assert_eq!(
+            caller_with(&mut h, ROOT, 0, Command::BringTop, || Ok(ID)).unwrap(),
+            CallerOutcome::Protocol
+        );
+        assert!(h.sent.is_empty());
+        let mut h = Fake::new();
+        let mut active = None;
+        let mut req = request(Command::BringTop);
+        req.epoch += 1;
+        h.route(
+            &mut active,
+            Lifecycle::Ready,
+            false,
+            &request_event(atoms(), CONTROL, req).unwrap(),
+        )
+        .unwrap();
+        assert!(active.is_none());
+        assert!(h.sent.is_empty());
+    }
+    #[test]
+    fn caller_reply_returned_at_or_after_fixed_deadline_is_unknown_without_resend() {
+        for command in [Command::Hide, Command::Show, Command::BringTop] {
+            for delta in [-1_i64, 0, 1] {
+                let mut h = Fake::new();
+                let budget = caller_budget(command);
+                let cost = if delta < 0 {
+                    budget - Duration::from_nanos(1)
+                } else {
+                    budget + Duration::from_nanos(delta as u64)
+                };
+                h.cost = Some(("next", cost));
+                h.events.push_back(terminal());
+                let outcome = caller_with(&mut h, ROOT, 0, command, || Ok(ID)).unwrap();
+                assert_eq!(
+                    matches!(outcome, CallerOutcome::Terminal(_)),
+                    delta < 0,
+                    "command={command:?} delta={delta}"
+                );
+                if delta >= 0 {
+                    assert_eq!(outcome.exit_code(), ExitCode::OutcomeUnknown);
+                }
+                assert_eq!(h.sent.len(), 1);
+            }
+        }
+    }
     #[test]
     fn command_specific_caller_budget_starts_before_discovery_and_never_resends() {
         for (command, millis) in [

@@ -7814,6 +7814,12 @@ mod show_tests {
         layer_issue: Option<RemoteLayerIssue>,
         layer_support: LayerSupport,
         mutations: Vec<Mutation>,
+        changes: VecDeque<(&'static str, Reading)>,
+        step_failures: VecDeque<&'static str>,
+        layer_reads: VecDeque<Reading>,
+        support_reads: VecDeque<PropertyResult<LayerSupport>>,
+        supported: Evidence<Vec<u32>>,
+        fail_before_layer_dispatch: bool,
     }
     impl Fake {
         fn new(current: Reading) -> Self {
@@ -7842,10 +7848,23 @@ mod show_tests {
                     below: true,
                 },
                 mutations: vec![],
+                changes: VecDeque::new(),
+                step_failures: VecDeque::new(),
+                layer_reads: VecDeque::new(),
+                support_reads: VecDeque::new(),
+                supported: Evidence::Readable(vec![12, 13, 14, 15, 16, 17]),
+                fail_before_layer_dispatch: false,
             }
         }
         fn step(&mut self, name: &'static str) -> Result<(), HostError> {
             self.log.push(name);
+            if self.changes.front().is_some_and(|(step, _)| *step == name) {
+                self.current = self.changes.pop_front().unwrap().1;
+            }
+            if self.step_failures.front() == Some(&name) {
+                self.step_failures.pop_front();
+                return Err(format!("injected {name}").into());
+            }
             if let Some((step, duration)) = self.advance {
                 if name == step {
                     self.now += duration;
@@ -7918,7 +7937,7 @@ mod show_tests {
                     },
                     desktop: Evidence::Readable(r.desktop),
                     current_desktop: Evidence::Readable(r.current),
-                    supported: Evidence::Readable(vec![12, 13, 14, 15, 16, 17]),
+                    supported: self.supported.clone(),
                 }),
             })
         }
@@ -8119,16 +8138,23 @@ mod show_tests {
                     if let Some(issue) = h.layer_issue {
                         return Ok(Err(issue));
                     }
+                    if let Some(read) = h.layer_reads.pop_front() {
+                        h.current = read;
+                    }
                     let snapshot = h.observe()?;
                     Ok(fake_layer_atoms().qualify_remote(&snapshot, baseline))
                 },
                 || {
                     let mut h = host.borrow_mut();
                     h.step("layer_support")?;
-                    Ok(Ok(h.layer_support))
+                    let default = h.layer_support;
+                    Ok(h.support_reads.pop_front().unwrap_or(Ok(default)))
                 },
                 |mutation, dispatched| {
                     let mut h = host.borrow_mut();
+                    if h.fail_before_layer_dispatch {
+                        return Err("injected before layer dispatch".into());
+                    }
                     *dispatched = true;
                     h.mutations.push(mutation);
                     h.step(match mutation {
@@ -8190,6 +8216,914 @@ mod show_tests {
         control::Detail::decode(d.encode()).unwrap();
     }
 
+    pub(crate) mod g3_hardening {
+        use super::*;
+        use control::Stage;
+
+        fn fresh(min: bool, layer: L, desktop: u32) -> (Fake, ActiveOperation) {
+            let h = Fake::new(reading(
+                if min {
+                    Visibility::Minimized
+                } else if desktop == 7 {
+                    Visibility::NotMinimizedElsewhere
+                } else {
+                    Visibility::NotMinimizedHere
+                },
+                layer,
+                desktop,
+                2,
+            ));
+            let op = h.command_operation(Command::BringTop);
+            (h, op)
+        }
+        fn restored(h: &mut Fake, op: &mut ActiveOperation) {
+            assert!(service_remote_with(op, h).unwrap().is_none());
+            let r = h.current;
+            h.current = reading(
+                if r.desktop == 7 {
+                    Visibility::NotMinimizedElsewhere
+                } else {
+                    Visibility::NotMinimizedHere
+                },
+                r.layer,
+                r.desktop,
+                r.current,
+            );
+            mark_remote_observation(op, false);
+        }
+        fn assert_terminal(
+            r: control::OperationResult,
+            status: Status,
+            reason: Reason,
+            stage: Stage,
+        ) {
+            assert_eq!(
+                (r.status(), r.detail().reason, r.detail().stage),
+                (status, reason, stage)
+            );
+            let d = r.detail();
+            assert_eq!(
+                d.progress.not_minimized_confirmed,
+                matches!(
+                    d.visibility,
+                    Visibility::NotMinimizedHere | Visibility::NotMinimizedElsewhere
+                )
+            );
+            if d.progress.above_confirmed {
+                assert_eq!(d.layer, L::Above);
+                assert!(d.progress.not_minimized_confirmed);
+            }
+            if d.progress.input_ready {
+                assert_eq!(d.visibility, Visibility::NotMinimizedHere);
+                assert!(!d.progress.placement_deferred);
+            }
+            if d.progress.placement_deferred {
+                assert_eq!(d.visibility, Visibility::NotMinimizedElsewhere);
+                assert!(!d.progress.input_ready);
+            }
+            assert_eq!(control::Detail::decode(d.encode()).unwrap(), d);
+            assert_eq!(d.encode() & 0xff00_0000, 0);
+        }
+        fn assert_before_layer(h: &Fake) {
+            assert!(h.mutations.is_empty());
+            assert_eq!(h.count("layer_read"), 0);
+        }
+
+        #[test]
+        fn owner_deadline_edges_allow_only_final_confirmation_without_new_layer_work() {
+            for delta in [-1_i64, 0, 1] {
+                for above in [false, true] {
+                    let (mut h, mut op) = fresh(false, L::Normal, 2);
+                    observe_visibility(&mut op, &mut h).unwrap();
+                    op.stage = Stage::Layer;
+                    op.detail.stage = Stage::Layer;
+                    h.now += Duration::from_millis(3000);
+                    op.bring_top.layer_admitted = Some(h.now);
+                    h.layer_mode = 1;
+                    assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                    assert_eq!(h.layer_deadline(), Some(op.deadline));
+                    h.now = if delta < 0 {
+                        op.deadline - Duration::from_nanos(1)
+                    } else {
+                        op.deadline + Duration::from_nanos(delta as u64)
+                    };
+                    h.current.layer = if above { L::Above } else { L::Normal };
+                    let result = service_remote_with(&mut op, &mut h).unwrap();
+                    if above {
+                        assert_eq!(result.unwrap().status(), Status::Success);
+                    } else if delta < 0 {
+                        assert!(result.is_none());
+                    } else {
+                        assert_terminal(
+                            result.unwrap(),
+                            Status::Failed,
+                            Reason::ConfirmationTimeout,
+                            Stage::Layer,
+                        );
+                    }
+                    assert_eq!(h.mutations, [Mutation::AddAbove]);
+                }
+            }
+        }
+        #[test]
+        fn incoherent_final_state_times_out_without_stale_bits_or_erasing_restoration_history() {
+            let (mut h, mut op) = fresh(true, L::Normal, 7);
+            restored(&mut h, &mut op);
+            h.layer_mode = 1;
+            assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+            let deadline = h.layer_deadline().unwrap();
+            h.current.evidence.coherent = false;
+            h.current.layer = L::Unknown;
+            for _ in 0..20 {
+                h.now += Duration::from_millis(20);
+                assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                assert_eq!(h.layer_deadline(), Some(deadline));
+            }
+            h.now = deadline;
+            let r = service_remote_with(&mut op, &mut h).unwrap().unwrap();
+            assert_terminal(
+                r,
+                Status::Partial,
+                Reason::ConfirmationTimeout,
+                Stage::Layer,
+            );
+            assert_eq!(
+                r.detail().progress,
+                control::Progress {
+                    host_mutation_dispatched: true,
+                    ..control::Progress::default()
+                }
+            );
+            assert!(op.bring_top.restoration_confirmed);
+            assert_eq!(h.mutations, [Mutation::AddAbove]);
+        }
+        #[test]
+        fn selecting_popup_during_g_visibility_cleans_before_busy_and_stale_release_is_inert() {
+            let (mut h, op) = fresh(false, L::Normal, 2);
+            h.runtime
+                .acquire_menu_with(MenuPopup::test_popup(10, 1), Point::new(0, 0), || {
+                    Ok((GrabStatus::SUCCESS, 100))
+                })
+                .unwrap();
+            let log = RefCell::new(vec![]);
+            h.runtime
+                .complete_menu_with(
+                    &mut h.window,
+                    MenuOutcome::SetLayer(Layer::Below),
+                    |p| {
+                        log.borrow_mut().push("release");
+                        p.release_with(|| Ok(())).map(|_| ())
+                    },
+                    |_| {
+                        log.borrow_mut().push("destroy");
+                        Ok(())
+                    },
+                    |_, target| {
+                        log.borrow_mut().push("busy");
+                        local_layer_after_menu_with(
+                            op.request.command == Command::BringTop,
+                            target,
+                            || panic!("no local layer work during remote visibility"),
+                        )
+                    },
+                )
+                .unwrap();
+            assert_eq!(*log.borrow(), ["release", "destroy", "busy"]);
+            assert!(h.runtime.menu.is_none());
+            assert!(!h.runtime.pointer.is_grabbed());
+            assert!(h.runtime.layers.pending().is_none());
+            assert_eq!(
+                h.runtime
+                    .interaction
+                    .menu_release(1, crate::geometry::MenuHit::Row(2), 101, 0),
+                HostAction::None
+            );
+            let (mut h, mut op) = fresh(true, L::Normal, 2);
+            h.runtime = visibility_fence_tests::runtime(4);
+            restored(&mut h, &mut op);
+            assert_eq!(
+                h.runtime
+                    .interaction
+                    .menu_release(1, crate::geometry::MenuHit::Row(4), 101, 0),
+                HostAction::None
+            );
+            assert!(h.runtime.menu.is_none());
+            assert!(h.mutations.is_empty());
+        }
+        #[test]
+        fn timeout_final_reread_can_confirm_already_achieved_above_without_resend() {
+            let (mut h, mut op) = fresh(true, L::Normal, 2);
+            restored(&mut h, &mut op);
+            h.layer_mode = 1;
+            assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+            h.now = h.layer_deadline().unwrap();
+            h.changes = VecDeque::from([
+                (
+                    "observe",
+                    reading(Visibility::NotMinimizedHere, L::Normal, 2, 2),
+                ),
+                (
+                    "observe",
+                    reading(Visibility::NotMinimizedHere, L::Above, 2, 2),
+                ),
+            ]);
+            let r = service_remote_with(&mut op, &mut h).unwrap().unwrap();
+            assert_terminal(r, Status::Success, Reason::None, Stage::Layer);
+            assert_eq!(h.mutations, [Mutation::AddAbove]);
+            assert!(r.detail().progress.above_confirmed);
+        }
+        #[test]
+        fn user_time_only_and_checked_layer_effect_with_current_above_do_not_invent_partial() {
+            let (mut h, mut op) = fresh(true, L::Normal, 2);
+            h.advance = Some(("user_time_zero", op.bring_top.visibility_cutoff - h.now));
+            let r = service_remote_with(&mut op, &mut h).unwrap().unwrap();
+            assert_terminal(r, Status::Failed, Reason::ConfirmationTimeout, Stage::Show);
+            assert!(r.detail().progress.host_mutation_dispatched);
+            assert_eq!(h.count("map"), 0);
+            assert!(!op.bring_top.restoration_confirmed);
+            assert_before_layer(&h);
+            let (mut h, mut op) = fresh(false, L::Normal, 2);
+            h.fail = Some("add_above");
+            h.changes.push_back((
+                "add_above",
+                reading(Visibility::NotMinimizedHere, L::Above, 2, 2),
+            ));
+            assert!(service_remote_with(&mut op, &mut h).is_err());
+            let r = finish_bring_top_with(&mut op, &mut h, Reason::X11Failure, false).unwrap();
+            assert_terminal(r, Status::Failed, Reason::X11Failure, Stage::Layer);
+            assert!(r.detail().progress.above_confirmed);
+            assert!(!op.bring_top.minimized_at_start);
+            assert!(!op.bring_top.restoration_confirmed);
+            assert_eq!(h.mutations, [Mutation::AddAbove]);
+        }
+        #[test]
+        fn shutdown_cleanup_of_later_layer_phase_pointer_owners_keeps_original_failure() {
+            for gesture in [1, 2, 3, 4] {
+                let (mut h, mut op) = fresh(false, L::Normal, 2);
+                h.layer_mode = 1;
+                assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                let layers = std::mem::take(&mut h.runtime.layers);
+                h.runtime = visibility_fence_tests::runtime(gesture);
+                h.runtime.layers = layers;
+                let release = std::cell::Cell::new(0);
+                let popup = std::cell::Cell::new(0);
+                let result = finish_probe_with(Err("original G shutdown cause".into()), || {
+                    assert!(abort_layer(&mut h.runtime.layers, "shutdown").is_some());
+                    assert!(abort_layer(&mut h.runtime.layers, "shutdown repeated").is_none());
+                    h.runtime.cancel_menu_with(
+                        &mut h.window,
+                        |p| {
+                            release.set(release.get() + 1);
+                            p.release_with(|| Ok(())).map(|_| ())
+                        },
+                        |_| {
+                            popup.set(popup.get() + 1);
+                            Ok(())
+                        },
+                    )
+                });
+                assert_eq!(result.unwrap_err().to_string(), "original G shutdown cause");
+                assert!(!h.runtime.pointer.is_grabbed());
+                assert!(h.runtime.menu.is_none());
+                assert!(h.runtime.pending_move.is_none());
+                assert!(h.runtime.layers.pending().is_none());
+                assert_eq!(release.get(), 1);
+                assert_eq!(popup.get(), usize::from(gesture >= 3));
+                assert_eq!(h.mutations, [Mutation::AddAbove]);
+            }
+        }
+        /// Real production progression snapshots shared with transport lifecycle
+        /// tests. No copied Show/Layer state machine or fabricated proof flags.
+        pub(crate) fn lifecycle_fixtures() -> Vec<(&'static str, ActiveOperation, LayerController)>
+        {
+            let mut fixtures = vec![];
+            for name in [
+                "before-baseline",
+                "after-fence",
+                "restore-attempt",
+                "restore-request",
+                "after-proof",
+                "geometry",
+                "input-restored-before-layer",
+                "before-layer-send",
+                "after-remove",
+                "after-add",
+                "checked-layer-uncertainty",
+                "layer-confirmed-before-reply",
+                "transitional-final-read",
+            ] {
+                let layer = if name == "after-remove" {
+                    L::Below
+                } else if name == "transitional-final-read" {
+                    L::Above
+                } else {
+                    L::Normal
+                };
+                let (mut h, mut op) = fresh(true, layer, 2);
+                match name {
+                    "before-baseline" => {}
+                    "after-fence" => {
+                        let mut transient = h.current;
+                        transient.evidence.coherent = false;
+                        transient.layer = L::Unknown;
+                        h.reads = VecDeque::from([h.current, transient]);
+                        assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                        assert_eq!(op.show.phase, ShowPhase::Fenced);
+                    }
+                    "restore-attempt" => {
+                        h.fail = Some("map");
+                        assert!(service_remote_with(&mut op, &mut h).is_err());
+                    }
+                    "restore-request" => {
+                        assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                    }
+                    _ => {
+                        restored(&mut h, &mut op);
+                        match name {
+                            "after-proof" => {
+                                h.fail = Some("geometry");
+                                assert!(service_remote_with(&mut op, &mut h).is_err());
+                            }
+                            "geometry" => {
+                                h.bounds = ValidOriginBounds::new(200, 500, 200, 500);
+                                assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                            }
+                            "input-restored-before-layer" => {
+                                assert!(matches!(
+                                    service_visibility_stage_with(&mut op, &mut h).unwrap(),
+                                    Some(VisibilityCompletion::Ready(_))
+                                ));
+                            }
+                            "before-layer-send" => {
+                                h.layer_issue = Some(RemoteLayerIssue::Waiting);
+                                assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                            }
+                            "after-remove" | "after-add" => {
+                                h.layer_mode = 1;
+                                assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                            }
+                            "checked-layer-uncertainty" => {
+                                h.fail = Some("add_above");
+                                assert!(service_remote_with(&mut op, &mut h).is_err());
+                                assert!(op.bring_top.layer_dispatched);
+                                assert!(!op.bring_top.layer_checked);
+                            }
+                            "layer-confirmed-before-reply" => {
+                                assert_eq!(
+                                    service_remote_with(&mut op, &mut h)
+                                        .unwrap()
+                                        .unwrap()
+                                        .status(),
+                                    Status::Success
+                                );
+                            }
+                            "transitional-final-read" => {
+                                let above = h.current;
+                                let mut transient = above;
+                                transient.evidence.coherent = false;
+                                transient.layer = L::Unknown;
+                                h.reads =
+                                    VecDeque::from([above, above, above, above, above, transient]);
+                                assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                                assert!(op.bring_top.layer_finished);
+                            }
+                            _ => unreachable!(),
+                        }
+                        assert!(
+                            op.bring_top.minimized_at_start && op.bring_top.restoration_confirmed
+                        );
+                    }
+                }
+                fixtures.push((name, op, h.runtime.layers));
+            }
+            fixtures
+        }
+        #[test]
+        fn destroyed_and_withdrawn_at_each_visibility_boundary_keep_exact_history() {
+            for unavailable in [Visibility::Destroyed, Visibility::Withdrawn] {
+                for point in 0..4 {
+                    let (mut h, mut op) = fresh(true, L::Normal, 2);
+                    let lost = reading(unavailable, L::Unknown, 2, 2);
+                    match point {
+                        0 => h.current = lost,
+                        1 => h.reads = VecDeque::from([h.current, lost]),
+                        2 => {
+                            assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                            h.current = lost;
+                        }
+                        _ => {
+                            restored(&mut h, &mut op);
+                            h.changes.push_back(("geometry", lost));
+                        }
+                    }
+                    let r = service_remote_with(&mut op, &mut h).unwrap().unwrap();
+                    assert_terminal(
+                        r,
+                        if point == 3 {
+                            Status::Partial
+                        } else {
+                            Status::Failed
+                        },
+                        if unavailable == Visibility::Destroyed {
+                            Reason::BodyDestroyed
+                        } else {
+                            Reason::Withdrawn
+                        },
+                        if point == 3 {
+                            Stage::Geometry
+                        } else {
+                            Stage::Show
+                        },
+                    );
+                    assert_eq!(op.bring_top.restoration_confirmed, point == 3);
+                    assert!(!r.detail().progress.not_minimized_confirmed);
+                    assert!(!r.detail().progress.above_confirmed);
+                    assert!(!r.detail().progress.input_ready);
+                    assert_eq!(h.count("map"), usize::from(point >= 2));
+                    assert_before_layer(&h);
+                }
+            }
+        }
+        #[test]
+        fn visibility_bad_capability_properties_and_incoherence_are_bounded_without_effects() {
+            for kind in 0..5 {
+                let (mut h, mut op) = fresh(true, L::Normal, 2);
+                match kind {
+                    0 => h.current.evidence.capability = Capability::Unsupported,
+                    1 => h.current.evidence.hidden = Evidence::Malformed,
+                    2 => h.current.evidence.hidden = Evidence::Missing,
+                    3 => h.current.evidence.coherent = false,
+                    _ => h.current.evidence.wm_state = WmState::Malformed,
+                }
+                h.current.layer = L::Unknown;
+                let early = service_remote_with(&mut op, &mut h).unwrap();
+                if kind == 0 {
+                    assert_terminal(
+                        early.unwrap(),
+                        Status::Failed,
+                        Reason::Unsupported,
+                        Stage::Show,
+                    );
+                } else {
+                    assert!(early.is_none());
+                    for _ in 0..3 {
+                        mark_remote_observation(&mut op, false);
+                        assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                    }
+                    h.now = op.bring_top.visibility_cutoff;
+                    assert_terminal(
+                        service_remote_with(&mut op, &mut h).unwrap().unwrap(),
+                        Status::Failed,
+                        Reason::ConfirmationTimeout,
+                        Stage::Show,
+                    );
+                }
+                assert!(!op.bring_top.restoration_confirmed);
+                assert_eq!(h.count("fence"), 0);
+                assert_eq!(h.count("map"), 0);
+                assert_before_layer(&h);
+            }
+        }
+        #[test]
+        fn workspace_drift_before_mutation_after_dispatch_and_after_proof_is_not_repaired() {
+            for body_changes in [false, true] {
+                for point in 0..3 {
+                    let (mut h, mut op) = fresh(true, L::Normal, 2);
+                    let changed = reading(
+                        if point == 0 {
+                            Visibility::Minimized
+                        } else {
+                            Visibility::NotMinimizedElsewhere
+                        },
+                        L::Normal,
+                        if body_changes { 7 } else { 2 },
+                        if body_changes { 2 } else { 7 },
+                    );
+                    match point {
+                        0 => h.reads = VecDeque::from([h.current, changed]),
+                        1 => {
+                            assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                            h.current = changed;
+                        }
+                        _ => {
+                            restored(&mut h, &mut op);
+                            h.bounds = ValidOriginBounds::new(200, 500, 200, 500);
+                            assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                            h.current = changed;
+                        }
+                    }
+                    let r = service_remote_with(&mut op, &mut h).unwrap().unwrap();
+                    assert_terminal(
+                        r,
+                        if point == 2 {
+                            Status::Partial
+                        } else {
+                            Status::Failed
+                        },
+                        Reason::LayoutChanged,
+                        if point == 2 {
+                            Stage::Geometry
+                        } else {
+                            Stage::Show
+                        },
+                    );
+                    assert_eq!(op.bring_top.restoration_confirmed, point == 2);
+                    assert_eq!(h.count("map"), usize::from(point > 0));
+                    assert_eq!(h.count("correct"), usize::from(point == 2));
+                    assert_before_layer(&h);
+                }
+            }
+        }
+        #[test]
+        fn geometry_layout_interruption_and_checked_correction_failure_never_start_layer() {
+            for failure in ["layout", "geometry", "correct"] {
+                let (mut h, mut op) = fresh(true, L::Normal, 2);
+                restored(&mut h, &mut op);
+                h.bounds = ValidOriginBounds::new(200, 500, 200, 500);
+                if failure == "layout" {
+                    assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                    mark_remote_observation(&mut op, true);
+                    assert_terminal(
+                        service_remote_with(&mut op, &mut h).unwrap().unwrap(),
+                        Status::Partial,
+                        Reason::LayoutChanged,
+                        Stage::Geometry,
+                    );
+                } else {
+                    h.fail = Some(failure);
+                    let err = service_remote_with(&mut op, &mut h).unwrap_err();
+                    assert_eq!(err.to_string(), format!("injected {failure}"));
+                    let r =
+                        finish_bring_top_with(&mut op, &mut h, Reason::X11Failure, false).unwrap();
+                    assert_terminal(r, Status::Partial, Reason::X11Failure, Stage::Geometry);
+                }
+                assert!(op.bring_top.restoration_confirmed);
+                assert_eq!(h.count("map"), 1);
+                assert_before_layer(&h);
+            }
+        }
+        #[test]
+        fn g_fence_failure_and_enable_refence_failure_keep_primary_error_and_capture_debt() {
+            for failure in ["empty", "release", "popup"] {
+                let (mut h, mut op) = fresh(true, L::Normal, 2);
+                h.runtime = visibility_fence_tests::runtime(4);
+                h.fail = Some(failure);
+                let err = service_remote_with(&mut op, &mut h).unwrap_err();
+                assert_eq!(err.to_string(), format!("injected {failure}"));
+                let reason = if failure == "release" {
+                    Reason::ReleaseFailed
+                } else {
+                    Reason::X11Failure
+                };
+                let r = finish_bring_top_with(&mut op, &mut h, reason, false).unwrap();
+                assert_terminal(r, Status::Failed, reason, Stage::Show);
+                assert!(!op.bring_top.restoration_confirmed);
+                assert_eq!(h.count("release"), 1);
+                assert_eq!(h.count("popup"), 1);
+                assert_eq!(h.count("map"), 0);
+                assert_before_layer(&h);
+                assert_eq!(h.runtime.pointer.is_grabbed(), failure == "release");
+            }
+            let (mut h, mut op) = fresh(true, L::Normal, 2);
+            restored(&mut h, &mut op);
+            h.step_failures = VecDeque::from(["enable", "fence"]);
+            let err = service_remote_with(&mut op, &mut h).unwrap_err();
+            assert_eq!(err.to_string(), "injected enable");
+            assert_eq!(h.count("fence"), 2);
+            assert_eq!(h.count("enable"), 1);
+            let r = finish_bring_top_with(&mut op, &mut h, Reason::X11Failure, false).unwrap();
+            assert_terminal(r, Status::Partial, Reason::X11Failure, Stage::Geometry);
+            assert!(!r.detail().progress.input_ready);
+            assert_before_layer(&h);
+        }
+        #[test]
+        fn layer_loss_or_conflict_before_first_send_and_after_dispatch_is_truthful() {
+            for min in [false, true] {
+                for desktop in [2, 7] {
+                    for kind in 0..6 {
+                        for after_send in [false, true] {
+                            let (mut h, mut op) = fresh(min, L::Normal, desktop);
+                            if min {
+                                restored(&mut h, &mut op);
+                            }
+                            if after_send {
+                                h.layer_mode = 1;
+                                assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                            }
+                            let mut bad = reading(
+                                if desktop == 7 {
+                                    Visibility::NotMinimizedElsewhere
+                                } else {
+                                    Visibility::NotMinimizedHere
+                                },
+                                L::Normal,
+                                desktop,
+                                2,
+                            );
+                            let reason = match kind {
+                                0 => {
+                                    bad = reading(Visibility::Destroyed, L::Unknown, desktop, 2);
+                                    Reason::BodyDestroyed
+                                }
+                                1 => {
+                                    bad = reading(Visibility::Withdrawn, L::Unknown, desktop, 2);
+                                    Reason::Withdrawn
+                                }
+                                2 => {
+                                    bad.desktop = 8;
+                                    bad.evidence.workspace = Workspace::Other;
+                                    Reason::LayoutChanged
+                                }
+                                3 => {
+                                    bad.current = 8;
+                                    bad.evidence.workspace = Workspace::Other;
+                                    Reason::LayoutChanged
+                                }
+                                4 => {
+                                    bad.layer = L::Conflict;
+                                    Reason::Unverifiable
+                                }
+                                _ => {
+                                    bad.evidence.hidden = Evidence::Malformed;
+                                    bad.layer = L::Unknown;
+                                    Reason::Unverifiable
+                                }
+                            };
+                            if after_send {
+                                h.current = bad;
+                            } else {
+                                h.layer_reads.push_back(bad);
+                            }
+                            let r = service_remote_with(&mut op, &mut h).unwrap().unwrap();
+                            assert_terminal(
+                                r,
+                                if min { Status::Partial } else { Status::Failed },
+                                reason,
+                                Stage::Layer,
+                            );
+                            assert_eq!(h.mutations.len(), usize::from(after_send));
+                            assert!(!r.detail().progress.above_confirmed);
+                            assert!(h.runtime.layers.pending().is_none());
+                        }
+                    }
+                }
+            }
+        }
+        #[test]
+        fn support_refusal_or_malformed_support_before_removal_and_before_addition() {
+            let good = LayerSupport {
+                state: true,
+                above: true,
+                below: true,
+            };
+            for min in [false, true] {
+                for after_remove in [false, true] {
+                    for malformed in [false, true] {
+                        let (mut h, mut op) = fresh(min, L::Below, 2);
+                        if min {
+                            restored(&mut h, &mut op);
+                        }
+                        if after_remove {
+                            h.support_reads.push_back(Ok(good));
+                        }
+                        h.support_reads.push_back(if malformed {
+                            Err("malformed _NET_SUPPORTED")
+                        } else {
+                            Ok(LayerSupport {
+                                above: false,
+                                ..good
+                            })
+                        });
+                        let r = service_remote_with(&mut op, &mut h).unwrap().unwrap();
+                        assert_terminal(
+                            r,
+                            if min { Status::Partial } else { Status::Failed },
+                            if malformed {
+                                Reason::Unverifiable
+                            } else {
+                                Reason::Unsupported
+                            },
+                            Stage::Layer,
+                        );
+                        assert_eq!(h.count("remove_below"), usize::from(after_remove));
+                        assert_eq!(h.count("add_above"), 0);
+                        assert_eq!(
+                            r.detail().layer,
+                            if after_remove { L::Normal } else { L::Below }
+                        );
+                        assert!(!r.detail().progress.above_confirmed);
+                    }
+                }
+            }
+        }
+        #[test]
+        fn remote_property_support_loss_and_native_errors_preserve_dispatch_marks() {
+            for min in [false, true] {
+                for before_marker in [false, true] {
+                    let (mut h, mut op) = fresh(min, L::Normal, 2);
+                    if min {
+                        restored(&mut h, &mut op);
+                    }
+                    h.fail_before_layer_dispatch = before_marker;
+                    if !before_marker {
+                        h.fail = Some("add_above");
+                    }
+                    let err = service_remote_with(&mut op, &mut h).unwrap_err();
+                    assert!(err.to_string().contains(if before_marker {
+                        "before layer dispatch"
+                    } else {
+                        "add_above"
+                    }));
+                    assert!(op.bring_top.layer_attempted);
+                    assert_eq!(op.bring_top.layer_dispatched, !before_marker);
+                    assert!(!op.bring_top.layer_checked);
+                    let r =
+                        finish_bring_top_with(&mut op, &mut h, Reason::X11Failure, false).unwrap();
+                    assert_terminal(
+                        r,
+                        if min { Status::Partial } else { Status::Failed },
+                        Reason::X11Failure,
+                        Stage::Layer,
+                    );
+                    assert_eq!(h.mutations.len(), usize::from(!before_marker));
+                    assert!(h.runtime.layers.pending().is_none());
+                }
+                for support in [
+                    Evidence::Malformed,
+                    Evidence::Missing,
+                    Evidence::Readable(vec![12, 13, 14, 15]),
+                ] {
+                    let (mut h, mut op) = fresh(min, L::Normal, 7);
+                    if min {
+                        restored(&mut h, &mut op);
+                    }
+                    h.layer_mode = 1;
+                    assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                    h.supported = support.clone();
+                    h.current.layer = L::Unknown;
+                    let r = service_remote_with(&mut op, &mut h).unwrap().unwrap();
+                    assert_terminal(
+                        r,
+                        if min { Status::Partial } else { Status::Failed },
+                        if matches!(support, Evidence::Readable(_)) {
+                            Reason::Unsupported
+                        } else {
+                            Reason::Unverifiable
+                        },
+                        Stage::Layer,
+                    );
+                    assert_eq!(h.mutations, [Mutation::AddAbove]);
+                    assert!(!r.detail().progress.above_confirmed);
+                    for name in ["map", "user_time_zero", "geometry", "correct", "enable"] {
+                        assert_eq!(h.count(name), 0);
+                    }
+                }
+            }
+        }
+        #[test]
+        fn exact_visibility_geometry_and_layer_edges_never_renew_budgets() {
+            for delta in [-1_i64, 0, 1] {
+                let (mut h, mut op) = fresh(true, L::Normal, 2);
+                let cutoff = op.bring_top.visibility_cutoff;
+                h.now = if delta < 0 {
+                    cutoff - Duration::from_nanos(1)
+                } else {
+                    cutoff + Duration::from_nanos(delta as u64)
+                };
+                let r = service_remote_with(&mut op, &mut h).unwrap();
+                assert_eq!(h.count("map"), usize::from(delta < 0));
+                assert_eq!(r.is_none(), delta < 0);
+                assert_before_layer(&h);
+                let (mut h, mut op) = fresh(true, L::Normal, 2);
+                restored(&mut h, &mut op);
+                h.bounds = ValidOriginBounds::new(200, 500, 200, 500);
+                let boundary = op.bring_top.visibility_cutoff - CONFIRMATION_TIMEOUT;
+                h.now = if delta < 0 {
+                    boundary - Duration::from_nanos(1)
+                } else {
+                    boundary + Duration::from_nanos(delta as u64)
+                };
+                let r = service_remote_with(&mut op, &mut h).unwrap();
+                assert_eq!(h.count("correct"), usize::from(delta <= 0));
+                assert_eq!(r.is_none(), delta <= 0);
+                assert_before_layer(&h);
+                for final_above in [false, true] {
+                    let (mut h, mut op) = fresh(false, L::Below, 2);
+                    h.layer_mode = 1;
+                    assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                    let deadline = h.layer_deadline().unwrap();
+                    h.now = if delta < 0 {
+                        deadline - Duration::from_nanos(1)
+                    } else {
+                        deadline + Duration::from_nanos(delta as u64)
+                    };
+                    h.current.layer = if final_above { L::Above } else { L::Normal };
+                    let r = service_remote_with(&mut op, &mut h).unwrap();
+                    assert_eq!(h.count("add_above"), usize::from(!final_above && delta < 0));
+                    if final_above {
+                        assert_eq!(r.unwrap().status(), Status::Success);
+                    } else if delta >= 0 {
+                        assert_eq!(r.unwrap().status(), Status::Failed);
+                    } else {
+                        assert!(r.is_none());
+                    }
+                    assert_eq!(
+                        op.deadline - op.bring_top.visibility_cutoff,
+                        Duration::from_millis(1000)
+                    );
+                }
+            }
+        }
+        #[test]
+        fn all_desktops_all_layers_visible_and_minimized_preserve_sentinel() {
+            for min in [false, true] {
+                for layer in [L::Normal, L::Below, L::Above] {
+                    let (mut h, mut op) = fresh(min, layer, u32::MAX);
+                    if min {
+                        restored(&mut h, &mut op);
+                    }
+                    let r = service_remote_with(&mut op, &mut h).unwrap().unwrap();
+                    assert_success(r, true, min || layer != L::Above);
+                    assert_eq!(r.detail().workspace, Workspace::AllDesktops);
+                    assert_eq!(h.current.desktop, u32::MAX);
+                    assert_eq!(op.show.baseline.unwrap().desktop, u32::MAX);
+                    assert_eq!(h.count("map"), usize::from(min));
+                    assert_eq!(h.count("remove_hidden"), 0);
+                }
+            }
+        }
+        #[test]
+        fn g_right_opening_preservation_and_restoration_fence_invalidate_stale_input() {
+            let (mut h, mut op) = fresh(false, L::Normal, 2);
+            h.runtime = visibility_fence_tests::runtime(2);
+            assert_eq!(
+                service_remote_with(&mut op, &mut h)
+                    .unwrap()
+                    .unwrap()
+                    .status(),
+                Status::Success
+            );
+            assert!(h.runtime.pointer.is_grabbed());
+            assert!(matches!(
+                h.runtime.interaction.state(),
+                InteractionState::RightPressed { .. }
+            ));
+            assert_eq!(h.count("fence"), 0);
+            for gesture in 1..=4 {
+                let (mut h, mut op) = fresh(true, L::Normal, 2);
+                h.runtime = visibility_fence_tests::runtime(gesture);
+                h.runtime.pending_move = Some(Point::new(200, 200));
+                h.window.in_flight_moves.push_back(Point::new(200, 200));
+                let generation = h.runtime.menu_generation;
+                restored(&mut h, &mut op);
+                assert!(h.runtime.visibility_dispatch_eligible());
+                assert_eq!(h.runtime.menu_generation, generation + 1);
+                assert!(!h.runtime.pointer.is_grabbed());
+                assert!(h.runtime.menu.is_none());
+                assert_eq!(
+                    service_remote_with(&mut op, &mut h)
+                        .unwrap()
+                        .unwrap()
+                        .status(),
+                    Status::Success
+                );
+                assert_eq!(h.count("fence"), 1);
+                let release = Event::ButtonRelease(x11rb::protocol::xproto::ButtonPressEvent {
+                    event: h.window.window,
+                    detail: 1,
+                    ..Default::default()
+                });
+                assert!(h
+                    .runtime
+                    .input_fence
+                    .rejects(&release, h.window.window, 70000));
+                assert!(!h.runtime.interaction.has_left_gesture());
+                assert!(h.runtime.pending_move.is_none());
+                let reads = h.count("observe");
+                restore_deferred_input(&mut h).unwrap();
+                assert_eq!(h.count("observe"), reads);
+            }
+        }
+        #[test]
+        fn completed_elsewhere_g_defers_input_and_never_resurrects_on_local_return() {
+            let (mut h, mut op) = fresh(true, L::Below, 7);
+            restored(&mut h, &mut op);
+            let r = service_remote_with(&mut op, &mut h).unwrap().unwrap();
+            assert_success(r, false, true);
+            assert!(h.runtime.input_fence.blocked);
+            assert_eq!(h.count("geometry"), 0);
+            assert_eq!(h.count("enable"), 0);
+            let mutations = h.mutations.clone();
+            h.current = reading(Visibility::NotMinimizedHere, L::Above, 7, 7);
+            restore_deferred_input(&mut h).unwrap();
+            assert!(h.runtime.accepts_input());
+            assert_eq!(h.count("enable"), 1);
+            assert_eq!(h.mutations, mutations);
+            restore_deferred_input(&mut h).unwrap();
+            assert_eq!(h.count("enable"), 1);
+            assert_eq!(h.count("remove_hidden"), 1);
+        }
+    }
     mod bring_top {
         use super::*;
         use control::{ExitCode, Stage};
@@ -9111,6 +10045,166 @@ mod show_tests {
             s
         }
 
+        #[test]
+        fn g_more_than_64_events_before_visibility_or_layer_evidence_finish_without_wait() {
+            for layer_phase in [false, true] {
+                let mut s = Loop::new();
+                if layer_phase {
+                    s.host.current = visible();
+                    s.host.layer_mode = 1;
+                }
+                s.route(request(Command::BringTop, 99)).unwrap();
+                s.event_cost = Duration::from_millis(1);
+                let mut q = VecDeque::from(vec![Queued::Ordinary("traffic"); 130]);
+                q.push_back(Queued::Observed(reading(
+                    Visibility::NotMinimizedHere,
+                    if layer_phase { L::Above } else { L::Normal },
+                    2,
+                    2,
+                )));
+                while s.owner.active.is_some() {
+                    s.iteration(&mut q).unwrap();
+                }
+                assert_eq!(
+                    s.owner.replies,
+                    [(Command::BringTop, Status::Success, Reason::None, s.host.now)]
+                );
+                assert_eq!(s.host.count("traffic"), 130);
+                assert_eq!(s.host.count("map"), usize::from(!layer_phase));
+                assert_eq!(s.host.count("add_above"), 1);
+                assert_eq!(s.waits, [None]);
+            }
+        }
+        #[test]
+        fn sustained_g_traffic_cannot_starve_visibility_layer_or_total_deadlines() {
+            for phase in 0..3 {
+                let mut s = Loop::new();
+                let t0 = s.host.now;
+                if phase > 0 {
+                    s.host.current = visible();
+                    s.host.layer_mode = 1;
+                }
+                if phase == 2 {
+                    // Adversarial late Layer admission exercises the total cap
+                    // through the production adapter, with no controller renewal.
+                    let mut op = s.host.command_operation(Command::BringTop);
+                    observe_visibility(&mut op, &mut s.host).unwrap();
+                    s.host.now = t0 + Duration::from_millis(3000);
+                    op.stage = control::Stage::Layer;
+                    op.detail.stage = control::Stage::Layer;
+                    op.bring_top.layer_admitted = Some(s.host.now);
+                    op.bring_top.layer_observe = true;
+                    s.owner.active = Some(op);
+                    s.owner.service(&mut s.host).unwrap();
+                } else {
+                    s.route(request(Command::BringTop, 99)).unwrap();
+                }
+                let expected = if phase == 0 {
+                    2500
+                } else if phase == 1 {
+                    1000
+                } else {
+                    3500
+                };
+                s.event_cost = Duration::from_millis(if phase == 2 { 1 } else { 10 });
+                let mut q = VecDeque::from(vec![Queued::Ordinary("traffic"); 1000]);
+                while s.owner.active.is_some() {
+                    s.iteration(&mut q).unwrap();
+                }
+                assert_eq!(
+                    s.owner.replies,
+                    [(
+                        Command::BringTop,
+                        Status::Failed,
+                        Reason::ConfirmationTimeout,
+                        t0 + Duration::from_millis(expected)
+                    )]
+                );
+                assert!(!q.is_empty());
+                assert!(s.waits.is_empty());
+                assert_eq!(s.host.count("map"), usize::from(phase == 0));
+                assert_eq!(s.host.count("add_above"), usize::from(phase > 0));
+            }
+        }
+        #[test]
+        fn g_wait_uses_earliest_movement_pointer_or_remote_deadline_without_idle_reads() {
+            let mut s = Loop::new();
+            s.host.current = visible();
+            s.host.layer_mode = 1;
+            let t0 = s.host.now;
+            s.route(request(Command::BringTop, 99)).unwrap();
+            let reads = s.host.count("observe");
+            s.host.runtime.confirmation_deadline = Some(t0 + Duration::from_millis(150));
+            s.host.runtime.safety.deadline = Some(t0 + Duration::from_millis(250));
+            s.iteration(&mut VecDeque::new()).unwrap();
+            assert_eq!(s.waits.last(), Some(&Some(t0 + Duration::from_millis(150))));
+            s.host.runtime.confirmation_deadline = None;
+            s.iteration(&mut VecDeque::new()).unwrap();
+            assert_eq!(s.waits.last(), Some(&Some(t0 + Duration::from_millis(250))));
+            s.host.runtime.safety.deadline = None;
+            s.iteration(&mut VecDeque::new()).unwrap();
+            assert_eq!(s.waits.last(), Some(&s.host.layer_deadline()));
+            assert_eq!(s.host.count("observe"), reads);
+            assert_eq!(s.host.count("add_above"), 1);
+        }
+        #[test]
+        fn checked_restore_with_buffered_visibility_event_is_serviced_before_wait() {
+            let mut s = Loop::new();
+            let visible = visible();
+            s.host.changes.push_back(("map", visible));
+            s.route(request(Command::BringTop, 99)).unwrap();
+            assert_eq!(s.host.count("map"), 1);
+            assert!(s.owner.replies.is_empty());
+            // The checked request buffered its notification; drain the real
+            // bounded-batch seam rather than inventing another wake event.
+            s.iteration(&mut VecDeque::from([Queued::Observed(visible)]))
+                .unwrap();
+            assert_eq!(s.owner.replies[0].1, Status::Success);
+            assert_eq!(s.host.count("map"), 1);
+            assert_eq!(s.waits, [None]);
+        }
+        #[test]
+        fn all_remote_pairings_progress_original_only_and_keep_duplicate_deadlines() {
+            for first in [Command::Hide, Command::Show, Command::BringTop] {
+                for second in [Command::Hide, Command::Show, Command::BringTop] {
+                    let mut s = Loop::new();
+                    if first == Command::Hide {
+                        s.host.current = visible();
+                    }
+                    s.route(request(first, 99)).unwrap();
+                    let original = s.owner.active.unwrap();
+                    let maps = s.host.count("map");
+                    let hides = s.host.count("iconify");
+                    let mutations = s.host.mutations.clone();
+                    s.host.now += Duration::from_millis(20);
+                    s.route(request(first, 99)).unwrap();
+                    s.route(request(second, 100)).unwrap();
+                    assert_eq!(s.owner.active, Some(original));
+                    assert_eq!(s.host.count("map"), maps);
+                    assert_eq!(s.host.count("iconify"), hides);
+                    assert_eq!(s.host.mutations, mutations);
+                    assert_eq!(s.owner.replies.len(), 1);
+                    assert_eq!(s.owner.replies[0].1, Status::Busy);
+                    s.host.current = reading(
+                        if first == Command::Hide {
+                            Visibility::Minimized
+                        } else {
+                            Visibility::NotMinimizedHere
+                        },
+                        L::Normal,
+                        2,
+                        2,
+                    );
+                    mark_remote_observation(s.owner.active.as_mut().unwrap(), false);
+                    s.owner.service(&mut s.host).unwrap();
+                    s.owner.service(&mut s.host).unwrap();
+                    assert_eq!(s.owner.replies.len(), 2);
+                    assert_eq!(s.owner.replies[1].0, first);
+                    assert_eq!(s.owner.replies[1].1, Status::Success);
+                    assert!(s.owner.active.is_none());
+                }
+            }
+        }
         #[test]
         fn bring_top_lookahead_begins_before_outer_continue() {
             let mut s = Loop::new();
