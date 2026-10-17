@@ -1789,6 +1789,180 @@ mod tests {
         assert_eq!(host.log, ["timestamp", "grab", "owner", "ungrab"]);
     }
 
+    mod cooperative_contenders {
+        use super::*;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct SelectionServer {
+            owner: u32,
+            grabbed_by: Option<u32>,
+            timestamp: u32,
+            samples: Vec<(u32, u32)>,
+            claims: Vec<(u32, u32)>,
+            trace: Vec<(u32, &'static str)>,
+        }
+
+        struct Contender {
+            server: Rc<RefCell<SelectionServer>>,
+            control: u32,
+            now: Instant,
+            before_grab: Option<Box<dyn FnOnce()>>,
+        }
+
+        impl Contender {
+            fn new(server: &Rc<RefCell<SelectionServer>>, control: u32, now: Instant) -> Self {
+                Self {
+                    server: Rc::clone(server),
+                    control,
+                    now,
+                    before_grab: None,
+                }
+            }
+        }
+
+        impl AcquisitionHost for Contender {
+            fn now(&self) -> Instant {
+                self.now
+            }
+
+            fn timestamp(&mut self, deadline: Instant) -> Result<NonZeroU32> {
+                assert!(self.now < deadline);
+                let mut server = self.server.borrow_mut();
+                assert_eq!(server.grabbed_by, None);
+                server.timestamp += 1;
+                let timestamp = server.timestamp;
+                server.samples.push((self.control, timestamp));
+                server.trace.push((self.control, "timestamp"));
+                Ok(NonZeroU32::new(timestamp).unwrap())
+            }
+
+            fn grab(&mut self) -> Result<()> {
+                // Schedule the other real acquisition only after this contender
+                // sampled its timestamp, without holding a simulated server grab.
+                if let Some(other) = self.before_grab.take() {
+                    other();
+                }
+                let mut server = self.server.borrow_mut();
+                assert_eq!(server.grabbed_by, None);
+                server.grabbed_by = Some(self.control);
+                server.trace.push((self.control, "grab"));
+                Ok(())
+            }
+
+            fn owner(&mut self) -> Result<u32> {
+                let mut server = self.server.borrow_mut();
+                assert_eq!(server.grabbed_by, Some(self.control));
+                server.trace.push((self.control, "owner"));
+                Ok(server.owner)
+            }
+
+            fn claim(&mut self, timestamp: NonZeroU32) -> Result<()> {
+                let mut server = self.server.borrow_mut();
+                assert_eq!(server.grabbed_by, Some(self.control));
+                assert!(server.samples.contains(&(self.control, timestamp.get())));
+                server.claims.push((self.control, timestamp.get()));
+                // Like SetSelectionOwner, this permits replacement. Cooperation
+                // must come from guarded_claim's lookup, not a fake-host refusal.
+                server.owner = self.control;
+                server.trace.push((self.control, "claim"));
+                Ok(())
+            }
+
+            fn ungrab(&mut self) -> Result<()> {
+                let mut server = self.server.borrow_mut();
+                assert_eq!(server.grabbed_by, Some(self.control));
+                server.grabbed_by = None;
+                server.trace.push((self.control, "ungrab"));
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn two_cooperative_contenders_keep_first_owner_and_release_both_grabs() {
+            for (a, b) in [(10, 20), (20, 10)] {
+                let server = Rc::new(RefCell::new(SelectionServer::default()));
+                let now = Instant::now();
+                let mut first = Contender::new(&server, a, now);
+                let mut second = Contender::new(&server, b, now);
+                let results = [
+                    acquire_with(&mut first, a).unwrap(),
+                    acquire_with(&mut second, b).unwrap(),
+                ];
+                assert_eq!(
+                    results,
+                    [
+                        (Acquisition::Owned, Some(1)),
+                        (Acquisition::Duplicate, None)
+                    ]
+                );
+                let server = server.borrow();
+                assert_eq!(server.owner, a);
+                assert_eq!(server.grabbed_by, None);
+                assert_eq!(server.samples, [(a, 1), (b, 2)]);
+                assert_eq!(server.claims, [(a, 1)]);
+                assert_eq!(
+                    server.trace,
+                    [
+                        (a, "timestamp"),
+                        (a, "grab"),
+                        (a, "owner"),
+                        (a, "claim"),
+                        (a, "owner"),
+                        (a, "ungrab"),
+                        (b, "timestamp"),
+                        (b, "grab"),
+                        (b, "owner"),
+                        (b, "ungrab"),
+                    ]
+                );
+            }
+        }
+
+        #[test]
+        fn two_cooperative_contenders_recheck_owner_after_earlier_timestamp_sample() {
+            for (a, b) in [(10, 20), (20, 10)] {
+                let server = Rc::new(RefCell::new(SelectionServer::default()));
+                let now = Instant::now();
+                let mut prepared_first = Contender::new(&server, a, now);
+                let winner = Rc::new(Cell::new(None));
+                let winner_result = Rc::clone(&winner);
+                let shared_server = Rc::clone(&server);
+                prepared_first.before_grab = Some(Box::new(move || {
+                    assert_eq!(shared_server.borrow().samples, [(a, 1)]);
+                    let mut other = Contender::new(&shared_server, b, now);
+                    winner_result.set(Some(acquire_with(&mut other, b).unwrap()));
+                }));
+                assert_eq!(
+                    acquire_with(&mut prepared_first, a).unwrap(),
+                    (Acquisition::Duplicate, None)
+                );
+                assert_eq!(winner.get(), Some((Acquisition::Owned, Some(2))));
+                let server = server.borrow();
+                assert_eq!(server.owner, b);
+                assert_eq!(server.grabbed_by, None);
+                assert_eq!(server.samples, [(a, 1), (b, 2)]);
+                assert_eq!(server.claims, [(b, 2)]);
+                assert_eq!(
+                    server.trace,
+                    [
+                        (a, "timestamp"),
+                        (b, "timestamp"),
+                        (b, "grab"),
+                        (b, "owner"),
+                        (b, "claim"),
+                        (b, "owner"),
+                        (b, "ungrab"),
+                        (a, "grab"),
+                        (a, "owner"),
+                        (a, "ungrab"),
+                    ]
+                );
+            }
+        }
+    }
+
     #[test]
     fn stale_claim_releases_then_samples_fresh_timestamp_before_second_grab() {
         let mut host = FakeHost::new(&[0, 0, 0, 10]);
@@ -2687,6 +2861,192 @@ mod transport_tests {
             assert!(h.sent.is_empty());
         }
     }
+
+    #[test]
+    fn caller_timeout_does_not_cancel_admitted_show_or_make_vanished_reply_fatal() {
+        struct CoupledShow {
+            transport: Fake,
+            active: Option<ActiveOperation>,
+            show: crate::show_tests::CallerTimeoutShow,
+            reply_exists: bool,
+            admitted_at: Option<Instant>,
+            completed: Option<(Instant, control::OperationResult)>,
+        }
+
+        impl CoupledShow {
+            fn service_owner(&mut self) -> Result<()> {
+                let Some(operation) = self.active.as_mut() else {
+                    return Ok(());
+                };
+                let original_deadline = operation.deadline;
+                let result = self.show.service_at(operation, self.transport.now)?;
+                assert_eq!(operation.deadline, original_deadline);
+                if let Some(result) = result {
+                    self.show.assert_completed(result);
+                    assert!(self.transport.now < original_deadline);
+                    let response = TerminalResponse {
+                        status: result.status(),
+                        detail: result.detail(),
+                        request_id: operation.request.request_id,
+                        control_xid: CONTROL,
+                    };
+                    self.completed = Some((self.transport.now, result));
+                    let mut active = self.active.take();
+                    let sent = finish_active(self, atoms(), &mut active, response);
+                    assert!(active.is_none());
+                    sent?;
+                }
+                Ok(())
+            }
+        }
+
+        impl PeerHost for CoupledShow {
+            fn now(&self) -> Instant {
+                self.transport.now
+            }
+            fn owner(&mut self) -> Result<u32> {
+                self.transport.owner()
+            }
+            fn evidence(&mut self, window: u32, property: u32) -> Result<Option<EndpointEvidence>> {
+                if window == REPLY_WINDOW && !self.reply_exists {
+                    return Ok(None);
+                }
+                self.transport.evidence(window, property)
+            }
+            fn send(&mut self, event: ClientMessageEvent) -> Result<bool> {
+                self.transport.send(event)?;
+                if event.type_ == atoms().request {
+                    assert!(self.active.is_none(), "one request, no resend/cancellation");
+                    assert!(self.reply_exists);
+                    assert_eq!(self.transport.marker, Some(marker(Command::Show)));
+                    self.transport
+                        .route(&mut self.active, Lifecycle::Ready, false, &event)?;
+                    assert_eq!(self.active.unwrap().request, request(Command::Show));
+                    assert!(self.admitted_at.replace(self.transport.now).is_none());
+                    self.service_owner()?;
+                    assert!(
+                        self.completed.is_none(),
+                        "Map acknowledgement is not completion"
+                    );
+                    return Ok(true);
+                }
+                assert_eq!((event.type_, event.window), (atoms().reply, REPLY_WINDOW));
+                assert!(!self.reply_exists);
+                let (_, result) = self.completed.expect("host completion precedes reply loss");
+                assert_eq!(result.status(), Status::Success);
+                // Exercise the production typed peer-error boundary, not a
+                // generic send failure or a manually fabricated success result.
+                Ok(peer_result::<()>(
+                    Err(ReplyError::X11Error(x11rb::x11_utils::X11Error {
+                        error_kind: ErrorKind::Window,
+                        error_code: 3,
+                        sequence: 1,
+                        bad_value: REPLY_WINDOW,
+                        minor_opcode: 0,
+                        major_opcode: 25,
+                        extension_name: None,
+                        request_name: None,
+                    })),
+                    REPLY_WINDOW,
+                )?
+                .is_some())
+            }
+        }
+
+        impl CallerHost for CoupledShow {
+            fn atoms(&mut self, screen_num: u32) -> Result<(u32, TransportAtoms)> {
+                self.transport.atoms(screen_num)
+            }
+            fn watch(&mut self, owner: u32) -> Result<bool> {
+                self.transport.watch(owner)
+            }
+            fn create_reply(&mut self, marker: CallerMarker) -> Result<u32> {
+                let reply = self.transport.create_reply(marker)?;
+                self.reply_exists = true;
+                Ok(reply)
+            }
+            fn next(&mut self) -> Result<Option<Event>> {
+                self.transport.next()
+            }
+            fn wait(&mut self, deadline: Instant) -> Result<()> {
+                self.show.assert_pending();
+                self.transport.wait(deadline)?;
+                self.service_owner()?;
+                assert!(self.active.is_some());
+                Ok(())
+            }
+            fn cleanup(&mut self) -> Result<()> {
+                self.transport.cleanup()?;
+                self.reply_exists = false;
+                Ok(())
+            }
+        }
+
+        let mut transport = Fake::new();
+        let t0 = transport.now;
+        transport.cost = Some(("atoms", Duration::from_millis(3000)));
+        let mut coupled = CoupledShow {
+            transport,
+            active: None,
+            show: crate::show_tests::CallerTimeoutShow::new(t0),
+            reply_exists: false,
+            admitted_at: None,
+            completed: None,
+        };
+        let outcome = caller_with(&mut coupled, ROOT, 0, Command::Show, || Ok(ID)).unwrap();
+        assert_eq!(outcome, CallerOutcome::Unknown("caller deadline expired"));
+        assert_eq!(outcome.exit_code(), ExitCode::OutcomeUnknown);
+        assert_eq!(outcome.exit_code() as u32, 8);
+        let caller_deadline = t0 + Duration::from_millis(4000);
+        assert_eq!(coupled.transport.waits, [caller_deadline]);
+        assert_eq!(coupled.transport.now, caller_deadline);
+        assert!(!coupled.reply_exists);
+        assert_eq!(coupled.admitted_at, Some(t0 + Duration::from_millis(3000)));
+        let pending = coupled
+            .active
+            .expect("caller timeout must not cancel admitted work");
+        let owner_deadline = t0 + Duration::from_millis(5500);
+        assert_eq!(pending.deadline, owner_deadline);
+        assert!(caller_deadline < owner_deadline);
+        assert_eq!(pending.show.phase, control::ShowPhase::RestoreRequested);
+        assert!(coupled.completed.is_none());
+        assert_eq!(coupled.transport.sent.len(), 1);
+        coupled.show.assert_pending();
+
+        coupled.transport.now = t0 + Duration::from_millis(4200);
+        coupled.service_owner().unwrap();
+        assert_eq!(coupled.active, Some(pending));
+        coupled.show.assert_pending();
+        coupled.transport.now = t0 + Duration::from_millis(4500);
+        coupled
+            .show
+            .observe_restored(coupled.active.as_mut().unwrap());
+        coupled.service_owner().unwrap(); // expected reply BadWindow is nonfatal
+        assert!(coupled.active.is_none());
+        let (completed_at, result) = coupled.completed.unwrap();
+        assert_eq!(completed_at, t0 + Duration::from_millis(4500));
+        assert!(caller_deadline < completed_at && completed_at < owner_deadline);
+        coupled.show.assert_completed(result);
+        assert_eq!(coupled.transport.sent.len(), 2); // one request and one terminal attempt
+        assert_eq!(
+            Request::decode(&coupled.transport.sent[0].data.as_data32()).unwrap(),
+            pending.request
+        );
+        let terminal =
+            TerminalResponse::decode(&coupled.transport.sent[1].data.as_data32()).unwrap();
+        assert_eq!(terminal.status, Status::Success);
+        assert_eq!(terminal.detail, result.detail());
+        assert_eq!((terminal.control_xid, terminal.request_id), (CONTROL, ID));
+
+        let completed_trace = coupled.show.trace().to_vec();
+        coupled.transport.now = owner_deadline + Duration::from_millis(100);
+        coupled.service_owner().unwrap();
+        assert!(coupled.active.is_none());
+        assert_eq!(coupled.show.trace(), completed_trace);
+        assert_eq!(coupled.transport.sent.len(), 2);
+        assert_eq!(outcome.exit_code(), ExitCode::OutcomeUnknown);
+    }
+
     #[test]
     fn bring_top_duplicates_busy_and_single_terminal_use_production_transport() {
         let mut h = Fake::new();

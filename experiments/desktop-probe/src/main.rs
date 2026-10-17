@@ -8216,6 +8216,70 @@ mod show_tests {
         control::Detail::decode(d.encode()).unwrap();
     }
 
+    /// Reuse the existing visibility fake and production owner progression in
+    /// the transport's coupled caller-timeout test, without exposing its internals.
+    pub(crate) struct CallerTimeoutShow {
+        host: Fake,
+    }
+
+    impl CallerTimeoutShow {
+        pub(crate) fn new(now: Instant) -> Self {
+            let mut host = minimized();
+            host.now = now;
+            Self { host }
+        }
+
+        pub(crate) fn service_at(
+            &mut self,
+            operation: &mut ActiveOperation,
+            now: Instant,
+        ) -> Result<Option<control::OperationResult>, HostError> {
+            self.host.now = now;
+            if !remote_service_due(operation, now) {
+                return Ok(None);
+            }
+            service_remote_with(operation, &mut self.host)
+        }
+
+        pub(crate) fn observe_restored(&mut self, operation: &mut ActiveOperation) {
+            // Model a WM notification and subsequent fresh readable state, not
+            // a terminal result. Production Show still verifies placement/input.
+            self.host.current = visible();
+            mark_remote_observation(operation, false);
+        }
+
+        pub(crate) fn assert_pending(&self) {
+            assert_eq!(
+                control::classify(self.host.current.evidence).visibility,
+                Visibility::Minimized
+            );
+            assert_eq!(self.host.count("map"), 1);
+            assert_eq!(self.host.count("user_time_zero"), 1);
+            assert_eq!(self.host.count("enable"), 0);
+            assert!(self.host.runtime.input_fence.blocked);
+            assert!(!self.host.runtime.accepts_input());
+        }
+
+        pub(crate) fn assert_completed(&self, result: control::OperationResult) {
+            assert_success(result, true, true);
+            assert_eq!(
+                control::classify(self.host.current.evidence).visibility,
+                Visibility::NotMinimizedHere
+            );
+            assert_eq!(self.host.count("map"), 1);
+            assert_eq!(self.host.count("user_time_zero"), 1);
+            assert_eq!(self.host.count("fence"), 1);
+            assert_eq!(self.host.count("enable"), 1);
+            assert!(self.host.runtime.accepts_input());
+            assert!(!self.host.runtime.pointer.is_grabbed());
+            assert!(self.host.runtime.menu.is_none());
+        }
+
+        pub(crate) fn trace(&self) -> &[&'static str] {
+            &self.host.log
+        }
+    }
+
     pub(crate) mod g3_hardening {
         use super::*;
         use control::Stage;
