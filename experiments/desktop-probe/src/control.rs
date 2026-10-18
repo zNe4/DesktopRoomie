@@ -943,10 +943,10 @@ impl OperationResult {
                 {
                     return Err(ResultError::InconsistentStatus);
                 }
-                if status == Status::Partial && !meaningful {
+                if status == Status::Partial && (complete || !meaningful) {
                     return Err(ResultError::InvalidPartial);
                 }
-                if status == Status::Failed && meaningful {
+                if status == Status::Failed && (complete || meaningful) {
                     return Err(ResultError::InconsistentStatus);
                 }
             }
@@ -3375,6 +3375,106 @@ mod placement_tests {
         assert!(result(Command::BringHere, Status::Success, d, c, p).is_err());
     }
     #[test]
+    fn complete_already_local_here_without_history_accepts_success_and_rejects_failed() {
+        let (d, c, mut p) = complete(Command::BringHere);
+        p.baseline.as_mut().unwrap().desktop = p.destination_desktop;
+        assert_eq!(p.proof.history, RecoveryHistory::default());
+        assert!(result(Command::BringHere, Status::Success, d, c, p).is_ok());
+        let failed = Detail {
+            reason: Reason::ConfirmationTimeout,
+            ..d
+        };
+        assert_eq!(
+            result(Command::BringHere, Status::Failed, failed, c, p),
+            Err(ResultError::InconsistentStatus)
+        );
+    }
+
+    #[test]
+    fn complete_recover_with_relocation_history_accepts_success_and_rejects_partial() {
+        let (mut d, c, mut p) = complete(Command::Recover);
+        p.baseline.as_mut().unwrap().minimized = false;
+        p.proof.history.relocation_confirmed = true;
+        d.placement = p.proof;
+        assert!(result(Command::Recover, Status::Success, d, c, p).is_ok());
+        let partial = Detail {
+            reason: Reason::ConfirmationTimeout,
+            ..d
+        };
+        assert_eq!(
+            result(Command::Recover, Status::Partial, partial, c, p),
+            Err(ResultError::InvalidPartial)
+        );
+    }
+
+    #[test]
+    fn complete_recover_with_restoration_history_accepts_success_and_rejects_partial() {
+        let (mut d, c, mut p) = complete(Command::Recover);
+        p.baseline.as_mut().unwrap().desktop = p.destination_desktop;
+        p.proof.history.restoration_confirmed = true;
+        d.placement = p.proof;
+        assert!(result(Command::Recover, Status::Success, d, c, p).is_ok());
+        let partial = Detail {
+            reason: Reason::ConfirmationTimeout,
+            ..d
+        };
+        assert_eq!(
+            result(Command::Recover, Status::Partial, partial, c, p),
+            Err(ResultError::InvalidPartial)
+        );
+    }
+
+    #[test]
+    fn incomplete_recover_with_relocation_history_accepts_partial_and_rejects_failed() {
+        let mut p = progress();
+        p.baseline.as_mut().unwrap().minimized = false;
+        p.proof.history.relocation_confirmed = true;
+        let d = Detail {
+            placement: p.proof,
+            ..preflight_detail(Reason::Unverifiable, Stage::Layer)
+        };
+        let c = Confirmation::default();
+        assert!(result(Command::Recover, Status::Partial, d, c, p).is_ok());
+        assert_eq!(
+            result(Command::Recover, Status::Failed, d, c, p),
+            Err(ResultError::InconsistentStatus)
+        );
+    }
+
+    #[test]
+    fn incomplete_recover_with_restoration_history_still_accepts_partial() {
+        let mut p = progress();
+        p.baseline.as_mut().unwrap().desktop = p.destination_desktop;
+        p.proof.history.restoration_confirmed = true;
+        let d = Detail {
+            placement: p.proof,
+            ..preflight_detail(Reason::Unverifiable, Stage::Layer)
+        };
+        assert!(result(
+            Command::Recover,
+            Status::Partial,
+            d,
+            Confirmation::default(),
+            p
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn incomplete_here_without_history_accepts_failed_and_rejects_partial() {
+        let mut p = progress();
+        p.baseline.as_mut().unwrap().desktop = p.destination_desktop;
+        p.baseline.as_mut().unwrap().minimized = false;
+        let d = preflight_detail(Reason::Unverifiable, Stage::Placement);
+        let c = Confirmation::default();
+        assert!(result(Command::BringHere, Status::Failed, d, c, p).is_ok());
+        assert_eq!(
+            result(Command::BringHere, Status::Partial, d, c, p),
+            Err(ResultError::InvalidPartial)
+        );
+    }
+
+    #[test]
     fn placement_proof_cross_product_keeps_current_readiness_and_historical_partial_independent() {
         for command in [Command::BringHere, Command::Recover] {
             for minimized in [false, true] {
@@ -3480,8 +3580,8 @@ mod placement_tests {
                             let expected = consistent
                                 && match status {
                                     Status::Success => complete,
-                                    Status::Partial => meaningful,
-                                    Status::Failed => !meaningful,
+                                    Status::Partial => !complete && meaningful,
+                                    Status::Failed => !complete && !meaningful,
                                     _ => unreachable!(),
                                 };
                             assert_eq!(
