@@ -1,6 +1,6 @@
 # Openbox host integration — user-managed setup
 
-**Status (recorded 2026-10-13):** stages A–G are accepted. Latest owner-tested executable `80d7df4aa1524122bd7c232f5aa09a4e39c8dd9f` supports Bring Top on the body's existing workspace; matching [CI 38468930784](https://github.com/zNe4/DesktopRoomie/actions/runs/38468930784) passed 447 tests, 0 failed. [Stage-G native acceptance](#stage-g-acceptance-recorded-2026-10-13) follows earlier [Stage-F acceptance](#stage-f-acceptance-recorded-2026-10-13); the original failed Stage-F candidate and manual experiments remain preserved as history. H is **unblocked for separately authorized planning but not started**; no final M03.2 acceptance exists. [STATUS](../STATUS.md) records the checkpoint. This guide authorizes neither executable work nor host-config edits.
+**Status (updated 2026-10-18):** A–G accepted at historical executable SHAs. Frozen H `a46e432c1f97b03c576737b1fc0ac35d7f90c158` passed [CI 39098551853](https://github.com/zNe4/DesktopRoomie/actions/runs/39098551853) (453 tests) and H-N1/N2/N3 owner native gates with qualifications. [Integrated M03.2 acceptance](../../experiments/desktop-probe/ACCEPTANCE-M03.2.md) records H23 conditional/unexercised, H14 unobserved and H28 optional/unexercised; **H-A final sign-off pending**. This guide preserves historical F/G observations and authorizes no host-config changes.
 
 DesktopRoomie should own safe same-instance control, WM-state verification, input cleanup and keyboard-focus isolation. Openbox should be reused for *optional* user conveniences such as keyboard shortcuts, application menus and session autostart. The application must be recoverable from its CLI without optional Openbox bindings; no global key-grabbing daemon, tray framework or automatic dotfile rewriting is required.
 
@@ -181,7 +181,22 @@ The owner's off-workspace CLI said: `not minimized + Above confirmed on another 
 
 **Boundary/next gate:** accepted Bring Top establishes not-minimized plus freshly confirmed effective **Above on the body's existing workspace**. It does not Bring Here, switch the user's desktop, focus/activate, guarantee caller-workspace visibility, or override fullscreen. Other WMs and Wayland remain unverified. **H is unblocked for separately authorized planning, not yet started or accepted.** Full integrated `ACCEPTANCE-M03.2.md` remains reserved for H; M03.3 Bring Here/Recover remains future. No executable or user Openbox-configuration edits are authorized by this documentation update.
 
+## Stage-H integrated Openbox host evidence (2026-10-18)
+
+**H candidate:** `a46e432c1f97b03c576737b1fc0ac35d7f90c158`, compiled SHA-256 `fdd7863561502773106e36842169cf900a3769dedd2aaa9eede366653e32da2c` in owner preflight, matching [CI 39098551853](https://github.com/zNe4/DesktopRoomie/actions/runs/39098551853) (453 passing tests). Owner host: Openbox 3.6.1/X11 `:0`/Picom v13, eDP-2 + DP-1-0 1920×1080 each, published workarea `10,48,3820,1022`.
+
+- **H-N1 13 gates PASS:** H01–H09, H12, H18–H19, H24. Physical typing/input/occlusion, managed Hide/Show layer preservation, 20 cycles, safe gesture/menu interruptions, real Iconic/no-HIDDEN off-workspace Show and clean SIGKILL relaunch.
+- **H21 PASS:** 25 s duration shutdown yielded 17 successes, one truthful exit-8 unknown, 22 no-owner responses; separate manual Quit under 80 Show invocations yielded 56 successes then 24 no-owner results. Both owner exit 0, zero bodies afterward; user input normal.
+- **H23 conditional/not exercised:** Polybar 3.7.2 IPC hide/show succeeded as commands but `_NET_WORKAREA` remained `10,48,3820,1022` before, while hidden, and after. Polybar dock reports top strut 38; Plank unaffected. No root-property fabrication or config changes.
+- **H26 PASS:** 19 samples over 90 seconds with zero accumulated CPU tick delta at `CLK_TCK=100` in each separate process, visible 8→8 ticks; minimized 2→2. This is below 10-ms counter resolution, not physically zero cycles. Input worked after Show.
+- **H27 scoped PASS:** Plank icon persists when minimized; Polybar topbar has no task list. Original managed UTILITY body, layer, desktop and geometry survived Hide/Show. Pager behavior not separately recorded.
+- **H14 N/A/unobserved** alternate off-workspace Normal/non-viewable representation; **H28 optional/unexercised** user Openbox shortcut binding.
+- Earlier owner G3 H10/H11/H13/H16/H17/H20/H22/H25 and F H15 remain attributed to `80d7df4…` / `ccd0191…`, **not** new H-SHA native tests.
+
+See [H01–H28 matrix](../../experiments/desktop-probe/ACCEPTANCE-M03.2.md#h01h28-integration-matrix) and [M03.2 source design](../../experiments/desktop-probe/M03.2-IMPLEMENTATION.md). H-D documentation does not itself grant final H-A owner acceptance.
+
 ## Configuration levels
+
 
 | Level | Current guidance |
 | --- | --- |
@@ -241,7 +256,7 @@ After deliberately editing the active `rc.xml`, `openbox --reconfigure` requests
 | `--bring-here` | Move the **same instance** to the current workspace, preserving its layer; hidden-state handling to be designed | M03.3 |
 | `--recover` | Explicitly compose Bring Here and Bring Top, with truthful partial-failure reporting | M03.3 |
 
-M03.2 command spellings and transport are implemented; Hide and local/off-workspace Show were accepted at `ccd0191…`, and original-workspace Bring Top now has owner Openbox acceptance at `80d7df4…`. H remains unstarted, M03.2 is not finally accepted, and M03.3 remains future work. Optional bindings stay user-managed; only accepted operations should be recommended as working shortcuts.
+M03.2 command spellings and transport are implemented; Hide and local/off-workspace Show were accepted at `ccd0191…`, and original-workspace Bring Top now has owner Openbox acceptance at `80d7df4…`. H native verification is complete but H-A final owner acceptance is pending, and M03.3 remains future work. Optional bindings stay user-managed; only accepted operations should be recommended as working shortcuts.
 
 ## Official reference material
 
@@ -250,4 +265,4 @@ M03.2 command spellings and transport are implemented; Hide and local/off-worksp
 - [Openbox autostart](https://openbox.org/help/Autostart) — user startup scripts and `openbox-session` distinction.
 - [Openbox configuration](https://openbox.org/help/Configuration) — user/system configuration locations.
 
-Hide, Show and original-workspace Bring Top are accepted on the exercised Openbox host; optional binding changes and shortcut smoke tests remain owner-managed and are not claimed by this record. H requires separate approval; Bring Here and Recover are deferred to M03.3.
+Hide, Show and original-workspace Bring Top are accepted on the exercised Openbox host; optional binding changes and shortcut smoke tests remain owner-managed and are not claimed by this record. H native verification is complete with H-A final sign-off pending; Bring Here and Recover are deferred to M03.3.
