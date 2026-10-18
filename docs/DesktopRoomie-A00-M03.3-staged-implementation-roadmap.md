@@ -83,6 +83,8 @@ Every stage preserves:
 
 ## 5. Stage A — protocol v2 and pure operation foundations
 
+**Status — ACCEPTED 2026-10-18:** corrected executable `d7727b3abf9e2c047e389f13a9c5cac19f9ed1a8`; matching [CI 39152686625](https://github.com/zNe4/DesktopRoomie/actions/runs/39152686625), 488 passed / 0 failed; independent ChatGPT source review and explicit owner acceptance. First candidate `10f49920…` remains historical failed-review evidence because its terminal-result partition was too permissive. This acceptance does not authorize Stage B.
+
 **Purpose:** make the new commands and proof model representable without enabling native workspace relocation.
 
 Primary expected files: `src/control.rs`, `src/x11/control.rs`, narrowly `src/main.rs` parser/help/tests.
@@ -101,7 +103,7 @@ Required work:
 
 Required tests include complete codec round trips, mixed-v1/v2 rejection, reserved/unknown fields, destination-marker correlation, every command/lifecycle/status/reason combination, deadline immutability, single-operation admission and all legal/illegal Success/Partial proof cross-products.
 
-**Gate:** matching v2 peers retain accepted Hide/Show/Bring Top behavior; no native workspace mutation exists yet.
+**Gate — satisfied:** matching v2 pure/protocol behavior and Stage-A execution guards passed source review and CI at `d7727b3…`; no native workspace mutation exists. **Next:** Stage B only under a separate owner assignment.
 
 **Recommended Codex:** GPT-6, High reasoning.
 
