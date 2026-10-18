@@ -130,7 +130,9 @@ If `--bring-top` acts on a body on another workspace, it must not report that th
 
 The read-only plan must also resolve iconification/restore ordering relative to pending layers, drag, popup, geometry correction, lifecycle events and shutdown without a focus steal or orphan grab. M03.2 must have its own detailed plan review, deterministic failure tests, manual acceptance and stop gate before coding.
 
-## 6. M03.3 — preliminary design boundary (not yet implementation authority)
+## 6. M03.3 — approved P0 architecture and staged roadmap
+
+**P0 approval update — 2026-10-18:** the owner approved the detailed Bring Here/Recover architecture after independent ChatGPT research and review. The frozen decisions are recorded in [the M03.3 staged implementation roadmap](DesktopRoomie-A00-M03.3-staged-implementation-roadmap.md), including caller-frozen destination semantics, preserved genuine minimization, sticky-window rejection, strict destination workarea validation, one-shot retained-monitor correction, Bring Here → Bring Top Recover ordering, verified-progress Partial semantics, private protocol v2, bounded deadlines and required owner-native Openbox evidence. This approval defines implementation boundaries but does not by itself authorize code changes. **Next separately authorized gate: M03.3 Stage A.**
 
 **Bring Here** moves **the same instance** to the caller/user's current workspace while preserving its existing Above/Normal/Below policy. Request `_NET_WM_DESKTOP` on the body, never change `_NET_CURRENT_DESKTOP` to transport the user. Validate the target index against `_NET_NUMBER_OF_DESKTOPS`, read that target's `_NET_WORKAREA` rectangle, intersect with the selected monitor and checked body fit, and reconcile body position before enabling input. Observe the effective destination desktop and resulting geometry; reject unsupported/stale destinations, changed desktop count, invalid workarea or WM refusal. The M03.3 plan must decide explicitly how an iconified body is treated; do not assume a hidden instance becomes viewable just because its workspace changed.
 
