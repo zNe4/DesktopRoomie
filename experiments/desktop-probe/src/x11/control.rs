@@ -3578,43 +3578,158 @@ mod transport_tests {
     }
     #[test]
     fn hide_shutdown_at_each_phase_preserves_progress_and_ready_owner_until_closing() {
-        for phase in [
-            control::HidePhase::Fence,
-            control::HidePhase::Fenced,
-            control::HidePhase::IconifyAttempted,
-            control::HidePhase::IconifyRequested,
-        ] {
+        let fixtures = crate::show_tests::h_c2::hide_phases();
+        assert_eq!(fixtures.len(), 6);
+        for (operation, fixture) in fixtures {
+            assert_shutdown_snapshot(operation, fixture, false);
+        }
+    }
+
+    fn assert_shutdown_snapshot(
+        operation: ActiveOperation,
+        mut fixture: crate::show_tests::h_c2::Fixture,
+        reply_failure: bool,
+    ) {
+        let mut host = Fake::new();
+        if reply_failure {
+            host.failure = Some("send");
+        }
+        let mut endpoint = ControlWindow::candidate(0, CONTROL, 11, 50, 51, 52);
+        endpoint.transport = atoms();
+        endpoint.descriptor = OwnerDescriptor {
+            body_xid: Some(fixture.body()),
+            ..owner()
+        };
+        endpoint.owns_selection = true;
+        endpoint.active = Some(operation);
+        let original = fixture.take_original_error();
+        let original_message = original.as_ref().map(ToString::to_string);
+        let state = fixture.state();
+        let trace = fixture.trace().to_vec();
+        let ready = fixture.input_ready();
+        assert_eq!(endpoint.descriptor.lifecycle, Lifecycle::Ready);
+        let body = endpoint.descriptor.body_xid;
+        endpoint.closing_with(|| Ok(CONTROL), |_| Ok(())).unwrap();
+        assert_eq!(endpoint.descriptor.lifecycle, Lifecycle::Closing);
+        assert_eq!(endpoint.descriptor.body_xid, body);
+        let finished = endpoint.finish_remote_with(&mut host);
+        assert_eq!(finished.is_err(), reply_failure);
+        assert!(endpoint.active().is_none());
+        endpoint.finish_remote_with(&mut host).unwrap();
+        assert_eq!(host.sent.len(), 1);
+        let response = TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap();
+        assert_eq!(response.status, Status::Closing);
+        assert_eq!(
+            (response.detail.reason, response.detail.stage),
+            (Reason::Closing, Stage::Shutdown)
+        );
+        assert_eq!(response.detail.progress, operation.detail.progress);
+        assert_eq!(response.detail.visibility, operation.detail.visibility);
+        assert_eq!(response.detail.workspace, operation.detail.workspace);
+        assert_eq!(response.request_id, operation.request.request_id);
+        assert_eq!(response.control_xid, CONTROL);
+        assert_eq!(
+            (host.sent[0].type_, host.sent[0].window),
+            (atoms().reply, operation.request.reply_xid)
+        );
+        assert_eq!(fixture.state(), state); // no rollback, including InputRestored
+
+        fixture.notify_and_service(endpoint.active_mut());
+        fixture.late_notifications(endpoint.active_mut());
+        endpoint.finish_remote_with(&mut host).unwrap();
+        assert_eq!(fixture.trace(), trace); // no map/HIDDEN/configure/layer/enable work
+        assert_eq!(fixture.state(), state);
+        assert_eq!(fixture.input_ready(), ready);
+        assert_eq!(host.sent.len(), 1);
+
+        // Use the ordered production cleanup coordinator after remote clearing.
+        // A failed reply cannot prevent body/control/flush cleanup or supersede
+        // the original geometry failure in the new placement-pending snapshot.
+        let order = std::cell::RefCell::new(vec![]);
+        let cleanup = crate::owner_cleanup_with(
+            &mut endpoint,
+            |endpoint| {
+                assert!(endpoint.active().is_none());
+                order.borrow_mut().push("remote-cleared");
+                finished
+            },
+            || {
+                order.borrow_mut().push("body");
+                fixture.cleanup()
+            },
+            |endpoint| {
+                endpoint.resource.release_with(|| {
+                    order.borrow_mut().push("control");
+                    Ok(())
+                })
+            },
+            || {
+                order.borrow_mut().push("flush");
+                Ok(())
+            },
+        );
+        assert_eq!(
+            *order.borrow(),
+            ["remote-cleared", "body", "control", "flush"]
+        );
+        if let Some(original) = original {
+            assert_eq!(
+                crate::finish_probe_with(Err(original), || cleanup)
+                    .unwrap_err()
+                    .to_string(),
+                original_message.unwrap()
+            );
+        } else {
+            cleanup.unwrap();
+        }
+        assert_eq!(fixture.trace(), trace);
+        assert!(endpoint.active().is_none());
+        assert_eq!(host.sent.len(), 1);
+    }
+
+    fn assert_post_dispatch_hide_loss(destroyed: bool) {
+        for elsewhere in [false, true] {
+            let (operation, result, mut fixture) =
+                crate::show_tests::h_c2::hide_loss_after_dispatch(destroyed, elsewhere);
             let mut host = Fake::new();
             let mut endpoint = ControlWindow::candidate(0, CONTROL, 11, 50, 51, 52);
             endpoint.transport = atoms();
             endpoint.descriptor = owner();
-            host.evidence
-                .push_back(Some(evidence(&marker(Command::Hide).encode().unwrap())));
-            host.route(
-                &mut endpoint.active,
-                Lifecycle::Ready,
-                false,
-                &request_event(atoms(), CONTROL, request(Command::Hide)).unwrap(),
-            )
-            .unwrap();
-            let active = endpoint.active_mut().unwrap();
-            active.hide.phase = phase;
-            active.detail.progress.host_mutation_dispatched = matches!(
-                phase,
-                control::HidePhase::IconifyAttempted | control::HidePhase::IconifyRequested
-            );
-            let progress = active.detail.progress;
-            assert_eq!(endpoint.descriptor.lifecycle, Lifecycle::Ready);
-            assert_eq!(endpoint.descriptor.body_xid, owner().body_xid);
-            endpoint.finish_remote_with(&mut host).unwrap();
-            endpoint.finish_remote_with(&mut host).unwrap();
+            endpoint.active = Some(operation);
+            let state = fixture.state();
+            let trace = fixture.trace().to_vec();
+            let terminal = TerminalResponse {
+                status: result.status(),
+                detail: result.detail(),
+                request_id: operation.request.request_id,
+                control_xid: CONTROL,
+            };
+            finish_active(&mut host, atoms(), &mut endpoint.active, terminal).unwrap();
             assert!(endpoint.active().is_none());
+            assert_eq!(
+                TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap(),
+                terminal
+            );
+            fixture.notify_and_service(endpoint.active_mut());
+            fixture.late_notifications(endpoint.active_mut());
+            endpoint.finish_remote_with(&mut host).unwrap();
+            assert_eq!(fixture.trace(), trace);
+            assert_eq!(fixture.state(), state);
             assert_eq!(host.sent.len(), 1);
-            let reply = TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap();
-            assert_eq!(reply.status, Status::Closing);
-            assert_eq!(reply.detail.progress, progress);
-            assert_eq!(reply.request_id, ID);
+            assert!(!fixture.input_ready());
+            fixture.cleanup().unwrap();
+            assert_eq!(fixture.trace(), trace);
         }
+    }
+
+    #[test]
+    fn hide_body_destroyed_after_dispatch_fails_once_without_retry_or_input_restoration() {
+        assert_post_dispatch_hide_loss(true);
+    }
+
+    #[test]
+    fn hide_body_withdrawn_after_dispatch_never_confuses_unmapped_with_minimized() {
+        assert_post_dispatch_hide_loss(false);
     }
     #[test]
     fn hide_owner_loss_during_validation_is_fatal_without_admission_or_reply() {
@@ -3710,43 +3825,19 @@ mod transport_tests {
 
     #[test]
     fn shutdown_at_each_show_phase_replies_once_with_progress_then_clears_record() {
-        for phase in [
-            control::ShowPhase::Observe,
-            control::ShowPhase::Fenced,
-            control::ShowPhase::RestoreAttempted,
-            control::ShowPhase::RestoreRequested,
-            control::ShowPhase::EnablingInput,
-        ] {
-            let mut host = Fake::new();
-            let mut endpoint = ControlWindow::candidate(0, CONTROL, 11, 50, 51, 52);
-            endpoint.transport = atoms();
-            endpoint.descriptor = owner();
-            host.route(
-                &mut endpoint.active,
-                Lifecycle::Ready,
-                false,
-                &request_event(atoms(), CONTROL, request(Command::Show)).unwrap(),
-            )
-            .unwrap();
-            let active = endpoint.active_mut().unwrap();
-            active.show.phase = phase;
-            active.detail.progress.host_mutation_dispatched = matches!(
-                phase,
-                control::ShowPhase::RestoreAttempted
-                    | control::ShowPhase::RestoreRequested
-                    | control::ShowPhase::EnablingInput
-            );
-            let progress = active.detail.progress;
-            endpoint.finish_remote_with(&mut host).unwrap();
-            endpoint.finish_remote_with(&mut host).unwrap();
-            assert!(endpoint.active().is_none());
-            assert_eq!(host.sent.len(), 1);
-            let response = TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap();
-            assert_eq!(response.status, Status::Closing);
-            assert_eq!(response.detail.reason, Reason::Closing);
-            assert_eq!(response.detail.stage, Stage::Shutdown);
-            assert_eq!(response.detail.progress, progress);
-            assert_eq!(response.request_id, ID);
+        let fixtures = crate::show_tests::h_c2::show_phases();
+        assert_eq!(fixtures.len(), 8);
+        for (operation, fixture) in fixtures {
+            assert_shutdown_snapshot(operation, fixture, false);
+        }
+    }
+
+    #[test]
+    fn shutdown_during_show_placement_and_correction_retains_work_without_restarting() {
+        let fixtures = crate::show_tests::h_c2::geometry_snapshots();
+        assert_eq!(fixtures.len(), 3);
+        for (name, operation, fixture) in fixtures {
+            assert_shutdown_snapshot(operation, fixture, name == "placement-pending");
         }
     }
 

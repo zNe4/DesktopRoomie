@@ -181,7 +181,7 @@ fn main() {
         } => (false, delay_secs, duration_secs),
     };
 
-    println!("=== DesktopRoomie A00-M03.1: Desktop Probe ===");
+    println!("=== DesktopRoomie A00-M03.2: Desktop Probe ===");
 
     // Connect to X11 display session
     let (conn, screen_num) = match x11rb::connect(None) {
@@ -8277,6 +8277,465 @@ mod show_tests {
 
         pub(crate) fn trace(&self) -> &[&'static str] {
             &self.host.log
+        }
+    }
+
+    /// Standalone Hide/Show snapshots for the Section-12 lifecycle regressions.
+    /// Keep the fake alive through terminal delivery so shutdown can be checked
+    /// against actual dispatch, geometry and input state, not just phase labels.
+    pub(crate) mod h_c2 {
+        use super::*;
+        use control::{HidePhase, Stage};
+
+        pub(crate) struct Fixture {
+            host: Fake,
+            original_error: Option<HostError>,
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        pub(crate) struct HostState {
+            body: u32,
+            geometry: Rect,
+            availability: BodyAvailability,
+            blocked: bool,
+            empty_confirmed: bool,
+            input_ready: bool,
+        }
+
+        impl Fixture {
+            pub(crate) fn take_original_error(&mut self) -> Option<HostError> {
+                self.original_error.take()
+            }
+
+            pub(crate) fn state(&self) -> HostState {
+                HostState {
+                    body: self.body(),
+                    geometry: self.host.geometry,
+                    availability: self.host.runtime.body,
+                    blocked: self.host.runtime.input_fence.blocked,
+                    empty_confirmed: self.host.runtime.input_fence.empty_confirmed,
+                    input_ready: self.input_ready(),
+                }
+            }
+
+            pub(crate) fn body(&self) -> u32 {
+                self.host.window.window
+            }
+
+            pub(crate) fn trace(&self) -> &[&'static str] {
+                &self.host.log
+            }
+
+            pub(crate) fn input_ready(&self) -> bool {
+                self.host.runtime.accepts_input()
+            }
+
+            /// Same active-record boundary as owner servicing: notifications
+            /// can only schedule existing work, never recreate a terminal record.
+            pub(crate) fn notify_and_service(&mut self, active: Option<&mut ActiveOperation>) {
+                if let Some(op) = active {
+                    mark_remote_observation(op, false);
+                    if remote_service_due(op, self.host.now) {
+                        service_remote_with(op, &mut self.host).unwrap();
+                    }
+                }
+            }
+
+            pub(crate) fn late_notifications(&mut self, active: Option<&mut ActiveOperation>) {
+                // Even convincing late WM state and an expired correction/owner
+                // deadline cannot restart a completed operation.
+                self.host.current = reading(Visibility::Minimized, L::Normal, 2, 2);
+                self.host.now += Duration::from_secs(10);
+                self.notify_and_service(active);
+            }
+
+            pub(crate) fn cleanup(&mut self) -> Result<(), HostError> {
+                let h = &mut self.host;
+                abort_layer(&mut h.runtime.layers, "shutdown");
+                h.runtime.correction = None;
+                h.runtime.cancel_menu_with(
+                    &mut h.window,
+                    |pointer| pointer.release_with(|| Ok(())).map(|_| ()),
+                    |_| Ok(()),
+                )?;
+                assert!(h.runtime.interaction.is_idle());
+                assert!(!h.runtime.pointer.is_grabbed());
+                assert!(h.runtime.menu.is_none());
+                assert!(h.runtime.layers.pending().is_none());
+                Ok(())
+            }
+        }
+
+        pub(crate) fn hide_loss_after_dispatch(
+            destroyed: bool,
+            elsewhere: bool,
+        ) -> (ActiveOperation, control::OperationResult, Fixture) {
+            let desktop = if elsewhere { 7 } else { 2 };
+            let initial = if elsewhere {
+                Visibility::NotMinimizedElsewhere
+            } else {
+                Visibility::NotMinimizedHere
+            };
+            let mut h = Fake::new(reading(initial, L::Normal, desktop, 2));
+            let body = h.window.window;
+            let geometry = h.geometry;
+            let mut op = h.command_operation(Command::Hide);
+            let deadline = op.deadline;
+            assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+            assert_eq!(
+                op.hide.phase,
+                if elsewhere {
+                    HidePhase::HiddenAddRequested
+                } else {
+                    HidePhase::IconifyRequested
+                }
+            );
+            assert_eq!(h.count("iconify"), usize::from(!elsewhere));
+            assert_eq!(h.count("add_hidden"), usize::from(elsewhere));
+            assert_eq!(
+                h.log,
+                [
+                    "fence",
+                    "empty",
+                    "release",
+                    "observe",
+                    if elsewhere { "add_hidden" } else { "iconify" }
+                ]
+            );
+            assert!(h.fence_settled());
+            assert!(op.detail.progress.host_mutation_dispatched);
+
+            // Availability changes only AFTER the checked dispatch above.
+            let (visibility, reason) = if destroyed {
+                (Visibility::Destroyed, Reason::BodyDestroyed)
+            } else {
+                (Visibility::Withdrawn, Reason::Withdrawn)
+            };
+            let mut lost = reading(visibility, L::Unknown, desktop, 2);
+            if destroyed {
+                lost.evidence.wm_state = WmState::Absent;
+                lost.evidence.map_state = Evidence::Missing;
+                lost.evidence.hidden = Evidence::Missing;
+                lost.evidence.coherent = false;
+            } else {
+                assert_eq!(
+                    lost.evidence.map_state,
+                    Evidence::Readable(MapState::Unmapped)
+                );
+                assert_eq!(lost.evidence.hidden, Evidence::Readable(false));
+            }
+            h.current = lost;
+            mark_remote_observation(&mut op, false);
+            assert!(remote_service_due(&op, h.now));
+            let before = h.log.len();
+            let result = service_remote_with(&mut op, &mut h).unwrap().unwrap();
+            // Fresh failure observation plus independent safe-input observation;
+            // no retry, remanagement, geometry work or enabling is performed.
+            assert_eq!(&h.log[before..], ["observe", "observe"]);
+            assert_eq!(result.status(), Status::Failed);
+            assert_eq!(result.exit_code(), control::ExitCode::OperationFailed);
+            let d = result.detail();
+            assert_eq!(
+                (d.reason, d.visibility, d.stage),
+                (reason, visibility, Stage::Hide)
+            );
+            assert_eq!(
+                d.progress,
+                control::Progress {
+                    host_mutation_dispatched: true,
+                    ..control::Progress::default()
+                }
+            );
+            assert_eq!(control::Detail::decode(d.encode()).unwrap(), d);
+            assert_eq!(op.deadline, deadline);
+            assert!(h.runtime.input_fence.blocked);
+            assert!(!h.runtime.accepts_input());
+            assert!(h.fence_settled());
+            assert_eq!((h.window.window, h.geometry), (body, geometry));
+            (
+                op,
+                result,
+                Fixture {
+                    host: h,
+                    original_error: None,
+                },
+            )
+        }
+
+        pub(crate) fn hide_phases() -> Vec<(ActiveOperation, Fixture)> {
+            [
+                HidePhase::Fence,
+                HidePhase::Fenced,
+                HidePhase::IconifyAttempted,
+                HidePhase::IconifyRequested,
+                HidePhase::HiddenAddAttempted,
+                HidePhase::HiddenAddRequested,
+            ]
+            .into_iter()
+            .map(|phase| {
+                let elsewhere = matches!(
+                    phase,
+                    HidePhase::HiddenAddAttempted | HidePhase::HiddenAddRequested
+                );
+                let mut h = Fake::new(reading(
+                    if elsewhere {
+                        Visibility::NotMinimizedElsewhere
+                    } else {
+                        Visibility::NotMinimizedHere
+                    },
+                    L::Normal,
+                    if elsewhere { 7 } else { 2 },
+                    2,
+                ));
+                let mut op = h.command_operation(Command::Hide);
+                let deadline = op.deadline;
+                let mut original_error = None;
+                if phase == HidePhase::Fenced {
+                    let mut transient = h.current;
+                    transient.evidence.coherent = false;
+                    h.reads.push_back(transient);
+                }
+                let uncertain = matches!(
+                    phase,
+                    HidePhase::IconifyAttempted | HidePhase::HiddenAddAttempted
+                );
+                if uncertain {
+                    h.fail = Some(if elsewhere { "add_hidden" } else { "iconify" });
+                }
+                if phase != HidePhase::Fence {
+                    let outcome = service_remote_with(&mut op, &mut h);
+                    if uncertain {
+                        let error = outcome.unwrap_err();
+                        assert!(error.to_string().contains(h.fail.unwrap()));
+                        original_error = Some(error);
+                    } else {
+                        assert!(outcome.unwrap().is_none());
+                    }
+                    assert!(h.fence_settled());
+                    assert!(!h.runtime.accepts_input());
+                }
+                assert_eq!(op.hide.phase, phase);
+                assert_eq!(op.deadline, deadline);
+                let sent = !matches!(phase, HidePhase::Fence | HidePhase::Fenced);
+                assert_eq!(h.count("iconify"), usize::from(sent && !elsewhere));
+                assert_eq!(h.count("add_hidden"), usize::from(sent && elsewhere));
+                assert_eq!(op.detail.progress.host_mutation_dispatched, sent);
+                assert_eq!(
+                    h.count("map") + h.count("remove_hidden") + h.count("enable"),
+                    0
+                );
+                if sent {
+                    assert_eq!(
+                        op.hide.baseline.unwrap().desktop,
+                        if elsewhere { 7 } else { 2 }
+                    );
+                    assert_eq!(op.hide.baseline.unwrap().current_desktop, 2);
+                    assert_eq!(
+                        op.detail.workspace,
+                        if elsewhere {
+                            Workspace::Other
+                        } else {
+                            Workspace::Current
+                        }
+                    );
+                }
+                (
+                    op,
+                    Fixture {
+                        host: h,
+                        original_error,
+                    },
+                )
+            })
+            .collect()
+        }
+
+        pub(crate) fn show_phases() -> Vec<(ActiveOperation, Fixture)> {
+            [
+                ShowPhase::Observe,
+                ShowPhase::Fenced,
+                ShowPhase::RestoreAttempted,
+                ShowPhase::RestoreRequested,
+                ShowPhase::HiddenRemoveAttempted,
+                ShowPhase::HiddenRemoveRequested,
+                ShowPhase::EnablingInput,
+                ShowPhase::InputRestored,
+            ]
+            .into_iter()
+            .map(|phase| {
+                let elsewhere = matches!(
+                    phase,
+                    ShowPhase::HiddenRemoveAttempted | ShowPhase::HiddenRemoveRequested
+                );
+                let mut h = Fake::new(reading(
+                    Visibility::Minimized,
+                    L::Normal,
+                    if elsewhere { 7 } else { 2 },
+                    2,
+                ));
+                h.runtime.body = BodyAvailability::Unavailable;
+                let mut op = h.operation();
+                let deadline = op.deadline;
+                let mut original_error = None;
+                if phase == ShowPhase::Fenced {
+                    let mut transient = h.current;
+                    transient.evidence.coherent = false;
+                    h.reads = VecDeque::from([h.current, transient]);
+                }
+                let uncertain = matches!(
+                    phase,
+                    ShowPhase::RestoreAttempted | ShowPhase::HiddenRemoveAttempted
+                );
+                if uncertain {
+                    h.fail = Some(if elsewhere {
+                        "remove_hidden"
+                    } else {
+                        "user_time_zero"
+                    });
+                }
+                if phase != ShowPhase::Observe {
+                    let outcome = service_remote_with(&mut op, &mut h);
+                    if uncertain {
+                        let error = outcome.unwrap_err();
+                        assert!(error.to_string().contains(h.fail.unwrap()));
+                        original_error = Some(error);
+                    } else {
+                        assert!(outcome.unwrap().is_none());
+                    }
+                }
+                if matches!(phase, ShowPhase::EnablingInput | ShowPhase::InputRestored) {
+                    h.current = visible();
+                    mark_remote_observation(&mut op, false);
+                    if phase == ShowPhase::EnablingInput {
+                        h.fail = Some("enable");
+                        let error = service_remote_with(&mut op, &mut h).unwrap_err();
+                        assert_eq!(error.to_string(), "injected enable");
+                        original_error = Some(error);
+                    } else {
+                        let result = service_remote_with(&mut op, &mut h).unwrap().unwrap();
+                        assert_success(result, true, true);
+                    }
+                }
+                assert_eq!(op.show.phase, phase);
+                assert_eq!(op.deadline, deadline);
+                let sent = !matches!(phase, ShowPhase::Observe | ShowPhase::Fenced);
+                assert_eq!(op.detail.progress.host_mutation_dispatched, sent);
+                assert_eq!(h.count("remove_hidden"), usize::from(sent && elsewhere));
+                assert_eq!(h.count("user_time_zero"), usize::from(sent && !elsewhere));
+                assert_eq!(
+                    h.count("map"),
+                    usize::from(sent && !elsewhere && phase != ShowPhase::RestoreAttempted)
+                );
+                assert_eq!(
+                    h.count("iconify") + h.count("add_hidden") + h.count("correct"),
+                    0
+                );
+                assert_eq!(h.runtime.accepts_input(), phase == ShowPhase::InputRestored);
+                assert_eq!(
+                    op.detail.progress.input_ready,
+                    phase == ShowPhase::InputRestored
+                );
+                assert_eq!(
+                    op.detail.progress.not_minimized_confirmed,
+                    phase == ShowPhase::InputRestored
+                );
+                if elsewhere {
+                    assert_eq!(op.show.baseline.unwrap().desktop, 7);
+                    assert_eq!(op.show.baseline.unwrap().current_desktop, 2);
+                    assert_eq!(op.detail.workspace, Workspace::Other);
+                    assert!(op.show.area.is_none());
+                    assert!(op.show.correction.is_none());
+                    assert!(!op.show.correction_sent);
+                    assert_eq!(h.count("geometry") + h.count("enable"), 0);
+                    assert!(h.runtime.input_fence.blocked);
+                    assert!(!op.detail.progress.placement_deferred); // restoration still unconfirmed
+                }
+                (
+                    op,
+                    Fixture {
+                        host: h,
+                        original_error,
+                    },
+                )
+            })
+            .collect()
+        }
+
+        pub(crate) fn geometry_snapshots() -> Vec<(&'static str, ActiveOperation, Fixture)> {
+            let mut fixtures = vec![];
+            for name in [
+                "placement-pending",
+                "correction-pending",
+                "correction-confirmed-input-pending",
+            ] {
+                let mut h = minimized();
+                h.runtime.body = BodyAvailability::Unavailable;
+                let mut op = h.operation();
+                let deadline = op.deadline;
+                let mut original_error = None;
+                assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                h.current = visible();
+                mark_remote_observation(&mut op, false);
+                if name == "placement-pending" {
+                    // Snapshot at the first geometry read after restoration.
+                    h.fail = Some("geometry");
+                    let error = service_remote_with(&mut op, &mut h).unwrap_err();
+                    assert_eq!(error.to_string(), "injected geometry");
+                    original_error = Some(error);
+                    assert!(op.show.area.is_none());
+                    assert!(op.show.correction.is_none());
+                    assert!(!op.show.correction_sent);
+                } else {
+                    h.area = Rect::new(200, 200, 460, 460);
+                    h.bounds = checked_probe_bounds(h.area).unwrap();
+                    assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+                    let (target, confirmation) = op.show.correction.unwrap();
+                    assert_eq!(target, Point::new(200, 200));
+                    assert_eq!(confirmation, h.now + CONFIRMATION_TIMEOUT);
+                    assert_eq!(op.show.area, Some(h.area));
+                    assert!(op.show.correction_sent);
+                    assert_eq!(h.count("correct"), 1);
+                    if name == "correction-confirmed-input-pending" {
+                        h.now = confirmation;
+                        mark_remote_observation(&mut op, false);
+                        // No distinct correction-confirmed phase exists: the
+                        // same production call proceeds to checked input enable.
+                        h.fail = Some("enable");
+                        let error = service_remote_with(&mut op, &mut h).unwrap_err();
+                        assert_eq!(error.to_string(), "injected enable");
+                        original_error = Some(error);
+                        assert!(op.show.correction.is_none());
+                        assert_eq!(op.show.phase, ShowPhase::EnablingInput);
+                        assert_eq!(h.geometry.origin(), target);
+                    } else {
+                        assert_eq!(h.count("enable"), 0);
+                        assert_eq!(op.show.phase, ShowPhase::RestoreRequested);
+                    }
+                }
+                assert_eq!(
+                    (op.stage, op.detail.stage),
+                    (Stage::Geometry, Stage::Geometry)
+                );
+                assert_eq!(op.deadline, deadline);
+                assert!(!op.show.observe);
+                assert!(!op.show.layout_interrupted);
+                assert!(op.detail.progress.host_mutation_dispatched);
+                assert!(!op.detail.progress.input_ready);
+                assert!(!op.detail.progress.not_minimized_confirmed);
+                assert!(h.runtime.input_fence.blocked);
+                assert!(!h.runtime.accepts_input());
+                assert_eq!(h.count("map"), 1);
+                assert_eq!(h.count("add_hidden") + h.count("remove_hidden"), 0);
+                fixtures.push((
+                    name,
+                    op,
+                    Fixture {
+                        host: h,
+                        original_error,
+                    },
+                ));
+            }
+            fixtures
         }
     }
 
