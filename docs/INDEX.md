@@ -1,5 +1,7 @@
 # Documentation index
 
+**Current M03.2 status (2026-10-18): FINAL ACCEPTED** by explicit owner H-A decision following H-D publication. The H01–H28 record preserves conditional H23, unobserved H14 and optional H28; M03.3 planning is next, not implementation.
+
 DesktopRoomie is the reusable software; Project Vanilla is its private character implementation. This map separates implemented facts and evidence from future possibilities. The [current checkpoint](STATUS.md) carries changing status; this index is not a roadmap or implementation authorization.
 
 ## Authority

@@ -1,5 +1,7 @@
 # Implemented architecture
 
+**Acceptance status update, 2026-10-18:** M03.2 frozen H executable `a46e432c1f97b03c576737b1fc0ac35d7f90c158` was formally accepted at owner H-A following H-D publication; this is a documentation/acceptance decision, not new source or CI evidence. [Integrated host matrix](../experiments/desktop-probe/ACCEPTANCE-M03.2.md) retains the H23/H14/H28 qualifications.
+
 This describes the Rust/x11rb probe on frozen H executable `a46e432c1f97b03c576737b1fc0ac35d7f90c158` (matching [CI 39098551853](https://github.com/zNe4/DesktopRoomie/actions/runs/39098551853), 453 tests). Its owner-native H-N1/N2/N3 integration evidence is summarized in [ACCEPTANCE-M03.2](../experiments/desktop-probe/ACCEPTANCE-M03.2.md), with final H-A sign-off pending. Earlier owner-accepted G3 `80d7df4aa1524122bd7c232f5aa09a4e39c8dd9f` / [CI 38468930784](https://github.com/zNe4/DesktopRoomie/actions/runs/38468930784) (447 tests) and the [historical Stage-F correction/failure](host/OPENBOX.md) retain their own provenance. This is an existing source ownership map, not a redesign; see [M03.2 implementation](../experiments/desktop-probe/M03.2-IMPLEMENTATION.md), [STATUS](STATUS.md), [INVARIANTS](INVARIANTS.md).
 
 ## State ownership and boundaries

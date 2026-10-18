@@ -1,5 +1,7 @@
 # Openbox host integration — user-managed setup
 
+**Acceptance status update, 2026-10-18:** the owner formally accepted **A00-M03.2 at H-A** following H-D publication. This supersedes any earlier *current* H-A pending status below while preserving historically dated F/G decisions. H23 conditional/not exercised, H14 unobserved and H28 optional/not exercised remain the exact native limits. M03.3 has not been implemented.
+
 **Status (updated 2026-10-18):** A–G accepted at historical executable SHAs. Frozen H `a46e432c1f97b03c576737b1fc0ac35d7f90c158` passed [CI 39098551853](https://github.com/zNe4/DesktopRoomie/actions/runs/39098551853) (453 tests) and H-N1/N2/N3 owner native gates with qualifications. [Integrated M03.2 acceptance](../../experiments/desktop-probe/ACCEPTANCE-M03.2.md) records H23 conditional/unexercised, H14 unobserved and H28 optional/unexercised; **H-A final sign-off pending**. This guide preserves historical F/G observations and authorizes no host-config changes.
 
 DesktopRoomie should own safe same-instance control, WM-state verification, input cleanup and keyboard-focus isolation. Openbox should be reused for *optional* user conveniences such as keyboard shortcuts, application menus and session autostart. The application must be recoverable from its CLI without optional Openbox bindings; no global key-grabbing daemon, tray framework or automatic dotfile rewriting is required.
