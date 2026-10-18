@@ -5,6 +5,8 @@ use x11rb::protocol::xproto::{
     GetPropertyReply, Window,
 };
 
+pub mod destination;
+
 pub use crate::geometry::Rect;
 type HostError = Box<dyn std::error::Error>;
 
@@ -32,6 +34,8 @@ pub struct LayoutAtoms {
     pub workarea: Atom,
     pub current_desktop: Atom,
     pub wm_desktop: Atom,
+    pub number_of_desktops: Atom,
+    pub desktop_viewport: Atom,
 }
 impl LayoutAtoms {
     pub fn subscribe(conn: &impl Connection, root: Window) -> Result<Self, HostError> {
@@ -61,6 +65,14 @@ impl LayoutAtoms {
                 .reply()?
                 .atom,
             wm_desktop: conn.intern_atom(false, b"_NET_WM_DESKTOP")?.reply()?.atom,
+            number_of_desktops: conn
+                .intern_atom(false, b"_NET_NUMBER_OF_DESKTOPS")?
+                .reply()?
+                .atom,
+            desktop_viewport: conn
+                .intern_atom(false, b"_NET_DESKTOP_VIEWPORT")?
+                .reply()?
+                .atom,
         })
     }
 }
@@ -94,19 +106,12 @@ fn query_layout(
     let monitors =
         query_monitors(conn, root).map_err(|e| format!("RandR monitor query failed: {e}"))?;
     let monitor = select_monitor(&monitors, selected)?;
-    let desktop = cardinal_values(
+    let current_desktop = parse_current_desktop(
         &conn
             .get_property(false, root, atoms.current_desktop, AtomEnum::ANY, 0, 1)?
             .reply()?,
+        strict,
     )?;
-    let current_desktop = match desktop {
-        None if !strict => {
-            eprintln!("[WARN] _NET_CURRENT_DESKTOP absent; using desktop 0");
-            0
-        }
-        Some(values) if values.len() == 1 && values[0] != u32::MAX => values[0],
-        _ => return Err("Malformed _NET_CURRENT_DESKTOP".into()),
-    };
     let property = conn
         .get_property(false, root, atoms.workarea, AtomEnum::ANY, 0, 65536)?
         .reply()?;
@@ -121,6 +126,18 @@ fn query_layout(
         desktop_workarea,
         usable_area,
     })
+}
+
+// Legacy diagnostic/control policy is deliberately independent of destination validation.
+fn parse_current_desktop(property: &GetPropertyReply, strict: bool) -> Result<u32, HostError> {
+    match cardinal_values(property)? {
+        None if !strict => {
+            eprintln!("[WARN] _NET_CURRENT_DESKTOP absent; using desktop 0");
+            Ok(0)
+        }
+        Some(values) if values.len() == 1 && values[0] != u32::MAX => Ok(values[0]),
+        _ => Err("Malformed _NET_CURRENT_DESKTOP".into()),
+    }
 }
 
 fn select_monitor(
@@ -316,6 +333,39 @@ mod tests {
             assert!(cardinal_values(&reply).is_err());
         }
     }
+    #[test]
+    fn diagnostic_desktop_zero_fallback_and_strict_control_policy_remain_separate() {
+        let mut absent = property(&[]);
+        absent.type_ = x11rb::NONE;
+        absent.format = 0;
+        assert_eq!(parse_current_desktop(&absent, false).unwrap(), 0);
+        assert!(parse_current_desktop(&absent, true).is_err());
+        for strict in [false, true] {
+            // Neither legacy path requires a desktop-count property.
+            assert_eq!(parse_current_desktop(&property(&[12]), strict).unwrap(), 12);
+            for p in [property(&[]), property(&[1, 2]), property(&[u32::MAX])] {
+                assert!(parse_current_desktop(&p, strict).is_err());
+            }
+            let mut malformed = absent.clone();
+            malformed.bytes_after = 4;
+            assert!(parse_current_desktop(&malformed, strict).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_workarea_still_selects_current_entry_without_destination_count_policy() {
+        let p = property(&[0, 0, 100, 100, 10, 20, 800, 600, 30, 40, 900, 700]);
+        assert_eq!(
+            parse_workarea(&p, 1).unwrap(),
+            Some(Rect::new(10, 20, 800, 600))
+        );
+        assert_eq!(
+            parse_workarea(&p, 2).unwrap(),
+            Some(Rect::new(30, 40, 900, 700))
+        );
+        assert!(parse_workarea(&p, 3).is_err());
+    }
+
     #[test]
     fn intersections_are_checked_and_never_expand_empty_or_invalid_fit() {
         let monitor = monitor(1, true);

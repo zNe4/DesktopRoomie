@@ -5571,6 +5571,8 @@ mod tests {
     fn interruption_discards_coalesced_move_and_release_preserves_flush_order() {
         use x11rb::protocol::xproto::{ButtonPressEvent, UnmapNotifyEvent, UNMAP_NOTIFY_EVENT};
         let atoms = x11::monitors::LayoutAtoms {
+            number_of_desktops: 90,
+            desktop_viewport: 91,
             workarea: 3,
             current_desktop: 4,
             wm_desktop: 5,
@@ -5718,6 +5720,8 @@ mod tests {
     fn workspace_workarea_and_root_geometry_are_relevant_but_unrelated_properties_are_not() {
         use x11rb::protocol::xproto::{Property, PropertyNotifyEvent};
         let atoms = x11::monitors::LayoutAtoms {
+            number_of_desktops: 90,
+            desktop_viewport: 91,
             workarea: 3,
             current_desktop: 4,
             wm_desktop: 5,
@@ -5738,6 +5742,13 @@ mod tests {
         }
         assert!(!relevant_layout_event(&property(100, 99), 1, 100, &atoms));
         assert!(!relevant_layout_event(&property(999, 3), 1, 100, &atoms));
+        for atom in [atoms.number_of_desktops, atoms.desktop_viewport] {
+            let event = property(1, atom);
+            assert!(!relevant_layout_event(&event, 1, 100, &atoms));
+            assert!(!interrupts_pending_movement(&event, 1, 100, &atoms));
+            assert!(!interrupts_layer(&event, 1, 100, &atoms));
+            assert!(!visibility_layout_interruption(&event, 1, &atoms));
+        }
     }
     #[test]
     fn safety_boundary_survives_multiple_batches_without_swallowing_ordinary_release() {
@@ -6122,6 +6133,8 @@ mod menu_runtime_tests {
     #[test]
     fn layout_and_window_lifecycle_identify_interruptions_before_refresh() {
         let atoms = x11::monitors::LayoutAtoms {
+            number_of_desktops: 90,
+            desktop_viewport: 91,
             current_desktop: 20,
             workarea: 21,
             wm_desktop: 22,
@@ -7156,6 +7169,8 @@ mod layer_runtime_tests {
     }
     fn layout_atoms() -> x11::monitors::LayoutAtoms {
         x11::monitors::LayoutAtoms {
+            number_of_desktops: 90,
+            desktop_viewport: 91,
             workarea: 30,
             current_desktop: 31,
             wm_desktop: 32,
@@ -11150,6 +11165,8 @@ mod show_tests {
         #[test]
         fn expected_unmap_and_state_notifications_schedule_hide_without_layout_abort() {
             let layout = x11::monitors::LayoutAtoms {
+                number_of_desktops: 90,
+                desktop_viewport: 91,
                 workarea: 10,
                 current_desktop: 11,
                 wm_desktop: 12,
@@ -11192,6 +11209,15 @@ mod show_tests {
                 );
                 assert!(remote_service_due(&op, h.now));
                 assert!(!op.hide.layout_interrupted);
+            }
+            for atom in [layout.number_of_desktops, layout.desktop_viewport] {
+                let event = Event::PropertyNotify(x11rb::protocol::xproto::PropertyNotifyEvent {
+                    window: 1,
+                    atom,
+                    ..Default::default()
+                });
+                assert!(!visibility_event(&event, 1, 100, &visibility, &layout));
+                assert!(!visibility_layout_interruption(&event, 1, &layout));
             }
         }
 
@@ -12311,6 +12337,8 @@ mod show_tests {
     #[test]
     fn layout_notifications_invalidate_show_without_visibility_or_geometry_retries() {
         let atoms = x11::monitors::LayoutAtoms {
+            number_of_desktops: 90,
+            desktop_viewport: 91,
             workarea: 10,
             current_desktop: 11,
             wm_desktop: 12,
