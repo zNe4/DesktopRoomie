@@ -153,6 +153,8 @@ Start with passive snapshots. Any state-changing experiment requires explicit ow
 
 ## 8. Stage C — checked WM-directed relocation primitive
 
+**Status — ACCEPTED 2026-10-18:** executable [`58a1ffa884c2527797d96023570542848407bcbe`](https://github.com/zNe4/DesktopRoomie/commit/58a1ffa884c2527797d96023570542848407bcbe), based on H0 documentation HEAD `3689133698b45514c45a0db612f46e27a3e887ea`; matching [CI 39159965288](https://github.com/zNe4/DesktopRoomie/actions/runs/39159965288), **542 passed / 0 failed**, format/build/Clippy passed; independent ChatGPT source/diff review and explicit owner acceptance. Only `x11/desktop.rs` and `x11/mod.rs` changed. This is a transport-only seam with no runtime consumer, no Bring Here/Recover execution and no new public CLI. [Stage-C implementation and acceptance note](../experiments/desktop-probe/M03.3-C-IMPLEMENTATION.md). Acceptance does not authorize Stage D.
+
 **Purpose:** implement one narrow native request seam, not a new controller.
 
 A helper may live in a small `src/x11/desktop.rs` if that keeps responsibilities clear. It sends exactly one root-directed `_NET_WM_DESKTOP` ClientMessage for an admitted frozen destination:
@@ -166,7 +168,7 @@ A helper may live in a small `src/x11/desktop.rs` if that keeps responsibilities
 
 It must check its logical deadline before mutation, mark possible dispatch before checked completion, distinguish X acknowledgement from WM state confirmation, and never retry an uncertain request. It never writes `_NET_WM_DESKTOP` directly and never sends `_NET_CURRENT_DESKTOP`, activation or focus requests.
 
-**Gate:** exact envelope and deadline/dispatch/error tests; no command-level success is inferred from transport acknowledgement.
+**Gate — satisfied:** exact envelope/serialized bytes and deadline/dispatch/error/no-retry tests passed independent review and matching 542-test CI at `58a1ffa…`. Checked X transport completion does not prove WM relocation. **Next:** Stage D only under separate owner authorization.
 
 **Recommended Codex:** GPT-6, Medium/High reasoning.
 
@@ -291,6 +293,5 @@ Record executable code SHA separately from later documentation-only commits. Pre
 
 ## 16. Immediate next gate
 
-**A00-M03.3-H0 — owner-native Openbox feasibility evidence.**
+**A00-M03.3 Stage D — standalone Bring Here.** Stages A, B, H0 and C are accepted; Stage C provides only a checked, unconsumed `_NET_WM_DESKTOP` transport seam. Stage D must separately integrate frozen caller destination capture, admission/evidence, one-shot relocation, local/minimized/layer/geometry/input confirmation and truthful terminal results under the approved gate in §9. `--bring-here` is not yet exposed and Recover stays Unsupported. No Stage-D implementation or native acceptance is authorized by this documentation closure.
 
-Stages A and B are accepted. H0 is an evidence checkpoint, not an implementation stage: begin with passive real-host snapshots of desktop count/workarea/viewport and retained-monitor facts, then perform only explicitly owner-authorized reversible `_NET_WM_DESKTOP` experiments with before/after state and real typing-focus observation. H0 does not authorize Stage C code or permanent host configuration changes. If H0 exposes focus/workspace switching, lost minimization, incompatible viewport semantics or other stop conditions, return to architecture review before implementing relocation.
