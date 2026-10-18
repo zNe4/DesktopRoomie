@@ -2,13 +2,13 @@
 
 **Acceptance status update, 2026-10-18:** the owner formally accepted **A00-M03.2 at H-A** following H-D publication. This supersedes any earlier *current* H-A pending status below while preserving historically dated F/G decisions. H23 conditional/not exercised, H14 unobserved and H28 optional/not exercised remain the exact native limits. M03.3 has not been implemented.
 
-**Status (updated 2026-10-18):** A–G accepted at historical executable SHAs. Frozen H `a46e432c1f97b03c576737b1fc0ac35d7f90c158` passed [CI 39098551853](https://github.com/zNe4/DesktopRoomie/actions/runs/39098551853) (453 tests) and H-N1/N2/N3 owner native gates with qualifications. [Integrated M03.2 acceptance](../../experiments/desktop-probe/ACCEPTANCE-M03.2.md) records H23 conditional/unexercised, H14 unobserved and H28 optional/unexercised; **H-A final sign-off pending**. This guide preserves historical F/G observations and authorizes no host-config changes.
+**Status (updated 2026-10-18):** M03.2 is formally accepted at frozen H `a46e432c1f97b03c576737b1fc0ac35d7f90c158` / CI 39098551853 (453 tests), preserving H23 conditional/unexercised, H14 unobserved and H28 optional/unexercised. M03.3 Stages A/B are accepted and [H0 native Openbox feasibility](../../experiments/desktop-probe/M03.3-H0-OPENBOX.md) is now owner-accepted. Stage C remains separately gated; this guide authorizes no host-config or executable changes.
 
 DesktopRoomie should own safe same-instance control, WM-state verification, input cleanup and keyboard-focus isolation. Openbox should be reused for *optional* user conveniences such as keyboard shortcuts, application menus and session autostart. The application must be recoverable from its CLI without optional Openbox bindings; no global key-grabbing daemon, tray framework or automatic dotfile rewriting is required.
 
 ## Openbox off-workspace visibility amendment (2026-10-10)
 
-This historical amendment preserves owner-supplied real-host evidence and the owner-approved correction design for **Openbox 3.6.1/X11/Picom**. At the 2026-10-10 checkpoint, A–E were accepted at `174d8a92574e16768330fb3c315578b105e4b698`, and F awaited correction/review/native acceptance. The amendment was subsequently implemented in `5ed75d7…` and accepted at `ccd0191…`, as recorded separately below. The original failed gate and manual experiments are not retroactively executable passes. No final M03.2 acceptance exists.
+This historical amendment preserves owner-supplied real-host evidence and the owner-approved correction design for **Openbox 3.6.1/X11/Picom**. At the 2026-10-10 checkpoint, A–E were accepted at `174d8a92574e16768330fb3c315578b105e4b698`, and F awaited correction/review/native acceptance. The amendment was subsequently implemented in `5ed75d7…` and accepted at `ccd0191…`, as recorded separately below. The original failed gate and manual experiments are not retroactively executable passes. Later M03.2 final acceptance is recorded in STATUS and ACCEPTANCE-M03.2.
 
 ### Failed Stage-F host gate
 
@@ -195,7 +195,7 @@ The owner's off-workspace CLI said: `not minimized + Above confirmed on another 
 - **H14 N/A/unobserved** alternate off-workspace Normal/non-viewable representation; **H28 optional/unexercised** user Openbox shortcut binding.
 - Earlier owner G3 H10/H11/H13/H16/H17/H20/H22/H25 and F H15 remain attributed to `80d7df4…` / `ccd0191…`, **not** new H-SHA native tests.
 
-See [H01–H28 matrix](../../experiments/desktop-probe/ACCEPTANCE-M03.2.md#h01h28-integration-matrix) and [M03.2 source design](../../experiments/desktop-probe/M03.2-IMPLEMENTATION.md). H-D documentation does not itself grant final H-A owner acceptance.
+See [H01–H28 matrix](../../experiments/desktop-probe/ACCEPTANCE-M03.2.md#h01h28-integration-matrix) and [M03.2 source design](../../experiments/desktop-probe/M03.2-IMPLEMENTATION.md). H-D itself was documentation-only; final H-A owner acceptance was subsequently recorded on 2026-10-18.
 
 ## Configuration levels
 
@@ -258,7 +258,7 @@ After deliberately editing the active `rc.xml`, `openbox --reconfigure` requests
 | `--bring-here` | Move the **same instance** to the current workspace, preserving its layer; hidden-state handling to be designed | M03.3 |
 | `--recover` | Explicitly compose Bring Here and Bring Top, with truthful partial-failure reporting | M03.3 |
 
-M03.2 command spellings and transport are implemented; Hide and local/off-workspace Show were accepted at `ccd0191…`, and original-workspace Bring Top now has owner Openbox acceptance at `80d7df4…`. H native verification is complete but H-A final owner acceptance is pending, and M03.3 remains future work. Optional bindings stay user-managed; only accepted operations should be recommended as working shortcuts.
+M03.2 command spellings and transport are implemented and final-accepted at its frozen H executable. M03.3 Stage A/B foundations are accepted and H0 native feasibility passed on the exercised Openbox host, but public Bring Here/Recover and repository `_NET_WM_DESKTOP` transport still do not exist. Stage C is the next separately authorized gate. Optional bindings stay user-managed; only accepted operations should be recommended as working shortcuts.
 
 ## Official reference material
 
@@ -267,4 +267,4 @@ M03.2 command spellings and transport are implemented; Hide and local/off-worksp
 - [Openbox autostart](https://openbox.org/help/Autostart) — user startup scripts and `openbox-session` distinction.
 - [Openbox configuration](https://openbox.org/help/Configuration) — user/system configuration locations.
 
-Hide, Show and original-workspace Bring Top are accepted on the exercised Openbox host; optional binding changes and shortcut smoke tests remain owner-managed and are not claimed by this record. H native verification is complete with H-A final sign-off pending; Bring Here and Recover are deferred to M03.3.
+Hide, Show and original-workspace Bring Top are accepted on the exercised Openbox host; optional binding changes and shortcut smoke tests remain owner-managed and are not claimed by this record. M03.2 final H-A acceptance is complete. M03.3 H0 separately establishes relocation feasibility, while Bring Here and Recover remain unimplemented pending Stage C/D/E.

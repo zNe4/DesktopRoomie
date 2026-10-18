@@ -134,6 +134,8 @@ A changed count, target workarea, viewport, retained monitor or frozen-current-d
 
 ## 7. H0 — owner-native Openbox feasibility gate
 
+**Status — ACCEPTED 2026-10-18:** owner-native evidence on accepted Stage-B executable `4e2bd4dbfce786cc2b269bd2af0693881324cc93`; body XID `0x3800002`; Openbox 3.6.1/X11/Picom v13. H0-1/2/3/6 PASS, H0-4 observed/pass, H0-5 trustworthy on this tested host. Exact source-1 WM relocation preserved workspace/focus, layer and genuine minimization; no retry or property-forcing workaround was needed. See [H0 evidence](../experiments/desktop-probe/M03.3-H0-OPENBOX.md). This checkpoint added no repository relocation implementation.
+
 This is an evidence checkpoint, not a coding stage. Before standalone relocation is accepted, owner-run reversible tests on DesktopRoomie's own body must establish:
 
 | Gate | Required Openbox evidence |
@@ -147,7 +149,7 @@ This is an evidence checkpoint, not a coding stage. Before standalone relocation
 
 Start with passive snapshots. Any state-changing experiment requires explicit owner authorization, before/after evidence, real typing-focus observation and restoration instructions.
 
-**Stop:** return to architecture review if Openbox requires focus/workspace switching, loses genuine minimization, cannot support safe destination evidence, or requires property-forcing/WM-fighting workarounds.
+**Gate — satisfied:** the exercised Openbox host met all six feasibility goals without triggering the stop conditions. Event ordering is observed host evidence, not an order to hard-code. **Next:** Stage C only under a separate owner assignment.
 
 ## 8. Stage C — checked WM-directed relocation primitive
 
