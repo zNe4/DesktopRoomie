@@ -2,6 +2,9 @@
 #![allow(dead_code)]
 
 use std::fmt;
+use std::time::{Duration, Instant};
+
+use crate::geometry::{Point, Rect, Size, ValidOriginBounds};
 
 pub const MAGIC: u32 = 0x4452_4d31;
 pub const VERSION: u32 = 2;
@@ -503,10 +506,445 @@ pub struct PlacementProgress {
     pub destination_desktop: u32,
     pub baseline: Option<PlacementBaseline>,
     pub proof: PlacementProof,
+    // D1 is pure and unwired. Both production Bring Here guards remain closed.
+    here_phase: HerePhase,
+    layout: Option<DestinationIdentity>,
+    observe: bool,
+    invalidated: Option<Reason>,
+    desktop_attempted: bool,
+    desktop_dispatched: bool,
+    desktop_checked: bool,
+    /// Original membership is needed for send eligibility, not a wire proof.
+    original_confirmed: bool,
+    /// Fresh local non-minimized evidence gates correction; destination proof
+    /// alone can also describe a minimized or transitional body.
+    local_geometry_eligible: bool,
+    /// Some means consumed, including failure before a native cookie exists.
+    correction: Option<(Point, Instant)>,
 }
+
+/// Progression/eligibility only: no phase proves any native postcondition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerePhase {
+    Observe,
+    Fenced,
+    DesktopAttempted,
+    AwaitDestination,
+    Geometry,
+    EnablingInput,
+    InputRestored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestinationViewport {
+    Absent,
+    AllZero,
+}
+
+/// Projection of accepted Stage-B equality facts, not raw property replies.
+/// D2 supplies validated values; monitor ordering/primary/outputs are excluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DestinationIdentity {
+    pub desktop_count: u32,
+    pub destination_desktop: u32,
+    pub current_desktop: u32,
+    pub monitor_name: u32,
+    pub monitor_bounds: Rect,
+    pub target_workarea: Option<Rect>,
+    pub viewport: DestinationViewport,
+    pub usable_area: Rect,
+    pub body_size: Size,
+    pub valid_origins: ValidOriginBounds,
+}
+
+/// Fresh host evidence, never PropertyNotify payloads. Membership/current must
+/// independently pass supported, coherent repeated reads, even if visibility is
+/// transitional. None means membership/current could not be established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HereObservation {
+    pub membership: Option<(u32, u32)>, // (body desktop, current desktop)
+    pub visibility: Visibility,
+    pub layer: LayerObservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HereDecision {
+    Original,
+    Destination,
+    Pending,
+    Invalid(Reason),
+}
+
 impl PlacementProgress {
+    // Read-only access prevents consumers from rearming attempts via a phase
+    // reset or taking/clearing correction facts after geometry confirmation.
+    pub fn here_phase(&self) -> HerePhase {
+        self.here_phase
+    }
+
+    pub fn layout(&self) -> Option<DestinationIdentity> {
+        self.layout
+    }
+
+    pub fn observation_due(&self) -> bool {
+        self.observe
+    }
+
+    pub fn invalidation_reason(&self) -> Option<Reason> {
+        self.invalidated
+    }
+
+    pub fn correction(&self) -> Option<(Point, Instant)> {
+        self.correction
+    }
+
+    pub fn new(destination_desktop: u32) -> Self {
+        Self {
+            destination_desktop,
+            baseline: None,
+            proof: PlacementProof::default(),
+            here_phase: HerePhase::Observe,
+            layout: None,
+            observe: true,
+            invalidated: None,
+            desktop_attempted: false,
+            desktop_dispatched: false,
+            desktop_checked: false,
+            original_confirmed: false,
+            local_geometry_eligible: false,
+            correction: None,
+        }
+    }
+
     pub fn clear_current(&mut self) {
         self.proof.current = PlacementConfirmation::default();
+        self.original_confirmed = false;
+        self.local_geometry_eligible = false;
+    }
+
+    pub fn request_here_observation(&mut self) {
+        self.observe = true;
+        self.clear_current();
+    }
+
+    pub fn invalidate_here(&mut self, reason: Reason) -> HereDecision {
+        let reason = *self.invalidated.get_or_insert(reason);
+        self.clear_current();
+        HereDecision::Invalid(reason)
+    }
+
+    /// Rebuild current proof; neither later evidence nor an error replaces the
+    /// first admitted layout/baseline. History is established independently of
+    /// layout/layer/minimization readiness, and survives their invalidation.
+    pub fn observe_here(
+        &mut self,
+        layout: Result<DestinationIdentity, Reason>,
+        observation: HereObservation,
+    ) -> HereDecision {
+        self.clear_current();
+        self.observe = false;
+        if let (Some(baseline), Some((body, current))) = (self.baseline, observation.membership) {
+            if baseline.desktop != self.destination_desktop
+                && self.desktop_attempted
+                && self.desktop_dispatched
+                && body == self.destination_desktop
+                && current == self.destination_desktop
+            {
+                // Checked transport is neither necessary nor sufficient for this.
+                self.proof.history.relocation_confirmed = true;
+            }
+        }
+        if let Some(reason) = self.invalidated {
+            return HereDecision::Invalid(reason);
+        }
+        let layout = match layout {
+            Ok(layout) => layout,
+            Err(reason) => return self.invalidate_here(reason),
+        };
+        if self.destination_desktop == NO_DESTINATION
+            || self.destination_desktop >= layout.desktop_count
+            || layout.destination_desktop != self.destination_desktop
+            || layout.current_desktop != self.destination_desktop
+            || self.layout.is_some_and(|admitted| admitted != layout)
+        {
+            return self.invalidate_here(Reason::LayoutChanged);
+        }
+        match observation.visibility {
+            Visibility::Destroyed => return self.invalidate_here(Reason::BodyDestroyed),
+            Visibility::Withdrawn => return self.invalidate_here(Reason::Withdrawn),
+            _ => {}
+        }
+        let Some((body, current)) = observation.membership else {
+            return if self.baseline.is_none() {
+                self.invalidate_here(Reason::Unverifiable)
+            } else {
+                HereDecision::Pending
+            };
+        };
+        if body == NO_DESTINATION {
+            return self.invalidate_here(Reason::Unsupported);
+        }
+        if current != self.destination_desktop || body >= layout.desktop_count {
+            return self.invalidate_here(Reason::LayoutChanged);
+        }
+        let minimized = match observation.visibility {
+            Visibility::Minimized => Some(true),
+            Visibility::NotMinimizedHere if body == current => Some(false),
+            Visibility::NotMinimizedElsewhere if body != current => Some(false),
+            _ => None,
+        };
+        let layer_known = matches!(
+            observation.layer,
+            LayerObservation::Normal | LayerObservation::Above | LayerObservation::Below
+        );
+        if self.baseline.is_none() {
+            let Some(minimized) = minimized.filter(|_| layer_known) else {
+                return self.invalidate_here(Reason::Unverifiable);
+            };
+            self.baseline = Some(PlacementBaseline {
+                desktop: body,
+                minimized,
+                layer: observation.layer,
+            });
+            self.layout = Some(layout);
+        }
+        let baseline = self.baseline.unwrap();
+        let destination = body == self.destination_desktop;
+        if body != baseline.desktop && !destination
+            || (destination && baseline.desktop != body && !self.desktop_dispatched)
+            || (!destination && self.proof.history.relocation_confirmed)
+        {
+            return self.invalidate_here(Reason::LayoutChanged);
+        }
+        if layer_known && baseline.layer != observation.layer {
+            return self.invalidate_here(Reason::LayerChanged);
+        }
+        if minimized.is_some_and(|minimized| minimized != baseline.minimized) {
+            return self.invalidate_here(Reason::Unverifiable);
+        }
+        self.proof.current = PlacementConfirmation {
+            destination,
+            layer_preserved: layer_known,
+            minimization_preserved: minimized == Some(true),
+            geometry: GeometryProof::Unknown,
+        };
+        self.original_confirmed = !destination && minimized.is_some() && layer_known;
+        self.local_geometry_eligible = destination && minimized == Some(false) && layer_known;
+        if minimized.is_none() || !layer_known {
+            HereDecision::Pending
+        } else if destination {
+            HereDecision::Destination
+        } else {
+            HereDecision::Original
+        }
+    }
+
+    /// Called only after the host reports a fully settled checked empty fence.
+    pub fn here_fenced(&mut self) -> bool {
+        if self.here_phase != HerePhase::Observe
+            || self.baseline.is_none()
+            || self.invalidated.is_some()
+        {
+            return false;
+        }
+        self.here_phase = HerePhase::Fenced;
+        self.request_here_observation();
+        true
+    }
+
+    /// Called after cookie acquisition, before checking, then again on success.
+    /// Consumed authority is independent of both possible dispatch and its check.
+    pub fn record_here_desktop_transport(
+        &mut self,
+        possible_dispatch: bool,
+        checked: bool,
+    ) -> bool {
+        if !self.desktop_attempted || (checked && !possible_dispatch) {
+            return false;
+        }
+        self.desktop_dispatched |= possible_dispatch;
+        self.desktop_checked |= checked;
+        if checked && self.here_phase == HerePhase::DesktopAttempted {
+            self.here_phase = HerePhase::AwaitDestination;
+        }
+        self.request_here_observation();
+        true
+    }
+
+    pub fn begin_here_geometry(&mut self) -> bool {
+        if !matches!(
+            self.here_phase,
+            HerePhase::Fenced | HerePhase::AwaitDestination
+        ) || self.invalidated.is_some()
+            || self.observe
+            || !self.proof.current.destination
+            || !self.proof.current.layer_preserved
+            || !self.local_geometry_eligible
+            || !self.baseline.is_some_and(|b| !b.minimized)
+        {
+            return false;
+        }
+        self.here_phase = HerePhase::Geometry;
+        true
+    }
+
+    /// Fresh actual fixed-size root geometry, not ConfigureNotify coordinates.
+    /// Also usable on the safe local no-op path without pretending to fence.
+    pub fn confirm_here_geometry(&mut self, origin: Point, size: Size) -> bool {
+        let valid = self.invalidated.is_none()
+            && !self.observe
+            && self.proof.current.destination
+            && self.proof.current.layer_preserved
+            && self.local_geometry_eligible
+            && self.baseline.is_some_and(|b| !b.minimized)
+            && self
+                .layout
+                .is_some_and(|l| l.body_size == size && l.valid_origins.contains(origin))
+            && self.correction.is_none_or(|(target, _)| target == origin);
+        self.proof.current.geometry = if valid {
+            GeometryProof::Verified
+        } else {
+            GeometryProof::Unknown
+        };
+        valid
+    }
+
+    pub fn defer_here_geometry(&mut self) -> bool {
+        if self.invalidated.is_some()
+            || self.observe
+            || self.here_phase == HerePhase::Observe
+            || !self.proof.current.destination
+            || !self.proof.current.layer_preserved
+            || !self.proof.current.minimization_preserved
+        {
+            return false;
+        }
+        self.proof.current.geometry = GeometryProof::Deferred;
+        true
+    }
+
+    /// Select the exact accepted partition, then use the unchanged validator.
+    /// The caller supplies coherent fresh visibility/input evidence in detail
+    /// and confirmation; phases, dispatch and correction never supply it.
+    pub fn here_result(
+        &self,
+        mut detail: Detail,
+        confirmed: Confirmation,
+    ) -> Result<OperationResult, ResultError> {
+        detail.placement = self.proof;
+        detail.progress.host_mutation_dispatched |= self.desktop_dispatched;
+        let success = Detail {
+            reason: Reason::None,
+            ..detail
+        };
+        if let Ok(result) = OperationResult::placement(
+            Command::BringHere,
+            Status::Success,
+            success,
+            confirmed,
+            self,
+        ) {
+            return Ok(result);
+        }
+        OperationResult::placement(
+            Command::BringHere,
+            if self.proof.history.relocation_confirmed {
+                Status::Partial
+            } else {
+                Status::Failed
+            },
+            detail,
+            confirmed,
+            self,
+        )
+    }
+}
+
+impl ActiveOperation {
+    fn here_mutation_eligible(&self, now: Instant) -> bool {
+        self.request.command == Command::BringHere
+            && now < self.deadline
+            && self.placement.invalidated.is_none()
+            && !self.placement.observe
+    }
+
+    pub fn consume_here_desktop_attempt(&mut self, now: Instant) -> bool {
+        let eligible = self.here_mutation_eligible(now);
+        let p = &mut self.placement;
+        if !eligible
+            || p.here_phase != HerePhase::Fenced
+            || p.desktop_attempted
+            || !p.original_confirmed
+            || !p
+                .baseline
+                .is_some_and(|b| b.desktop != p.destination_desktop)
+        {
+            return false;
+        }
+        p.desktop_attempted = true;
+        p.here_phase = HerePhase::DesktopAttempted;
+        p.request_here_observation();
+        true
+    }
+
+    pub fn consume_here_correction(&mut self, target: Point, now: Instant) -> bool {
+        // Reserve the entire future host confirmation interval before consuming.
+        let Some(deadline) = now.checked_add(Duration::from_millis(150)) else {
+            return false;
+        };
+        let eligible = self.here_mutation_eligible(now) && deadline <= self.deadline;
+        let p = &mut self.placement;
+        if !eligible
+            || p.here_phase != HerePhase::Geometry
+            || p.correction.is_some()
+            || !p.proof.current.destination
+            || !p.proof.current.layer_preserved
+            || !p.local_geometry_eligible
+            || !p.layout.is_some_and(|l| l.valid_origins.contains(target))
+            || !p.baseline.is_some_and(|b| !b.minimized)
+        {
+            return false;
+        }
+        p.correction = Some((target, deadline));
+        p.request_here_observation();
+        true
+    }
+
+    pub fn consume_here_input_enable(&mut self, now: Instant) -> bool {
+        if !self.here_mutation_eligible(now)
+            || self.placement.here_phase != HerePhase::Geometry
+            || !self.placement.proof.current.destination
+            || !self.placement.proof.current.layer_preserved
+            || self.placement.proof.current.geometry != GeometryProof::Verified
+        {
+            return false;
+        }
+        self.placement.here_phase = HerePhase::EnablingInput;
+        true
+    }
+
+    /// Checked native restoration is historical bookkeeping, not input readiness
+    /// proof. Final fresh observation and runtime safety still decide Success.
+    pub fn here_input_restored(&mut self) -> bool {
+        if self.placement.here_phase != HerePhase::EnablingInput
+            || self.placement.invalidated.is_some()
+        {
+            return false;
+        }
+        self.placement.here_phase = HerePhase::InputRestored;
+        self.placement.request_here_observation();
+        true
+    }
+
+    pub fn here_shutdown(&mut self, reason: Reason) -> Result<OperationResult, ResultError> {
+        self.placement.invalidate_here(reason);
+        let dispatched = self.detail.progress.host_mutation_dispatched;
+        self.stage = Stage::Shutdown;
+        self.detail = preflight_detail(reason, Stage::Shutdown);
+        self.detail.progress.host_mutation_dispatched = dispatched;
+        self.detail.placement = self.placement.proof;
+        self.placement
+            .here_result(self.detail, Confirmation::default())
     }
 }
 
@@ -656,11 +1094,7 @@ pub fn admit(
         request,
         stage: Stage::Preflight,
         deadline: now + request.command.owner_budget(),
-        placement: PlacementProgress {
-            destination_desktop,
-            baseline: None,
-            proof: PlacementProof::default(),
-        },
+        placement: PlacementProgress::new(destination_desktop),
         recover_phase: RecoverPhase::Here,
         detail: preflight_detail(Reason::Unsupported, Stage::Preflight),
         show: ShowProgress {
@@ -2578,6 +3012,903 @@ mod tests {
 }
 
 #[cfg(test)]
+mod here_progression_tests {
+    use super::*;
+
+    const TARGET: u32 = 1;
+    const ORIGINAL: u32 = 0;
+    const THIRD: u32 = 2;
+    const ORIGIN: Point = Point::new(-100, 50);
+    const SIZE: Size = Size::new(160, 160);
+
+    fn layout() -> DestinationIdentity {
+        DestinationIdentity {
+            desktop_count: 4,
+            destination_desktop: TARGET,
+            current_desktop: TARGET,
+            monitor_name: 9,
+            monitor_bounds: Rect::new(-500, 0, 1000, 800),
+            target_workarea: Some(Rect::new(-500, 40, 1000, 760)),
+            viewport: DestinationViewport::AllZero,
+            usable_area: Rect::new(-500, 40, 1000, 760),
+            body_size: SIZE,
+            valid_origins: ValidOriginBounds::new(-500, 340, 40, 640),
+        }
+    }
+
+    fn observation(body: u32, minimized: bool, layer: LayerObservation) -> HereObservation {
+        HereObservation {
+            membership: Some((body, TARGET)),
+            visibility: if minimized {
+                Visibility::Minimized
+            } else if body == TARGET {
+                Visibility::NotMinimizedHere
+            } else {
+                Visibility::NotMinimizedElsewhere
+            },
+            layer,
+        }
+    }
+
+    fn operation() -> (ActiveOperation, Instant) {
+        let now = Instant::now();
+        let mut active = None;
+        assert_eq!(
+            admit(
+                &mut active,
+                Request {
+                    command: Command::BringHere,
+                    request_id: 1,
+                    reply_xid: 2,
+                    epoch: 3
+                },
+                TARGET,
+                Lifecycle::Ready,
+                false,
+                now,
+            ),
+            Admission::Admitted
+        );
+        (active.unwrap(), now)
+    }
+
+    fn fenced(body: u32, minimized: bool, layer: LayerObservation) -> (ActiveOperation, Instant) {
+        let (mut op, now) = operation();
+        let sample = observation(body, minimized, layer);
+        let decision = if body == TARGET {
+            HereDecision::Destination
+        } else {
+            HereDecision::Original
+        };
+        assert_eq!(op.placement.observe_here(Ok(layout()), sample), decision);
+        assert!(op.placement.here_fenced());
+        // A fence transition requires another fresh observation before mutation.
+        assert!(!op.consume_here_desktop_attempt(now));
+        assert_eq!(op.placement.observe_here(Ok(layout()), sample), decision);
+        (op, now)
+    }
+
+    fn attempted(
+        minimized: bool,
+        layer: LayerObservation,
+        dispatched: bool,
+        checked: bool,
+    ) -> (ActiveOperation, Instant) {
+        let (mut op, now) = fenced(ORIGINAL, minimized, layer);
+        assert!(op.consume_here_desktop_attempt(now));
+        assert!(op
+            .placement
+            .record_here_desktop_transport(dispatched, checked));
+        (op, now)
+    }
+
+    fn arrived(minimized: bool, layer: LayerObservation) -> (ActiveOperation, Instant) {
+        let (mut op, now) = attempted(minimized, layer, true, true);
+        assert_eq!(
+            op.placement
+                .observe_here(Ok(layout()), observation(TARGET, minimized, layer)),
+            HereDecision::Destination
+        );
+        (op, now)
+    }
+
+    fn visible_detail(layer: LayerObservation, ready: bool) -> (Detail, Confirmation) {
+        (
+            Detail {
+                visibility: Visibility::NotMinimizedHere,
+                workspace: Workspace::Current,
+                layer,
+                progress: Progress {
+                    not_minimized_confirmed: true,
+                    input_ready: ready,
+                    ..Progress::default()
+                },
+                ..preflight_detail(Reason::ConfirmationTimeout, Stage::Placement)
+            },
+            Confirmation {
+                visibility: Some(ConfirmedVisibility::NotMinimizedHere),
+                above: false,
+            },
+        )
+    }
+
+    fn incomplete(op: &ActiveOperation) -> OperationResult {
+        let p = op.placement.proof.current;
+        op.placement
+            .here_result(
+                Detail {
+                    workspace: if p.destination {
+                        Workspace::Current
+                    } else {
+                        Workspace::Unknown
+                    },
+                    layer: if p.layer_preserved {
+                        op.placement.baseline.unwrap().layer
+                    } else {
+                        LayerObservation::Unknown
+                    },
+                    ..preflight_detail(Reason::LayoutChanged, Stage::Placement)
+                },
+                Confirmation::default(),
+            )
+            .unwrap()
+    }
+
+    fn assert_wire(result: OperationResult) {
+        let terminal = TerminalResponse {
+            status: result.status(),
+            detail: result.detail(),
+            request_id: 1,
+            control_xid: 2,
+        };
+        assert_eq!(
+            TerminalResponse::decode(&terminal.encode().unwrap()),
+            Ok(terminal)
+        );
+    }
+
+    #[test]
+    fn admission_is_value_only_without_mutation_authority_and_keeps_budgets() {
+        fn is_copy<T: Copy>(_: T) {}
+        let (mut op, now) = operation();
+        is_copy(op);
+        let deadline = op.deadline;
+        assert_eq!(deadline, now + Duration::from_millis(3500));
+        assert_eq!(
+            Command::BringHere.caller_budget(),
+            Duration::from_millis(5000)
+        );
+        assert_eq!(op.placement.here_phase, HerePhase::Observe);
+        assert!(!op.consume_here_desktop_attempt(now));
+        assert!(!op.consume_here_correction(ORIGIN, now));
+        assert!(!op.consume_here_input_enable(now));
+        assert!(!op.placement.record_here_desktop_transport(true, true));
+        assert!(!op.placement.here_fenced());
+        assert_eq!(op.placement.proof, PlacementProof::default());
+        let mut active = Some(op);
+        assert_eq!(
+            admit(
+                &mut active,
+                op.request,
+                TARGET,
+                Lifecycle::Ready,
+                false,
+                now + Duration::from_secs(1)
+            ),
+            Admission::Duplicate
+        );
+        assert_eq!(active.unwrap().deadline, deadline);
+        let mut other = op.request;
+        other.request_id += 1;
+        assert_eq!(
+            admit(&mut active, other, TARGET, Lifecycle::Ready, false, now),
+            Admission::Reply(Status::Busy, Reason::Busy, Stage::Preflight)
+        );
+    }
+
+    #[test]
+    fn every_relevant_layout_identity_change_latches_without_replacing_admission() {
+        for field in 0..11 {
+            let (mut op, now) = fenced(ORIGINAL, false, LayerObservation::Normal);
+            let baseline = op.placement.baseline;
+            let mut changed = layout();
+            match field {
+                0 => changed.desktop_count += 1,
+                1 => changed.destination_desktop = THIRD,
+                2 => changed.current_desktop = THIRD,
+                3 => changed.monitor_name += 1,
+                4 => changed.monitor_bounds.x += 1,
+                5 => changed.target_workarea = None,
+                6 => changed.target_workarea.as_mut().unwrap().height -= 1,
+                7 => changed.viewport = DestinationViewport::Absent,
+                8 => changed.usable_area.width -= 1,
+                9 => changed.body_size.width += 1,
+                10 => changed.valid_origins.max_x -= 1,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                op.placement.observe_here(
+                    Ok(changed),
+                    observation(ORIGINAL, false, LayerObservation::Normal)
+                ),
+                HereDecision::Invalid(Reason::LayoutChanged)
+            );
+            assert_eq!(
+                op.placement.observe_here(
+                    Ok(layout()),
+                    observation(ORIGINAL, false, LayerObservation::Normal)
+                ),
+                HereDecision::Invalid(Reason::LayoutChanged)
+            );
+            assert_eq!(op.placement.layout, Some(layout()));
+            assert_eq!(op.placement.baseline, baseline);
+            assert_eq!(op.placement.destination_desktop, TARGET);
+            assert!(!op.consume_here_desktop_attempt(now));
+        }
+    }
+
+    #[test]
+    fn safe_local_noop_can_succeed_without_fencing_or_relocation() {
+        for layer in [
+            LayerObservation::Normal,
+            LayerObservation::Above,
+            LayerObservation::Below,
+        ] {
+            let (mut op, now) = operation();
+            assert_eq!(
+                op.placement
+                    .observe_here(Ok(layout()), observation(TARGET, false, layer)),
+                HereDecision::Destination
+            );
+            assert!(!op.consume_here_desktop_attempt(now));
+            assert!(op.placement.confirm_here_geometry(ORIGIN, SIZE));
+            let (d, c) = visible_detail(layer, true);
+            let result = op.placement.here_result(d, c).unwrap();
+            assert_eq!(result.status(), Status::Success);
+            assert!(!result.detail().progress.host_mutation_dispatched);
+            assert_eq!(op.placement.proof.history, RecoveryHistory::default());
+            assert_eq!(op.placement.here_phase, HerePhase::Observe);
+            assert_wire(result);
+        }
+    }
+
+    #[test]
+    fn desktop_attempt_is_consumed_once_for_send_failure_check_failure_and_success() {
+        for (dispatched, checked) in [(false, false), (true, false), (true, true)] {
+            let (mut op, now) = attempted(false, LayerObservation::Normal, dispatched, checked);
+            let baseline = op.placement.baseline;
+            let deadline = op.deadline;
+            assert_eq!(
+                op.placement.here_phase,
+                if checked {
+                    HerePhase::AwaitDestination
+                } else {
+                    HerePhase::DesktopAttempted
+                }
+            );
+            assert!(!op.placement.record_here_desktop_transport(false, true));
+            for _ in 0..3 {
+                assert_eq!(
+                    op.placement.observe_here(
+                        Ok(layout()),
+                        observation(ORIGINAL, false, LayerObservation::Normal)
+                    ),
+                    HereDecision::Original
+                );
+                assert!(!op.consume_here_desktop_attempt(now));
+                assert!(!op.placement.here_fenced());
+                assert!(!op.placement.proof.history.relocation_confirmed);
+                op.placement.request_here_observation();
+            }
+            assert_eq!(op.placement.baseline, baseline);
+            assert_eq!(op.deadline, deadline);
+            assert!(!op.consume_here_desktop_attempt(deadline));
+        }
+    }
+
+    #[test]
+    fn target_before_our_dispatch_is_external_interruption_without_history() {
+        for attempted in [false, true] {
+            let (mut op, now) = fenced(ORIGINAL, false, LayerObservation::Normal);
+            if attempted {
+                assert!(op.consume_here_desktop_attempt(now));
+            }
+            assert_eq!(
+                op.placement.observe_here(
+                    Ok(layout()),
+                    observation(TARGET, false, LayerObservation::Normal)
+                ),
+                HereDecision::Invalid(Reason::LayoutChanged)
+            );
+            assert_eq!(incomplete(&op).status(), Status::Failed);
+            assert!(!op.consume_here_desktop_attempt(now));
+            assert_eq!(op.placement.baseline.unwrap().desktop, ORIGINAL);
+        }
+    }
+
+    #[test]
+    fn dispatch_and_checked_completion_do_not_confirm_relocation() {
+        for checked in [false, true] {
+            let (mut op, now) = attempted(false, LayerObservation::Normal, true, checked);
+            assert!(!op.placement.proof.history.relocation_confirmed);
+            op.placement.clear_current();
+            let result = incomplete(&op);
+            assert_eq!(result.status(), Status::Failed);
+            assert!(result.detail().progress.host_mutation_dispatched);
+            // A fresh target read can justify history even after a checked error.
+            assert_eq!(
+                op.placement.observe_here(
+                    Ok(layout()),
+                    observation(TARGET, false, LayerObservation::Normal)
+                ),
+                HereDecision::Destination
+            );
+            assert!(op.placement.proof.history.relocation_confirmed);
+            assert!(!op.placement.proof.history.restoration_confirmed);
+            assert!(!op.consume_here_desktop_attempt(now));
+        }
+    }
+
+    #[test]
+    fn third_or_sticky_desktop_never_creates_history_or_retry_authority() {
+        for body in [THIRD, NO_DESTINATION] {
+            let (mut op, now) = attempted(false, LayerObservation::Normal, true, true);
+            assert_eq!(
+                op.placement.observe_here(
+                    Ok(layout()),
+                    observation(body, false, LayerObservation::Normal)
+                ),
+                HereDecision::Invalid(if body == NO_DESTINATION {
+                    Reason::Unsupported
+                } else {
+                    Reason::LayoutChanged
+                })
+            );
+            assert_eq!(op.placement.proof, PlacementProof::default());
+            assert_eq!(op.placement.baseline.unwrap().desktop, ORIGINAL);
+            assert_eq!(op.placement.destination_desktop, TARGET);
+            assert!(!op.consume_here_desktop_attempt(now));
+        }
+    }
+
+    #[test]
+    fn destination_then_original_third_or_missing_evidence_retains_only_history() {
+        for membership in [Some((ORIGINAL, TARGET)), Some((THIRD, TARGET)), None] {
+            let (mut op, now) = arrived(false, LayerObservation::Normal);
+            assert!(op.placement.confirm_here_geometry(ORIGIN, SIZE));
+            let decision = op.placement.observe_here(
+                Ok(layout()),
+                HereObservation {
+                    membership,
+                    ..observation(TARGET, false, LayerObservation::Normal)
+                },
+            );
+            assert_eq!(
+                decision,
+                if membership.is_none() {
+                    HereDecision::Pending
+                } else {
+                    HereDecision::Invalid(Reason::LayoutChanged)
+                }
+            );
+            assert_eq!(op.placement.proof.current, PlacementConfirmation::default());
+            let result = incomplete(&op);
+            assert_eq!(result.status(), Status::Partial);
+            assert_wire(result);
+            assert!(!op.consume_here_desktop_attempt(now));
+        }
+    }
+
+    #[test]
+    fn sticky_and_unsettled_initial_evidence_cannot_become_baseline() {
+        for sample in [
+            observation(NO_DESTINATION, false, LayerObservation::Normal),
+            observation(ORIGINAL, false, LayerObservation::Conflict),
+            HereObservation {
+                visibility: Visibility::Transitional,
+                ..observation(ORIGINAL, false, LayerObservation::Normal)
+            },
+            HereObservation {
+                membership: None,
+                ..observation(ORIGINAL, false, LayerObservation::Normal)
+            },
+            observation(layout().desktop_count, false, LayerObservation::Normal),
+        ] {
+            let (mut op, now) = operation();
+            assert!(matches!(
+                op.placement.observe_here(Ok(layout()), sample),
+                HereDecision::Invalid(_)
+            ));
+            assert_eq!(op.placement.baseline, None);
+            assert_eq!(op.placement.layout, None);
+            assert!(!op.placement.here_fenced());
+            assert!(!op.consume_here_desktop_attempt(now));
+            assert_eq!(incomplete(&op).status(), Status::Failed);
+        }
+    }
+
+    #[test]
+    fn layer_or_genuine_minimization_drift_invalidates_without_rewriting_baseline() {
+        for minimized in [false, true] {
+            for layer_drift in [false, true] {
+                let (mut op, now) = attempted(minimized, LayerObservation::Above, true, true);
+                let baseline = op.placement.baseline;
+                let sample = observation(
+                    TARGET,
+                    if layer_drift { minimized } else { !minimized },
+                    if layer_drift {
+                        LayerObservation::Below
+                    } else {
+                        LayerObservation::Above
+                    },
+                );
+                assert_eq!(
+                    op.placement.observe_here(Ok(layout()), sample),
+                    HereDecision::Invalid(if layer_drift {
+                        Reason::LayerChanged
+                    } else {
+                        Reason::Unverifiable
+                    })
+                );
+                assert_eq!(op.placement.baseline, baseline);
+                assert_eq!(op.placement.proof.current, PlacementConfirmation::default());
+                assert!(op.placement.proof.history.relocation_confirmed);
+                assert!(!op.placement.proof.history.restoration_confirmed);
+                assert!(!op.consume_here_desktop_attempt(now));
+                assert_eq!(incomplete(&op).status(), Status::Partial);
+            }
+        }
+    }
+
+    #[test]
+    fn independent_membership_history_survives_rejected_layout_but_stale_current_cannot_create_it()
+    {
+        for current in [TARGET, THIRD] {
+            let (mut op, _) = attempted(false, LayerObservation::Normal, true, true);
+            assert_eq!(
+                op.placement.observe_here(
+                    Err(Reason::LayoutChanged),
+                    HereObservation {
+                        membership: Some((TARGET, current)),
+                        ..observation(TARGET, false, LayerObservation::Normal)
+                    }
+                ),
+                HereDecision::Invalid(Reason::LayoutChanged)
+            );
+            assert_eq!(
+                op.placement.proof.history.relocation_confirmed,
+                current == TARGET
+            );
+            assert_eq!(
+                incomplete(&op).status(),
+                if current == TARGET {
+                    Status::Partial
+                } else {
+                    Status::Failed
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn transitional_target_can_prove_membership_without_geometry_or_input_authority() {
+        let (mut op, now) = attempted(false, LayerObservation::Normal, true, true);
+        assert_eq!(
+            op.placement.observe_here(
+                Ok(layout()),
+                HereObservation {
+                    visibility: Visibility::Transitional,
+                    ..observation(TARGET, false, LayerObservation::Normal)
+                }
+            ),
+            HereDecision::Pending
+        );
+        assert!(op.placement.proof.current.destination);
+        assert!(op.placement.proof.history.relocation_confirmed);
+        assert!(!op.placement.begin_here_geometry());
+        assert!(!op.placement.confirm_here_geometry(ORIGIN, SIZE));
+        assert!(!op.consume_here_correction(ORIGIN, now));
+        assert!(!op.consume_here_input_enable(now));
+        assert_eq!(incomplete(&op).status(), Status::Partial);
+    }
+
+    #[test]
+    fn minimized_deferred_success_preserves_above_without_above_confirmation() {
+        for body in [ORIGINAL, TARGET] {
+            for layer in [
+                LayerObservation::Normal,
+                LayerObservation::Above,
+                LayerObservation::Below,
+            ] {
+                let (mut op, now) = if body == ORIGINAL {
+                    arrived(true, layer)
+                } else {
+                    fenced(body, true, layer)
+                };
+                assert!(!op.placement.begin_here_geometry());
+                assert!(!op.consume_here_correction(ORIGIN, now));
+                assert!(!op.consume_here_input_enable(now));
+                assert!(op.placement.defer_here_geometry());
+                let d = Detail {
+                    visibility: Visibility::Minimized,
+                    workspace: Workspace::Current,
+                    layer,
+                    progress: Progress {
+                        placement_deferred: true,
+                        ..Progress::default()
+                    },
+                    ..preflight_detail(Reason::None, Stage::Placement)
+                };
+                let c = Confirmation {
+                    visibility: Some(ConfirmedVisibility::Minimized),
+                    above: false,
+                };
+                let result = op.placement.here_result(d, c).unwrap();
+                assert_eq!(result.status(), Status::Success);
+                assert_eq!(
+                    result.detail().placement.history.relocation_confirmed,
+                    body == ORIGINAL
+                );
+                assert!(!result.detail().placement.history.restoration_confirmed);
+                assert!(!result.detail().progress.above_confirmed);
+                assert_wire(result);
+                assert!(op
+                    .placement
+                    .here_result(
+                        Detail {
+                            progress: Progress {
+                                above_confirmed: true,
+                                ..d.progress
+                            },
+                            ..d
+                        },
+                        Confirmation { above: true, ..c }
+                    )
+                    .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn visible_completion_with_relocation_history_is_success_and_loss_is_partial() {
+        let (mut op, _) = arrived(false, LayerObservation::Normal);
+        assert!(op.placement.confirm_here_geometry(ORIGIN, SIZE));
+        let (d, c) = visible_detail(LayerObservation::Normal, true);
+        let result = op.placement.here_result(d, c).unwrap();
+        assert_eq!(result.status(), Status::Success);
+        assert!(result.detail().placement.history.relocation_confirmed);
+        assert_wire(result);
+        op.placement.clear_current();
+        assert_eq!(incomplete(&op).status(), Status::Partial);
+    }
+
+    #[test]
+    fn local_correction_is_one_shot_and_never_creates_partial_authority() {
+        let (mut op, now) = fenced(TARGET, false, LayerObservation::Normal);
+        assert!(op.placement.begin_here_geometry());
+        assert!(!op.consume_here_correction(Point::new(9999, 9999), now));
+        assert!(op.consume_here_correction(ORIGIN, now));
+        let correction = op.placement.correction;
+        // Failure before cookie acquisition still consumes this correction.
+        for _ in 0..3 {
+            assert_eq!(
+                op.placement.observe_here(
+                    Ok(layout()),
+                    observation(TARGET, false, LayerObservation::Normal)
+                ),
+                HereDecision::Destination
+            );
+            assert!(!op.consume_here_correction(ORIGIN, now));
+            assert_eq!(op.placement.correction, correction);
+            assert!(!op.placement.confirm_here_geometry(Point::new(0, 50), SIZE));
+            assert!(!op
+                .placement
+                .confirm_here_geometry(ORIGIN, Size::new(161, 160)));
+        }
+        assert!(op.placement.confirm_here_geometry(ORIGIN, SIZE));
+        let (mut d, c) = visible_detail(LayerObservation::Normal, true);
+        d.progress.host_mutation_dispatched = true; // geometry dispatch is not relocation
+        assert_eq!(
+            op.placement.here_result(d, c).unwrap().status(),
+            Status::Success
+        );
+        op.placement.clear_current();
+        let failed = incomplete(&op);
+        assert_eq!(failed.status(), Status::Failed);
+        assert_eq!(op.placement.proof.history, RecoveryHistory::default());
+        assert_wire(failed);
+        assert!(!op.consume_here_desktop_attempt(now));
+    }
+
+    #[test]
+    fn correction_reserves_full_interval_and_never_renews_owner_deadline() {
+        for remaining in [0, 1, 149, 150, 151] {
+            let (mut op, _) = fenced(TARGET, false, LayerObservation::Normal);
+            assert!(op.placement.begin_here_geometry());
+            let deadline = op.deadline;
+            let now = deadline - Duration::from_millis(remaining);
+            assert_eq!(op.consume_here_correction(ORIGIN, now), remaining >= 150);
+            assert_eq!(op.deadline, deadline);
+            if remaining >= 150 {
+                let correction = op.placement.correction.unwrap();
+                assert_eq!(correction.1, now + Duration::from_millis(150));
+                assert!(correction.1 <= deadline);
+                op.placement.observe_here(
+                    Ok(layout()),
+                    observation(TARGET, false, LayerObservation::Normal),
+                );
+                assert!(!op.consume_here_correction(ORIGIN, now));
+                assert_eq!(op.placement.correction, Some(correction));
+            } else {
+                assert_eq!(op.placement.correction, None);
+            }
+        }
+    }
+
+    #[test]
+    fn all_phases_require_fresh_proof_and_input_enable_cannot_repeat() {
+        let (mut op, now) = arrived(false, LayerObservation::Normal);
+        assert!(!op.consume_here_input_enable(now));
+        assert!(op.placement.begin_here_geometry());
+        assert!(!op.consume_here_input_enable(now));
+        assert!(op.placement.confirm_here_geometry(ORIGIN, SIZE));
+        assert!(!op.consume_here_input_enable(op.deadline));
+        assert!(op.consume_here_input_enable(now));
+        assert_eq!(op.placement.here_phase, HerePhase::EnablingInput);
+        assert!(!op.consume_here_input_enable(now));
+        assert!(op.here_input_restored());
+        assert_eq!(op.placement.here_phase, HerePhase::InputRestored);
+        assert_eq!(op.placement.proof.current, PlacementConfirmation::default());
+        assert!(!op.here_input_restored());
+        op.placement.observe_here(
+            Ok(layout()),
+            observation(TARGET, false, LayerObservation::Normal),
+        );
+        assert!(op.placement.confirm_here_geometry(ORIGIN, SIZE));
+        assert!(!op.consume_here_input_enable(now));
+        let (d, c) = visible_detail(LayerObservation::Normal, true);
+        assert_eq!(
+            op.placement.here_result(d, c).unwrap().status(),
+            Status::Success
+        );
+        assert!(!op.placement.proof.history.restoration_confirmed);
+    }
+
+    #[test]
+    fn shutdown_clears_previously_complete_proof_and_keeps_exact_history_partition() {
+        for relocated in [false, true] {
+            let (mut op, now) = if relocated {
+                arrived(false, LayerObservation::Above)
+            } else {
+                fenced(TARGET, false, LayerObservation::Above)
+            };
+            assert!(op.placement.confirm_here_geometry(ORIGIN, SIZE));
+            let (d, c) = visible_detail(LayerObservation::Above, true);
+            assert_eq!(
+                op.placement.here_result(d, c).unwrap().status(),
+                Status::Success
+            );
+            op.detail = d;
+            for reason in [
+                Reason::Closing,
+                Reason::X11Failure,
+                Reason::BodyDestroyed,
+                Reason::OwnershipLost,
+            ] {
+                let mut shutdown = op;
+                let result = shutdown.here_shutdown(reason).unwrap();
+                assert_eq!(
+                    result.status(),
+                    if relocated {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    }
+                );
+                assert_eq!(result.detail().stage, Stage::Shutdown);
+                assert_eq!(
+                    result.detail().placement.current,
+                    PlacementConfirmation::default()
+                );
+                assert!(!result.detail().progress.input_ready);
+                assert!(!result.detail().progress.above_confirmed);
+                assert_wire(result);
+                assert!(matches!(
+                    shutdown.placement.observe_here(
+                        Ok(layout()),
+                        observation(TARGET, false, LayerObservation::Above)
+                    ),
+                    HereDecision::Invalid(_)
+                ));
+                assert!(!shutdown.placement.confirm_here_geometry(ORIGIN, SIZE));
+                assert!(!shutdown.consume_here_desktop_attempt(now));
+            }
+        }
+    }
+
+    #[test]
+    fn fatal_teardown_can_add_late_history_without_recreating_current_success() {
+        let (mut op, _) = attempted(true, LayerObservation::Above, true, false);
+        assert_eq!(
+            op.here_shutdown(Reason::X11Failure).unwrap().status(),
+            Status::Failed
+        );
+        assert_eq!(
+            op.placement.observe_here(
+                Ok(layout()),
+                observation(TARGET, true, LayerObservation::Above)
+            ),
+            HereDecision::Invalid(Reason::X11Failure)
+        );
+        let result = op.here_shutdown(Reason::X11Failure).unwrap();
+        assert_eq!(result.status(), Status::Partial);
+        assert!(result.detail().progress.host_mutation_dispatched);
+        assert!(!op.placement.defer_here_geometry());
+        assert_wire(result);
+    }
+
+    #[test]
+    fn desktop_expiry_does_not_consume_or_renew_authority() {
+        let (mut op, _) = fenced(ORIGINAL, false, LayerObservation::Normal);
+        let deadline = op.deadline;
+        assert!(!op.consume_here_desktop_attempt(deadline));
+        assert!(!op.consume_here_desktop_attempt(deadline + Duration::from_millis(1)));
+        assert!(!op.placement.desktop_attempted);
+        assert!(!op.placement.record_here_desktop_transport(true, true));
+        assert_eq!(op.deadline, deadline);
+        assert_eq!(incomplete(&op).status(), Status::Failed);
+    }
+
+    #[test]
+    fn losing_and_refreshing_evidence_rebuilds_current_proof_without_resetting_attempts() {
+        let (mut op, now) = arrived(false, LayerObservation::Normal);
+        assert!(op.placement.confirm_here_geometry(ORIGIN, SIZE));
+        op.placement.request_here_observation();
+        assert_eq!(op.placement.proof.current, PlacementConfirmation::default());
+        assert_eq!(incomplete(&op).status(), Status::Partial);
+        assert_eq!(
+            op.placement.observe_here(
+                Ok(layout()),
+                observation(TARGET, false, LayerObservation::Normal)
+            ),
+            HereDecision::Destination
+        );
+        assert_eq!(op.placement.proof.current.geometry, GeometryProof::Unknown);
+        assert!(!op.consume_here_desktop_attempt(now));
+        assert!(op.placement.confirm_here_geometry(ORIGIN, SIZE));
+        let (d, c) = visible_detail(LayerObservation::Normal, true);
+        assert_eq!(
+            op.placement.here_result(d, c).unwrap().status(),
+            Status::Success
+        );
+    }
+
+    #[test]
+    fn failed_input_enable_is_consumed_even_when_fresh_evidence_recovers() {
+        let (mut op, now) = arrived(false, LayerObservation::Normal);
+        assert!(op.placement.begin_here_geometry());
+        assert!(op.placement.confirm_here_geometry(ORIGIN, SIZE));
+        assert!(op.consume_here_input_enable(now));
+        // No checked restoration was reported; a later read grants no retry.
+        op.placement.request_here_observation();
+        op.placement.observe_here(
+            Ok(layout()),
+            observation(TARGET, false, LayerObservation::Normal),
+        );
+        assert!(op.placement.confirm_here_geometry(ORIGIN, SIZE));
+        assert!(!op.consume_here_input_enable(now));
+        let (d, c) = visible_detail(LayerObservation::Normal, false);
+        assert_eq!(
+            op.placement.here_result(d, c).unwrap().status(),
+            Status::Partial
+        );
+        assert_eq!(
+            op.here_shutdown(Reason::X11Failure).unwrap().status(),
+            Status::Partial
+        );
+        assert!(!op.here_input_restored());
+    }
+
+    #[test]
+    fn shutdown_at_every_phase_preserves_only_observed_history() {
+        let (observe, now) = operation();
+        let (fence, _) = fenced(ORIGINAL, false, LayerObservation::Normal);
+        let mut attempted = fence;
+        assert!(attempted.consume_here_desktop_attempt(now));
+        let mut waiting = attempted;
+        assert!(waiting.placement.record_here_desktop_transport(true, true));
+        let mut geometry = waiting;
+        geometry.placement.observe_here(
+            Ok(layout()),
+            observation(TARGET, false, LayerObservation::Normal),
+        );
+        assert!(geometry.placement.begin_here_geometry());
+        let mut enabling = geometry;
+        assert!(enabling.placement.confirm_here_geometry(ORIGIN, SIZE));
+        assert!(enabling.consume_here_input_enable(now));
+        let mut restored = enabling;
+        assert!(restored.here_input_restored());
+        for mut op in [
+            observe, fence, attempted, waiting, geometry, enabling, restored,
+        ] {
+            let history = op.placement.proof.history;
+            let result = op.here_shutdown(Reason::Closing).unwrap();
+            assert_eq!(
+                result.status(),
+                if history.relocation_confirmed {
+                    Status::Partial
+                } else {
+                    Status::Failed
+                }
+            );
+            assert_eq!(result.detail().placement.history, history);
+            assert_eq!(
+                result.detail().placement.current,
+                PlacementConfirmation::default()
+            );
+            assert!(!op.consume_here_desktop_attempt(now));
+            assert!(!op.consume_here_correction(ORIGIN, now));
+            assert!(!op.consume_here_input_enable(now));
+            assert_wire(result);
+        }
+    }
+
+    #[test]
+    fn pure_result_selection_still_rejects_inconsistent_confirmation() {
+        let (mut op, _) = arrived(false, LayerObservation::Normal);
+        assert!(op.placement.confirm_here_geometry(ORIGIN, SIZE));
+        let (d, c) = visible_detail(LayerObservation::Normal, true);
+        for bad in [
+            Detail {
+                workspace: Workspace::Other,
+                ..d
+            },
+            Detail {
+                layer: LayerObservation::Above,
+                ..d
+            },
+            Detail {
+                progress: Progress {
+                    above_confirmed: true,
+                    ..d.progress
+                },
+                ..d
+            },
+        ] {
+            assert!(op.placement.here_result(bad, c).is_err());
+        }
+        assert!(op
+            .placement
+            .here_result(d, Confirmation::default())
+            .is_err());
+    }
+
+    #[test]
+    fn destroyed_or_withdrawn_body_is_terminal_even_without_membership_evidence() {
+        for (visibility, reason) in [
+            (Visibility::Destroyed, Reason::BodyDestroyed),
+            (Visibility::Withdrawn, Reason::Withdrawn),
+        ] {
+            let (mut op, now) = arrived(false, LayerObservation::Normal);
+            assert_eq!(
+                op.placement.observe_here(
+                    Ok(layout()),
+                    HereObservation {
+                        membership: None,
+                        visibility,
+                        layer: LayerObservation::Unknown
+                    }
+                ),
+                HereDecision::Invalid(reason)
+            );
+            assert_eq!(op.placement.proof.current, PlacementConfirmation::default());
+            assert_eq!(incomplete(&op).status(), Status::Partial);
+            assert!(!op.consume_here_desktop_attempt(now));
+        }
+    }
+}
+
+#[cfg(test)]
 mod placement_tests {
     use super::*;
     use std::time::{Duration, Instant};
@@ -2615,13 +3946,12 @@ mod placement_tests {
     }
     fn progress() -> PlacementProgress {
         PlacementProgress {
-            destination_desktop: 7,
             baseline: Some(PlacementBaseline {
                 desktop: 2,
                 minimized: true,
                 layer: LayerObservation::Normal,
             }),
-            proof: PlacementProof::default(),
+            ..PlacementProgress::new(7)
         }
     }
     fn complete(command: Command) -> (Detail, Confirmation, PlacementProgress) {
