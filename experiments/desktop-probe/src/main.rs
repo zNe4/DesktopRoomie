@@ -2283,6 +2283,9 @@ fn service_visibility_with(
             Ok(outcome)
         }
         control::Command::BringTop => unreachable!("Bring Top uses the remote composition service"),
+        control::Command::BringHere | control::Command::Recover => {
+            Ok(Some(unsupported_placement(operation)))
+        }
     }
 }
 
@@ -2315,6 +2318,9 @@ fn observe_visibility(
             &mut operation.show.baseline,
             operation.show.layout_interrupted,
         ),
+        control::Command::BringHere | control::Command::Recover => {
+            unreachable!("Stage A has no placement observation")
+        }
     };
     if layout_interrupted {
         return Ok((snapshot, Some(Reason::LayoutChanged)));
@@ -2417,6 +2423,7 @@ fn visibility_observation_eligible(
     let baseline = match operation.request.command {
         control::Command::Hide => operation.hide.baseline,
         control::Command::Show | control::Command::BringTop => operation.show.baseline,
+        control::Command::BringHere | control::Command::Recover => return false,
     };
     baseline.is_some_and(|b| {
         if operation.request.command == control::Command::BringTop {
@@ -3202,11 +3209,29 @@ fn service_remote_with(
     operation: &mut control::ActiveOperation,
     host: &mut impl BringTopHost,
 ) -> Result<Option<control::OperationResult>, HostError> {
+    if matches!(
+        operation.request.command,
+        control::Command::BringHere | control::Command::Recover
+    ) {
+        return Ok(Some(unsupported_placement(operation)));
+    }
     if operation.request.command == control::Command::BringTop {
         service_bring_top_with(operation, host)
     } else {
         service_visibility_with(operation, host)
     }
+}
+
+/// Defense at the service boundary too: no host method is called for Stage A.
+fn unsupported_placement(operation: &control::ActiveOperation) -> control::OperationResult {
+    control::OperationResult::placement(
+        operation.request.command,
+        control::Status::Failed,
+        control::preflight_detail(control::Reason::Unsupported, control::Stage::Preflight),
+        control::Confirmation::default(),
+        &operation.placement,
+    )
+    .expect("Stage A placement commands are unsupported without progress")
 }
 
 /// Retains marked dispatch even when the native check fails. A transitional
@@ -3540,6 +3565,7 @@ fn remote_service_due(operation: &control::ActiveOperation, now: Instant) -> boo
             operation.bring_top.layer_observe
         }
         control::Command::BringTop => operation.show.observe,
+        control::Command::BringHere | control::Command::Recover => true,
     };
     observe || now >= remote_operation_deadline(operation)
 }
@@ -3557,6 +3583,7 @@ fn mark_remote_observation(operation: &mut control::ActiveOperation, layout_inte
             operation.hide.observe = true;
             operation.hide.layout_interrupted |= layout_interrupted;
         }
+        control::Command::BringHere | control::Command::Recover => {}
     }
 }
 
@@ -3658,6 +3685,9 @@ fn service_owner_operation<C: Connection>(
                 operation.detail.reason
             };
             let result = match operation.request.command {
+                control::Command::BringHere | control::Command::Recover => {
+                    unsupported_placement(operation)
+                }
                 control::Command::Hide => hide_result(operation, control::Status::Failed, reason),
                 control::Command::Show => {
                     show_result(operation, control::Status::Failed, reason, None)
@@ -7889,6 +7919,7 @@ mod show_tests {
                     reply_xid: 88,
                     epoch: 7,
                 },
+                crate::control::NO_DESTINATION,
                 Lifecycle::Ready,
                 false,
                 self.now,
@@ -8196,6 +8227,40 @@ mod show_tests {
     fn visible() -> Reading {
         reading(Visibility::NotMinimizedHere, L::Normal, 2, 2)
     }
+    #[test]
+    fn stage_a_placement_service_cannot_call_any_body_host_method() {
+        for command in [Command::BringHere, Command::Recover] {
+            let mut host = Fake::new(visible());
+            let mut active = None;
+            control::admit(
+                &mut active,
+                control::Request {
+                    command,
+                    request_id: 99,
+                    reply_xid: 88,
+                    epoch: 7,
+                },
+                2,
+                Lifecycle::Ready,
+                false,
+                host.now,
+            );
+            let mut operation = active.unwrap();
+            let original = operation;
+            let result = service_remote_with(&mut operation, &mut host)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (result.status(), result.detail().reason),
+                (Status::Failed, Reason::Unsupported)
+            );
+            assert!(host.log.is_empty());
+            assert!(host.mutations.is_empty());
+            assert_eq!(operation, original);
+            assert_eq!(host.runtime.body, BodyAvailability::Ready);
+        }
+    }
+
     fn assert_success(result: control::OperationResult, here: bool, dispatched: bool) {
         assert_eq!(result.status(), Status::Success);
         assert_eq!(result.exit_code(), control::ExitCode::Success);
@@ -10425,7 +10490,14 @@ mod show_tests {
                     return Ok(false);
                 };
                 host.step("request")?;
-                match control::admit(&mut self.active, request, Lifecycle::Ready, false, host.now) {
+                match control::admit(
+                    &mut self.active,
+                    request,
+                    crate::control::NO_DESTINATION,
+                    Lifecycle::Ready,
+                    false,
+                    host.now,
+                ) {
                     control::Admission::Admitted => {
                         host.step("admit")?;
                         let op = self.active.as_mut().unwrap();

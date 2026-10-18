@@ -750,13 +750,13 @@ impl EndpointEvidence {
             && self.class == WindowClass::INPUT_ONLY
             && self.map_state == MapState::UNMAPPED
     }
-    fn words(&self) -> Option<Vec<u32>> {
+    fn words(&self, length: u32) -> Option<Vec<u32>> {
         let p = &self.property;
         if p.type_ != u32::from(AtomEnum::CARDINAL)
             || p.format != 32
-            || p.value_len != 7
+            || p.value_len != length
             || p.bytes_after != 0
-            || p.value.len() != 28
+            || p.value.len() != length as usize * 4
         {
             return None;
         }
@@ -798,7 +798,7 @@ impl<C: Connection> PeerHost for NativePeer<'_, C> {
         // ANY lets validation distinguish wrong types from missing/truncated data.
         let Some(property) = peer_result(
             self.conn
-                .get_property(false, window, property, AtomEnum::ANY, 0, 7)?
+                .get_property(false, window, property, AtomEnum::ANY, 0, 8)?
                 .reply(),
             window,
         )?
@@ -887,7 +887,7 @@ fn validated_route(
     popup: Option<u32>,
     reply: u32,
     words: [u32; 5],
-) -> Option<(Request, Option<Reason>)> {
+) -> Option<(Request, u32, Option<Reason>)> {
     if reply == 0
         || reply == root
         || reply == owner.control_xid
@@ -897,7 +897,7 @@ fn validated_route(
     {
         return None;
     }
-    let marker = CallerMarker::decode(&evidence.words()?).ok()?;
+    let marker = CallerMarker::decode(&evidence.words(8)?).ok()?;
     let id = u64::from(words[1]) | (u64::from(words[2]) << 32);
     if marker.control_xid != owner.control_xid
         || marker.epoch != owner.epoch
@@ -906,8 +906,8 @@ fn validated_route(
     {
         return None;
     }
-    // A v1 marker supplies the safe identity for an incompatible header. Known
-    // commands must still match; an unknown wire command cannot decode as v1.
+    // A valid v2 marker supplies safe correlation for an incompatible request
+    // header. Incompatible markers themselves are never translated or admitted.
     let command = Command::try_from(words[0] & 0xffff);
     if command.is_ok_and(|command| command != marker.command) {
         return None;
@@ -929,9 +929,11 @@ fn validated_route(
     } else {
         Request::decode(&words).ok()?
     };
-    marker
-        .matches(owner.control_xid, request)
-        .then_some((request, error))
+    marker.matches(owner.control_xid, request).then_some((
+        request,
+        marker.destination_desktop,
+        error,
+    ))
 }
 
 fn finish_active(
@@ -975,7 +977,7 @@ fn route_request_with(
     let Some(evidence) = host.evidence(words[3], atoms.caller)? else {
         return Ok(true);
     };
-    let Some((request, protocol_error)) =
+    let Some((request, destination_desktop, protocol_error)) =
         validated_route(&evidence, root, owner, popup, words[3], words)
     else {
         return Ok(true);
@@ -990,6 +992,7 @@ fn route_request_with(
         None => control::admit(
             active,
             request,
+            destination_desktop,
             owner.lifecycle,
             local_layer_busy,
             host.now(),
@@ -1001,6 +1004,22 @@ fn route_request_with(
             (status, control::preflight_detail(reason, stage))
         }
         Admission::Admitted => {
+            if matches!(request.command, Command::BringHere | Command::Recover) {
+                // Stage A boundary: PeerHost has no body/WM/input methods. End
+                // here before main's accepted visibility/layer paths can run.
+                return finish_active(
+                    host,
+                    atoms,
+                    active,
+                    TerminalResponse {
+                        status: Status::Failed,
+                        request_id: request.request_id,
+                        control_xid: owner.control_xid,
+                        detail: control::preflight_detail(Reason::Unsupported, Stage::Preflight),
+                    },
+                )
+                .map(|()| true);
+            }
             let operation = active.as_mut().unwrap();
             operation.stage = if request.command == Command::Hide {
                 Stage::Hide
@@ -1150,7 +1169,7 @@ fn discover(
         return Ok(Err(CallerOutcome::Protocol));
     };
     let descriptor = evidence
-        .words()
+        .words(7)
         .and_then(|words| OwnerDescriptor::decode(&words).ok());
     let Some(descriptor) = descriptor else {
         return Ok(Err(CallerOutcome::Protocol));
@@ -1303,10 +1322,7 @@ fn correlated_reply(
 }
 
 fn caller_budget(command: Command) -> Duration {
-    Duration::from_millis(match command {
-        Command::Hide | Command::Show => 4000,
-        Command::BringTop => 5000,
-    })
+    command.caller_budget()
 }
 
 fn caller_with(
@@ -1340,6 +1356,9 @@ fn caller_with(
             epoch: owner.epoch,
             request_id: id()?,
             command,
+            // Only the three accepted CLI commands reach this path in Stage A.
+            // No destination observation is performed or synthesized here.
+            destination_desktop: control::NO_DESTINATION,
         };
         let reply = host.create_reply(marker)?;
         // Revalidate endpoint, identity and lifecycle at the send boundary. Never
@@ -2341,6 +2360,11 @@ mod transport_tests {
     }
     fn marker(command: Command) -> CallerMarker {
         CallerMarker {
+            destination_desktop: if matches!(command, Command::BringHere | Command::Recover) {
+                7
+            } else {
+                control::NO_DESTINATION
+            },
             control_xid: CONTROL,
             epoch: 77,
             request_id: ID,
@@ -3123,6 +3147,7 @@ mod transport_tests {
             control::admit(
                 &mut endpoint.active,
                 request(Command::BringTop),
+                crate::control::NO_DESTINATION,
                 Lifecycle::Ready,
                 false,
                 h.now,
@@ -3222,7 +3247,7 @@ mod transport_tests {
     fn discovery_rejects_every_malformed_descriptor_and_native_endpoint() {
         let valid = owner().encode().unwrap();
         let mut variants = vec![];
-        for (index, word) in [(0, 0), (1, 2), (2, 1), (3, 11), (4, 0), (5, 99), (6, 0)] {
+        for (index, word) in [(0, 0), (1, 1), (2, 1), (3, 11), (4, 0), (5, 99), (6, 0)] {
             let mut words = valid;
             words[index] = word;
             variants.push(Some(evidence(&words)));
@@ -3277,7 +3302,7 @@ mod transport_tests {
         assert_eq!(
             event.data.as_data32(),
             [
-                (1 << 16) | 2,
+                (2 << 16) | 2,
                 ID as u32,
                 (ID >> 32) as u32,
                 REPLY_WINDOW,
@@ -3307,12 +3332,13 @@ mod transport_tests {
             marker(Command::Show).encode().unwrap(),
             [
                 control::MAGIC,
-                1,
+                2,
                 CONTROL,
                 77,
                 ID as u32,
                 (ID >> 32) as u32,
-                2
+                2,
+                control::NO_DESTINATION,
             ]
         );
         // CreateWindow has no mapped flag; neither CallerHost nor PeerHost offers MapWindow,
@@ -3392,7 +3418,7 @@ mod transport_tests {
         let mut variants = vec![None];
         for (index, word) in [
             (0, 0),
-            (1, 2),
+            (1, 1),
             (2, CONTROL + 1),
             (3, 78),
             (4, 0),
@@ -3413,7 +3439,7 @@ mod transport_tests {
                 4 => e.property.type_ = 0,
                 5 => e.property.type_ = AtomEnum::STRING.into(),
                 6 => e.property.format = 16,
-                7 => e.property.value_len = 8,
+                7 => e.property.value_len = 7,
                 8 => e.property.bytes_after = 4,
                 9 => e.property.value.truncate(24),
                 10 => e.property.value.extend([0; 4]),
@@ -3450,14 +3476,14 @@ mod transport_tests {
                 REPLY_WINDOW,
                 words
             ),
-            Some((req, None))
+            Some((req, control::NO_DESTINATION, None))
         );
     }
     #[test]
-    fn incompatible_headers_get_protocol_error_only_via_valid_v1_route() {
+    fn incompatible_headers_get_protocol_error_only_via_valid_v2_route() {
         for (header, reason) in [
-            ((2 << 16) | 2, Reason::WrongVersion),
-            ((1 << 16) | 99, Reason::UnknownCommand),
+            ((1 << 16) | 2, Reason::WrongVersion),
+            ((2 << 16) | 99, Reason::UnknownCommand),
         ] {
             for safe in [true, false] {
                 let mut host = Fake::new();
@@ -3939,7 +3965,14 @@ mod transport_tests {
         let req = request(Command::Show);
         let mut active = None;
         assert_eq!(
-            control::admit(&mut active, req, Lifecycle::Ready, false, host.now),
+            control::admit(
+                &mut active,
+                req,
+                crate::control::NO_DESTINATION,
+                Lifecycle::Ready,
+                false,
+                host.now
+            ),
             Admission::Admitted
         );
         let original = active;
@@ -4004,7 +4037,14 @@ mod transport_tests {
             let req = request(command);
             let mut active = None;
             assert_eq!(
-                control::admit(&mut active, req, Lifecycle::Ready, false, now),
+                control::admit(
+                    &mut active,
+                    req,
+                    crate::control::NO_DESTINATION,
+                    Lifecycle::Ready,
+                    false,
+                    now
+                ),
                 Admission::Admitted
             );
             assert_eq!(
@@ -4017,6 +4057,7 @@ mod transport_tests {
                     control::admit(
                         &mut active,
                         req,
+                        crate::control::NO_DESTINATION,
                         Lifecycle::Ready,
                         false,
                         now + Duration::from_millis(elapsed)
@@ -4119,7 +4160,7 @@ mod transport_tests {
                 2 => event.format = 8,
                 3 => {
                     let mut w = event.data.as_data32();
-                    w[0] = (2 << 16) | 1;
+                    w[0] = (1 << 16) | 1;
                     event.data = w.into();
                 }
                 4 => {
@@ -4259,6 +4300,7 @@ mod transport_tests {
             control::admit(
                 &mut active,
                 request(Command::Show),
+                crate::control::NO_DESTINATION,
                 Lifecycle::Ready,
                 false,
                 host.now,
@@ -4356,6 +4398,225 @@ mod transport_tests {
             let reply = TerminalResponse::decode(&reply.data.as_data32()).unwrap();
             assert_eq!(reply.status, Status::Closing);
             assert_eq!(reply.detail.stage, Stage::Shutdown);
+        }
+    }
+    #[test]
+    fn v2_placement_requests_end_unsupported_in_transport_without_an_active_body_operation() {
+        for command in [Command::BringHere, Command::Recover] {
+            let mut host = Fake::new();
+            host.evidence
+                .push_back(Some(evidence(&marker(command).encode().unwrap())));
+            let mut active = None;
+            host.route(
+                &mut active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, request(command)).unwrap(),
+            )
+            .unwrap();
+            assert!(active.is_none());
+            assert_eq!(host.sent.len(), 1);
+            let event = host.sent[0];
+            assert_eq!((event.window, event.type_), (REPLY_WINDOW, atoms().reply));
+            let reply = TerminalResponse::decode(&event.data.as_data32()).unwrap();
+            assert_eq!(
+                (reply.status, reply.detail.reason, reply.detail.stage),
+                (Status::Failed, Reason::Unsupported, Stage::Preflight)
+            );
+            assert_eq!(reply.detail.progress, control::Progress::default());
+            assert_eq!(reply.detail.placement, control::PlacementProof::default());
+            assert_eq!(reply.request_id, ID);
+            assert_eq!(host.log, ["owner", "evidence", "owner", "send"]);
+        }
+    }
+
+    #[test]
+    fn placement_transport_respects_lifecycle_and_busy_before_unsupported_boundary() {
+        for command in [Command::BringHere, Command::Recover] {
+            for (lifecycle, busy, status, reason, stage) in [
+                (
+                    Lifecycle::Starting,
+                    false,
+                    Status::Starting,
+                    Reason::Starting,
+                    Stage::Preflight,
+                ),
+                (
+                    Lifecycle::Closing,
+                    false,
+                    Status::Closing,
+                    Reason::Closing,
+                    Stage::Shutdown,
+                ),
+                (
+                    Lifecycle::Ready,
+                    true,
+                    Status::Busy,
+                    Reason::Busy,
+                    Stage::Preflight,
+                ),
+            ] {
+                let mut host = Fake::new();
+                let mut active = None;
+                host.evidence
+                    .push_back(Some(evidence(&marker(command).encode().unwrap())));
+                host.route(
+                    &mut active,
+                    lifecycle,
+                    busy,
+                    &request_event(atoms(), CONTROL, request(command)).unwrap(),
+                )
+                .unwrap();
+                assert!(active.is_none());
+                assert_eq!(host.sent.len(), 1);
+                let reply = TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap();
+                assert_eq!(
+                    (reply.status, reply.detail.reason, reply.detail.stage),
+                    (status, reason, stage)
+                );
+            }
+            let mut host = Fake::new();
+            let mut active = None;
+            control::admit(
+                &mut active,
+                request(Command::Show),
+                control::NO_DESTINATION,
+                Lifecycle::Ready,
+                false,
+                host.now,
+            );
+            let original = active;
+            host.evidence
+                .push_back(Some(evidence(&marker(command).encode().unwrap())));
+            host.route(
+                &mut active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, request(command)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(active, original);
+            assert_eq!(
+                TerminalResponse::decode(&host.sent[0].data.as_data32())
+                    .unwrap()
+                    .status,
+                Status::Busy
+            );
+        }
+    }
+
+    #[test]
+    fn placement_marker_destination_is_frozen_even_when_a_duplicate_property_changes() {
+        for command in [Command::BringHere, Command::Recover] {
+            let mut host = Fake::new();
+            let mut active = None;
+            control::admit(
+                &mut active,
+                request(command),
+                7,
+                Lifecycle::Ready,
+                false,
+                host.now,
+            );
+            let original = active;
+            let changed = CallerMarker {
+                destination_desktop: 8,
+                ..marker(command)
+            };
+            host.evidence
+                .push_back(Some(evidence(&changed.encode().unwrap())));
+            host.route(
+                &mut active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, request(command)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(active, original);
+            assert_eq!(
+                TerminalResponse::decode(&host.sent[0].data.as_data32())
+                    .unwrap()
+                    .status,
+                Status::Busy
+            );
+            assert_eq!(active.unwrap().placement.destination_desktop, 7);
+        }
+    }
+
+    #[test]
+    fn v1_and_invalid_destination_markers_are_never_admitted_or_translated() {
+        for command in [Command::Show, Command::BringHere, Command::Recover] {
+            let valid = marker(command).encode().unwrap();
+            let mut wrong_version = valid;
+            wrong_version[1] = 1;
+            let mut wrong_destination = valid;
+            wrong_destination[7] = if command == Command::Show {
+                7
+            } else {
+                control::NO_DESTINATION
+            };
+            let mut trailing = valid.to_vec();
+            trailing.push(0);
+            for words in [
+                valid[..7].to_vec(),
+                wrong_version.to_vec(),
+                wrong_destination.to_vec(),
+                trailing,
+            ] {
+                let mut host = Fake::new();
+                let mut active = None;
+                host.evidence.push_back(Some(evidence(&words)));
+                host.route(
+                    &mut active,
+                    Lifecycle::Ready,
+                    false,
+                    &request_event(atoms(), CONTROL, request(command)).unwrap(),
+                )
+                .unwrap();
+                assert!(active.is_none());
+                assert!(host.sent.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn matching_v2_callers_retain_all_three_existing_command_routes_and_budgets() {
+        for command in [Command::Hide, Command::Show, Command::BringTop] {
+            let mut host = Fake::new();
+            host.events.push_back(terminal());
+            assert_eq!(
+                caller_with(&mut host, ROOT, 0, command, || Ok(ID)).unwrap(),
+                CallerOutcome::Terminal(response())
+            );
+            assert_eq!(host.marker, Some(marker(command)));
+            assert_eq!(host.marker.unwrap().encode().unwrap().len(), 8);
+            assert_eq!(host.sent.len(), 1);
+            assert_eq!(
+                Request::decode(&host.sent[0].data.as_data32()).unwrap(),
+                request(command)
+            );
+            let mut host = Fake::new();
+            let mut active = None;
+            host.evidence
+                .push_back(Some(evidence(&marker(command).encode().unwrap())));
+            host.route(
+                &mut active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, request(command)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(active.unwrap().request, request(command));
+            assert!(host.sent.is_empty());
+        }
+        for (command, millis) in [
+            (Command::Hide, 4000),
+            (Command::Show, 4000),
+            (Command::BringTop, 5000),
+            (Command::BringHere, 5000),
+            (Command::Recover, 9000),
+        ] {
+            assert_eq!(caller_budget(command), Duration::from_millis(millis));
         }
     }
 }

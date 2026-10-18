@@ -1,10 +1,11 @@
-//! Pure M03.2 wire values and observations. No X11 resources or operations.
+//! Pure control protocol and operation evidence. No X11 resources or operations.
 #![allow(dead_code)]
 
 use std::fmt;
 
 pub const MAGIC: u32 = 0x4452_4d31;
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
+pub const NO_DESTINATION: u32 = u32::MAX;
 pub const INSTANCE: &str = "_DESKTOPROOMIE_INSTANCE";
 pub const TIMESTAMP: &str = "_DESKTOPROOMIE_TIMESTAMP";
 pub const REQUEST: &str = "_DESKTOPROOMIE_REQUEST";
@@ -22,16 +23,19 @@ pub enum DecodeError {
     Version,
     ZeroIdentity,
     InvalidBody,
+    InvalidDestination,
+    ContradictoryProof,
     UnknownValue(&'static str, u32),
     ReservedBits,
 }
 
 // Each enum's decoder rejects all unassigned wire values.
 macro_rules! wire_enum {
-    ($name:ident { $($variant:ident = $value:literal),+ $(,)? }) => {
+    ($(#[$enum_meta:meta])* $name:ident { $($(#[$variant_meta:meta])* $variant:ident = $value:literal),+ $(,)? }) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        $(#[$enum_meta])*
         #[repr(u32)]
-        pub enum $name { $($variant = $value),+ }
+        pub enum $name { $($(#[$variant_meta])* $variant = $value),+ }
         impl TryFrom<u32> for $name {
             type Error = DecodeError;
             fn try_from(value: u32) -> Result<Self, Self::Error> {
@@ -44,7 +48,7 @@ macro_rules! wire_enum {
     };
 }
 
-wire_enum!(Command { Hide = 1, Show = 2, BringTop = 3 });
+wire_enum!(Command { Hide = 1, Show = 2, BringTop = 3, BringHere = 4, Recover = 5 });
 wire_enum!(Lifecycle { Starting = 1, Ready = 2, Closing = 3 });
 wire_enum!(Status { Success = 0, Failed = 1, Partial = 2, Busy = 3, Starting = 4, Closing = 5, ProtocolError = 6 });
 wire_enum!(Reason {
@@ -57,7 +61,35 @@ wire_enum!(Reason {
 wire_enum!(Visibility { Unknown = 0, Minimized = 1, NotMinimizedHere = 2, NotMinimizedElsewhere = 3, Transitional = 4, Withdrawn = 5, Destroyed = 6 });
 wire_enum!(LayerObservation { Unknown = 0, Normal = 1, Above = 2, Below = 3, Conflict = 4 });
 wire_enum!(Workspace { Unknown = 0, Current = 1, Other = 2, AllDesktops = 3 });
-wire_enum!(Stage { Preflight = 0, Hide = 1, Show = 2, Geometry = 3, Layer = 4, Shutdown = 5 });
+wire_enum!(Stage { Preflight = 0, Hide = 1, Show = 2, Geometry = 3, Layer = 4, Shutdown = 5, Placement = 6 });
+wire_enum!(#[derive(Default)] GeometryProof { #[default] Unknown = 0, Deferred = 1, Verified = 2 });
+
+impl Command {
+    pub fn validate_destination(self, destination: u32) -> Result<(), DecodeError> {
+        if matches!(self, Self::BringHere | Self::Recover) == (destination != NO_DESTINATION) {
+            Ok(())
+        } else {
+            Err(DecodeError::InvalidDestination)
+        }
+    }
+
+    pub fn owner_budget(self) -> std::time::Duration {
+        std::time::Duration::from_millis(match self {
+            Self::Hide => 1000,
+            Self::Show => 2500,
+            Self::BringTop | Self::BringHere => 3500,
+            Self::Recover => 7000,
+        })
+    }
+
+    pub fn caller_budget(self) -> std::time::Duration {
+        std::time::Duration::from_millis(match self {
+            Self::Hide | Self::Show => 4000,
+            Self::BringTop | Self::BringHere => 5000,
+            Self::Recover => 9000,
+        })
+    }
+}
 wire_enum!(ExitCode {
     Success = 0, LocalFailure = 1, Usage = 2, NoInstance = 3, DuplicateLaunch = 4,
     Busy = 5, Protocol = 6, OperationFailed = 7, OutcomeUnknown = 8, Partial = 9,
@@ -69,6 +101,8 @@ impl fmt::Display for Command {
             Self::Hide => "hide",
             Self::Show => "show",
             Self::BringTop => "bring-top",
+            Self::BringHere => "bring-here",
+            Self::Recover => "recover",
         })
     }
 }
@@ -165,11 +199,14 @@ pub struct CallerMarker {
     pub epoch: u32,
     pub request_id: u64,
     pub command: Command,
+    pub destination_desktop: u32,
 }
 impl CallerMarker {
-    pub fn encode(self) -> Result<[u32; 7], DecodeError> {
+    pub fn encode(self) -> Result<[u32; 8], DecodeError> {
         nonzero(&[self.control_xid, self.epoch])?;
         request_id(self.request_id as u32, (self.request_id >> 32) as u32)?;
+        self.command
+            .validate_destination(self.destination_desktop)?;
         Ok([
             MAGIC,
             VERSION,
@@ -178,21 +215,23 @@ impl CallerMarker {
             self.request_id as u32,
             (self.request_id >> 32) as u32,
             self.command as u32,
+            self.destination_desktop,
         ])
     }
     pub fn decode(words: &[u32]) -> Result<Self, DecodeError> {
-        let w: &[u32; 7] = words.try_into().map_err(|_| DecodeError::Length)?;
+        let w: &[u32; 8] = words.try_into().map_err(|_| DecodeError::Length)?;
         identity_header(w)?;
         let marker = Self {
             control_xid: w[2],
             epoch: w[3],
             request_id: request_id(w[4], w[5])?,
             command: w[6].try_into()?,
+            destination_desktop: w[7],
         };
         marker.encode()?;
         Ok(marker)
     }
-    // Destination/format/root/window-class validation belongs to native transport.
+    // The destination is carried only by this property, never by a request word.
     pub fn matches(self, control_xid: u32, request: Request) -> bool {
         self.encode().is_ok()
             && request.encode().is_ok()
@@ -244,6 +283,30 @@ pub struct Progress {
     pub input_ready: bool,
 }
 
+/// Historical transitions survive loss of current evidence. Neither flag implies
+/// that destination, visibility, geometry or input is currently confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecoveryHistory {
+    pub relocation_confirmed: bool,
+    pub restoration_confirmed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlacementConfirmation {
+    /// Body membership AND the frozen destination still being current.
+    pub destination: bool,
+    /// Deferred proves retained-monitor/workarea fit, but not actual geometry.
+    pub geometry: GeometryProof,
+    pub minimization_preserved: bool,
+    pub layer_preserved: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlacementProof {
+    pub current: PlacementConfirmation,
+    pub history: RecoveryHistory,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Detail {
     pub reason: Reason,
@@ -252,6 +315,7 @@ pub struct Detail {
     pub workspace: Workspace,
     pub progress: Progress,
     pub stage: Stage,
+    pub placement: PlacementProof,
 }
 impl Detail {
     pub fn encode(self) -> u32 {
@@ -266,12 +330,22 @@ impl Detail {
             | u32::from(p.host_mutation_dispatched) << 19
             | u32::from(p.input_ready) << 20
             | (self.stage as u32) << 21
+            // v2: 24 destination current; 25/26 historical relocation/restoration;
+            // 27..28 geometry (0 unknown, 1 admissible/deferred, 2 verified);
+            // 29 preserved genuine minimization; 30 preserved effective layer.
+            // Bits 0..23 retain their M03.2 meanings. Bit 31 remains reserved.
+            | u32::from(self.placement.current.destination) << 24
+            | u32::from(self.placement.history.relocation_confirmed) << 25
+            | u32::from(self.placement.history.restoration_confirmed) << 26
+            | (self.placement.current.geometry as u32) << 27
+            | u32::from(self.placement.current.minimization_preserved) << 29
+            | u32::from(self.placement.current.layer_preserved) << 30
     }
     pub fn decode(word: u32) -> Result<Self, DecodeError> {
-        if word & 0xff00_0000 != 0 {
+        if word & 0x8000_0000 != 0 {
             return Err(DecodeError::ReservedBits);
         }
-        Ok(Self {
+        let detail = Self {
             reason: (word & 0xff).try_into()?,
             visibility: ((word >> 8) & 7).try_into()?,
             layer: ((word >> 11) & 7).try_into()?,
@@ -284,7 +358,58 @@ impl Detail {
                 input_ready: word & (1 << 20) != 0,
             },
             stage: ((word >> 21) & 7).try_into()?,
-        })
+            placement: PlacementProof {
+                current: PlacementConfirmation {
+                    destination: word & (1 << 24) != 0,
+                    geometry: ((word >> 27) & 3).try_into()?,
+                    minimization_preserved: word & (1 << 29) != 0,
+                    layer_preserved: word & (1 << 30) != 0,
+                },
+                history: RecoveryHistory {
+                    relocation_confirmed: word & (1 << 25) != 0,
+                    restoration_confirmed: word & (1 << 26) != 0,
+                },
+            },
+        };
+        detail.validate_placement_wire()?;
+        Ok(detail)
+    }
+
+    fn validate_placement_wire(self) -> Result<(), DecodeError> {
+        let p = self.placement.current;
+        if (p.destination && self.workspace != Workspace::Current)
+            || (p.geometry != GeometryProof::Unknown && !p.destination)
+            || (p.geometry == GeometryProof::Verified && self.progress.placement_deferred)
+            || (p.geometry == GeometryProof::Deferred
+                && (!p.minimization_preserved || !self.progress.placement_deferred))
+            || (p.minimization_preserved
+                && (self.visibility != Visibility::Minimized
+                    || self.progress.not_minimized_confirmed
+                    || self.progress.input_ready
+                    || self.placement.history.restoration_confirmed))
+            || (p.layer_preserved
+                && !matches!(
+                    self.layer,
+                    LayerObservation::Normal | LayerObservation::Above | LayerObservation::Below
+                ))
+            || (self.placement != PlacementProof::default()
+                && ((self.progress.input_ready
+                    && (!p.destination
+                        || p.geometry != GeometryProof::Verified
+                        || self.visibility != Visibility::NotMinimizedHere
+                        || !self.progress.not_minimized_confirmed))
+                    || (self.progress.above_confirmed
+                        && (!self.progress.not_minimized_confirmed
+                            || self.layer != LayerObservation::Above))
+                    || (self.progress.not_minimized_confirmed
+                        && !matches!(
+                            self.visibility,
+                            Visibility::NotMinimizedHere | Visibility::NotMinimizedElsewhere
+                        ))))
+        {
+            return Err(DecodeError::ContradictoryProof);
+        }
+        Ok(())
     }
 }
 
@@ -299,6 +424,7 @@ impl TerminalResponse {
     pub fn encode(self) -> Result<[u32; 5], DecodeError> {
         nonzero(&[self.control_xid])?;
         request_id(self.request_id as u32, (self.request_id >> 32) as u32)?;
+        self.detail.validate_placement_wire()?;
         Ok([
             (VERSION << 16) | self.status as u32,
             self.request_id as u32,
@@ -360,6 +486,35 @@ pub struct ActiveOperation {
     pub show: ShowProgress,
     pub hide: HideProgress,
     pub bring_top: BringTopProgress,
+    pub placement: PlacementProgress,
+    pub recover_phase: RecoverPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacementBaseline {
+    pub desktop: u32,
+    pub minimized: bool,
+    pub layer: LayerObservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacementProgress {
+    /// Immutable from admission; never refreshed from current desktop evidence.
+    pub destination_desktop: u32,
+    pub baseline: Option<PlacementBaseline>,
+    pub proof: PlacementProof,
+}
+impl PlacementProgress {
+    pub fn clear_current(&mut self) {
+        self.proof.current = PlacementConfirmation::default();
+    }
+}
+
+/// Phase identity only, under ActiveOperation's immutable total deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoverPhase {
+    Here,
+    Top,
 }
 
 /// Composition facts only. The sole LayerController still owns its target,
@@ -455,18 +610,33 @@ pub fn preflight_detail(reason: Reason, stage: Stage) -> Detail {
         layer: LayerObservation::Unknown,
         workspace: Workspace::Unknown,
         progress: Progress::default(),
+        placement: PlacementProof::default(),
     }
 }
 
 pub fn admit(
     active: &mut Option<ActiveOperation>,
     request: Request,
+    destination_desktop: u32,
     lifecycle: Lifecycle,
     local_layer_busy: bool,
     now: std::time::Instant,
 ) -> Admission {
+    if request
+        .command
+        .validate_destination(destination_desktop)
+        .is_err()
+    {
+        return Admission::Reply(
+            Status::ProtocolError,
+            Reason::MalformedRequest,
+            Stage::Preflight,
+        );
+    }
     if let Some(current) = active {
-        if current.request == request {
+        if current.request == request
+            && current.placement.destination_desktop == destination_desktop
+        {
             return Admission::Duplicate;
         }
     }
@@ -485,13 +655,13 @@ pub fn admit(
     *active = Some(ActiveOperation {
         request,
         stage: Stage::Preflight,
-        deadline: now
-            + std::time::Duration::from_millis(match request.command {
-                Command::Hide => 1000,
-                // Owner-approved Stage-E budget, including slower-host margin.
-                Command::Show => 2500,
-                Command::BringTop => 3500,
-            }),
+        deadline: now + request.command.owner_budget(),
+        placement: PlacementProgress {
+            destination_desktop,
+            baseline: None,
+            proof: PlacementProof::default(),
+        },
+        recover_phase: RecoverPhase::Here,
         detail: preflight_detail(Reason::Unsupported, Stage::Preflight),
         show: ShowProgress {
             observe: true,
@@ -646,11 +816,172 @@ impl OperationResult {
         detail: Detail,
         confirmed: Confirmation,
     ) -> Result<Self, ResultError> {
+        if matches!(command, Command::BringHere | Command::Recover) {
+            // Placement results require the command-specific evidence constructor.
+            return Err(ResultError::InconsistentConfirmation);
+        }
         Self::validated(command, status, detail, confirmed, false)
     }
 
+    pub fn placement(
+        command: Command,
+        status: Status,
+        detail: Detail,
+        confirmed: Confirmation,
+        progress: &PlacementProgress,
+    ) -> Result<Self, ResultError> {
+        let p = progress.proof.current;
+        let h = progress.proof.history;
+        let baseline = progress.baseline;
+        let local = confirmed.visibility == Some(ConfirmedVisibility::NotMinimizedHere);
+        let minimized = confirmed.visibility == Some(ConfirmedVisibility::Minimized);
+        let not_minimized = matches!(
+            confirmed.visibility,
+            Some(
+                ConfirmedVisibility::NotMinimizedHere | ConfirmedVisibility::NotMinimizedElsewhere
+            )
+        );
+        let visibility = match confirmed.visibility {
+            Some(ConfirmedVisibility::Minimized) => Visibility::Minimized,
+            Some(ConfirmedVisibility::NotMinimizedHere) => Visibility::NotMinimizedHere,
+            Some(ConfirmedVisibility::NotMinimizedElsewhere) => Visibility::NotMinimizedElsewhere,
+            None => detail.visibility,
+        };
+        if !matches!(command, Command::BringHere | Command::Recover)
+            || command
+                .validate_destination(progress.destination_desktop)
+                .is_err()
+            || detail.placement != progress.proof
+            || detail.validate_placement_wire().is_err()
+            || (progress.proof != PlacementProof::default()
+                && !baseline.is_some_and(|b| {
+                    b.desktop != NO_DESTINATION
+                        && matches!(
+                            b.layer,
+                            LayerObservation::Normal
+                                | LayerObservation::Above
+                                | LayerObservation::Below
+                        )
+                }))
+            || detail.visibility != visibility
+            || detail.progress.not_minimized_confirmed != not_minimized
+            || detail.progress.above_confirmed != confirmed.above
+            || (confirmed.above && (!not_minimized || detail.layer != LayerObservation::Above))
+            || (local && detail.workspace != Workspace::Current)
+            || (confirmed.visibility == Some(ConfirmedVisibility::NotMinimizedElsewhere)
+                && detail.workspace != Workspace::Other)
+            || (detail.progress.input_ready
+                && (!local || !p.destination || p.geometry != GeometryProof::Verified))
+            || (detail.progress.placement_deferred
+                && (detail.progress.input_ready || p.geometry != GeometryProof::Deferred))
+            || (p.minimization_preserved && (!minimized || !baseline.is_some_and(|b| b.minimized)))
+            || (p.layer_preserved && !baseline.is_some_and(|b| b.layer == detail.layer))
+            || (h.relocation_confirmed
+                && !baseline.is_some_and(|b| {
+                    b.desktop != NO_DESTINATION && b.desktop != progress.destination_desktop
+                }))
+            || (h.restoration_confirmed && !baseline.is_some_and(|b| b.minimized))
+        {
+            return Err(ResultError::InconsistentConfirmation);
+        }
+        let meaningful =
+            h.relocation_confirmed || (command == Command::Recover && h.restoration_confirmed);
+        let complete = p.destination
+            && match command {
+                Command::BringHere => {
+                    p.layer_preserved
+                        && baseline.is_some_and(|b| b.minimized == minimized)
+                        && ((local
+                            && p.geometry == GeometryProof::Verified
+                            && detail.progress.input_ready)
+                            || (minimized
+                                && p.minimization_preserved
+                                && p.geometry != GeometryProof::Unknown
+                                && !detail.progress.input_ready))
+                }
+                Command::Recover => {
+                    local
+                        && confirmed.above
+                        && p.geometry == GeometryProof::Verified
+                        && detail.progress.input_ready
+                }
+                _ => unreachable!(),
+            };
+        let stage_valid = match command {
+            Command::BringHere => matches!(
+                detail.stage,
+                Stage::Preflight | Stage::Placement | Stage::Geometry | Stage::Shutdown
+            ),
+            Command::Recover => detail.stage != Stage::Hide,
+            _ => false,
+        };
+        if !stage_valid || (command == Command::BringHere && h.restoration_confirmed) {
+            return Err(ResultError::InconsistentStatus);
+        }
+        match status {
+            Status::Success => {
+                if detail.reason != Reason::None
+                    || !complete
+                    || (command == Command::Recover && detail.stage != Stage::Layer)
+                    || (command == Command::BringHere
+                        && !matches!(detail.stage, Stage::Placement | Stage::Geometry))
+                {
+                    return Err(ResultError::UnconfirmedSuccess);
+                }
+            }
+            Status::Failed | Status::Partial => {
+                if matches!(
+                    detail.reason,
+                    Reason::None
+                        | Reason::Starting
+                        | Reason::Busy
+                        | Reason::MalformedRequest
+                        | Reason::WrongVersion
+                        | Reason::UnknownCommand
+                        | Reason::StaleInstance
+                ) || (detail.stage == Stage::Preflight && meaningful)
+                {
+                    return Err(ResultError::InconsistentStatus);
+                }
+                if status == Status::Partial && !meaningful {
+                    return Err(ResultError::InvalidPartial);
+                }
+                if status == Status::Failed && meaningful {
+                    return Err(ResultError::InconsistentStatus);
+                }
+            }
+            Status::Busy | Status::Starting | Status::Closing | Status::ProtocolError => {
+                let (reason_valid, stage) = match status {
+                    Status::Busy => (detail.reason == Reason::Busy, Stage::Preflight),
+                    Status::Starting => (detail.reason == Reason::Starting, Stage::Preflight),
+                    Status::Closing => (detail.reason == Reason::Closing, Stage::Shutdown),
+                    Status::ProtocolError => (
+                        matches!(
+                            detail.reason,
+                            Reason::MalformedRequest
+                                | Reason::WrongVersion
+                                | Reason::UnknownCommand
+                                | Reason::StaleInstance
+                        ),
+                        Stage::Preflight,
+                    ),
+                    _ => unreachable!(),
+                };
+                if !reason_valid
+                    || detail.stage != stage
+                    || detail.progress != Progress::default()
+                    || detail.placement != PlacementProof::default()
+                    || confirmed != Confirmation::default()
+                {
+                    return Err(ResultError::InconsistentStatus);
+                }
+            }
+        }
+        Ok(Self { status, detail })
+    }
+
     /// Constructor-only historical proof; current confirmation fields retain
-    /// their v1 meanings, including after evidence loss or body destruction.
+    /// their M03.2 meanings, including after evidence loss or body destruction.
     pub fn bring_top(
         status: Status,
         detail: Detail,
@@ -673,6 +1004,9 @@ impl OperationResult {
         confirmed: Confirmation,
         restoration_proven: bool,
     ) -> Result<Self, ResultError> {
+        if detail.placement != PlacementProof::default() {
+            return Err(ResultError::InconsistentConfirmation);
+        }
         let visibility = match confirmed.visibility {
             Some(ConfirmedVisibility::Minimized) => Some(Visibility::Minimized),
             Some(ConfirmedVisibility::NotMinimizedHere) => Some(Visibility::NotMinimizedHere),
@@ -730,6 +1064,7 @@ impl OperationResult {
                             )
                     }
                     Command::BringTop => not_minimized && confirmed.above,
+                    Command::BringHere | Command::Recover => unreachable!("separate proof rules"),
                 })
         {
             return Err(ResultError::UnconfirmedSuccess);
@@ -802,6 +1137,7 @@ mod tests {
     fn marker() -> CallerMarker {
         let r = request();
         CallerMarker {
+            destination_desktop: crate::control::NO_DESTINATION,
             control_xid: owner().control_xid,
             epoch: r.epoch,
             request_id: r.request_id,
@@ -810,6 +1146,7 @@ mod tests {
     }
     fn detail() -> Detail {
         Detail {
+            placement: PlacementProof::default(),
             reason: Reason::None,
             visibility: Visibility::Unknown,
             layer: LayerObservation::Unknown,
@@ -865,27 +1202,28 @@ mod tests {
     }
     #[test]
     fn descriptor_and_marker_interoperability() {
-        let words = [0x4452_4d31, 1, 0, 0x1234, 0x89ab_cdef, 2, 0x5678];
+        let words = [0x4452_4d31, 2, 0, 0x1234, 0x89ab_cdef, 2, 0x5678];
         assert_eq!(owner().encode(), Ok(words));
         assert_eq!(OwnerDescriptor::decode(&words), Ok(owner()));
         let words = [
             0x4452_4d31,
-            1,
+            2,
             0x1234,
             0x89ab_cdef,
             0x7654_3210,
             0xfedc_ba98,
             3,
+            NO_DESTINATION,
         ];
         assert_eq!(marker().encode(), Ok(words));
         assert_eq!(CallerMarker::decode(&words), Ok(marker()));
     }
     #[test]
     fn request_and_response_interoperability() {
-        let words = [0x0001_0003, 0x7654_3210, 0xfedc_ba98, 0x9876, 0x89ab_cdef];
+        let words = [0x0002_0003, 0x7654_3210, 0xfedc_ba98, 0x9876, 0x89ab_cdef];
         assert_eq!(request().encode(), Ok(words));
         assert_eq!(Request::decode(&words), Ok(request()));
-        let words = [0x0001_0001, 0x7654_3210, 0xfedc_ba98, 0x1234, 0];
+        let words = [0x0002_0001, 0x7654_3210, 0xfedc_ba98, 0x1234, 0];
         assert_eq!(response().encode(), Ok(words));
         assert_eq!(TerminalResponse::decode(&words), Ok(response()));
     }
@@ -903,7 +1241,7 @@ mod tests {
                 }
                 .encode()
                 .unwrap()[0],
-                0x10000 | value
+                0x20000 | value
             );
             assert_eq!(Command::try_from(value), Ok(command));
             assert_eq!(
@@ -943,7 +1281,7 @@ mod tests {
                 ..response()
             };
             let words = r.encode().unwrap();
-            assert_eq!(words[0], 0x10000 | value);
+            assert_eq!(words[0], 0x20000 | value);
             assert_eq!(TerminalResponse::decode(&words), Ok(r));
         }
         let reasons = [
@@ -1041,6 +1379,7 @@ mod tests {
             assert_eq!(d.encode(), bits << 16);
         }
         let combined = Detail {
+            placement: PlacementProof::default(),
             reason: Reason::StaleInstance,
             visibility: Visibility::Destroyed,
             layer: LayerObservation::Conflict,
@@ -1059,14 +1398,16 @@ mod tests {
     }
     #[test]
     fn rejects_reserved_bits_and_all_unknown_discriminants() {
-        for bit in 24..32 {
+        for bit in 31..32 {
             assert_eq!(Detail::decode(1 << bit), Err(DecodeError::ReservedBits));
         }
-        for word in [18, 255, 7 << 8, 5 << 11, 6 << 11, 7 << 11, 6 << 21, 7 << 21] {
+        for word in [18, 255, 7 << 8, 5 << 11, 6 << 11, 7 << 11, 7 << 21] {
             assert!(Detail::decode(word).is_err());
         }
-        for value in [0, 4, u32::MAX] {
+        for value in [0, 6, u32::MAX] {
             assert!(Command::try_from(value).is_err());
+        }
+        for value in [0, 4, u32::MAX] {
             assert!(Lifecycle::try_from(value).is_err());
         }
         for value in [7, u32::MAX] {
@@ -1083,6 +1424,8 @@ mod tests {
                     OwnerDescriptor::decode(&vec![0; len]),
                     Err(DecodeError::Length)
                 );
+            }
+            if len != 8 {
                 assert_eq!(
                     CallerMarker::decode(&vec![0; len]),
                     Err(DecodeError::Length)
@@ -1099,7 +1442,7 @@ mod tests {
         for (index, bad, expected) in [
             (0, 0, DecodeError::Magic),
             (1, 0, DecodeError::Version),
-            (1, 2, DecodeError::Version),
+            (1, 1, DecodeError::Version),
         ] {
             let mut d = owner().encode().unwrap();
             d[index] = bad;
@@ -1108,7 +1451,7 @@ mod tests {
             m[index] = bad;
             assert_eq!(CallerMarker::decode(&m), Err(expected));
         }
-        for header in [3, 0x20003, 0xffff0003] {
+        for header in [3, 0x10003, 0xffff0003] {
             let mut r = request().encode().unwrap();
             r[0] = header;
             assert_eq!(Request::decode(&r), Err(DecodeError::Version));
@@ -1120,16 +1463,16 @@ mod tests {
         d[5] = 4;
         assert!(OwnerDescriptor::decode(&d).is_err());
         let mut m = marker().encode().unwrap();
-        m[6] = 4;
+        m[6] = 6;
         assert!(CallerMarker::decode(&m).is_err());
         let mut r = request().encode().unwrap();
-        r[0] = 0x10004;
+        r[0] = 0x20006;
         assert!(Request::decode(&r).is_err());
         let mut r = response().encode().unwrap();
-        r[0] = 0x10007;
+        r[0] = 0x20007;
         assert!(TerminalResponse::decode(&r).is_err());
-        r[0] = 0x10001;
-        r[4] = 1 << 24;
+        r[0] = 0x20001;
+        r[4] = 1 << 31;
         assert_eq!(TerminalResponse::decode(&r), Err(DecodeError::ReservedBits));
     }
     #[test]
@@ -1534,6 +1877,7 @@ mod tests {
         admit(
             &mut active,
             request(),
+            crate::control::NO_DESTINATION,
             Lifecycle::Ready,
             false,
             std::time::Instant::now(),
@@ -1849,7 +2193,7 @@ mod tests {
                 .status(),
             Status::Partial
         );
-        assert_eq!(VERSION, 1);
+        assert_eq!(VERSION, 2);
         assert_eq!(Detail::decode(unknown.encode()).unwrap(), unknown);
     }
     #[test]
@@ -1866,7 +2210,14 @@ mod tests {
             };
             let mut active = None;
             assert_eq!(
-                admit(&mut active, req, Lifecycle::Ready, false, t0),
+                admit(
+                    &mut active,
+                    req,
+                    crate::control::NO_DESTINATION,
+                    Lifecycle::Ready,
+                    false,
+                    t0
+                ),
                 Admission::Admitted
             );
             let original = active.unwrap();
@@ -1882,6 +2233,7 @@ mod tests {
                 admit(
                     &mut active,
                     req,
+                    crate::control::NO_DESTINATION,
                     Lifecycle::Ready,
                     false,
                     t0 + std::time::Duration::from_millis(100)
@@ -1903,6 +2255,7 @@ mod tests {
                         command: first,
                         ..request()
                     },
+                    crate::control::NO_DESTINATION,
                     Lifecycle::Ready,
                     false,
                     t0,
@@ -1914,7 +2267,14 @@ mod tests {
                     ..request()
                 };
                 assert_eq!(
-                    admit(&mut active, other, Lifecycle::Ready, false, t0),
+                    admit(
+                        &mut active,
+                        other,
+                        crate::control::NO_DESTINATION,
+                        Lifecycle::Ready,
+                        false,
+                        t0
+                    ),
                     Admission::Reply(Status::Busy, Reason::Busy, Stage::Preflight)
                 );
                 assert_eq!(active, original);
@@ -1922,7 +2282,14 @@ mod tests {
         }
         let mut active = None;
         assert_eq!(
-            admit(&mut active, request(), Lifecycle::Ready, true, t0),
+            admit(
+                &mut active,
+                request(),
+                crate::control::NO_DESTINATION,
+                Lifecycle::Ready,
+                true,
+                t0
+            ),
             Admission::Reply(Status::Busy, Reason::Busy, Stage::Preflight)
         );
         assert!(active.is_none());
@@ -2001,6 +2368,7 @@ mod tests {
                                         }
                                     };
                                     let d = Detail {
+                                        placement: PlacementProof::default(),
                                         reason,
                                         stage,
                                         visibility,
@@ -2151,7 +2519,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(VERSION, 1);
+        assert_eq!(VERSION, 2);
     }
     #[test]
     fn bring_top_failed_results_cannot_claim_unqualified_current_readiness_or_above() {
@@ -2205,6 +2573,952 @@ mod tests {
         ] {
             assert_eq!(code as u32, value);
             assert_eq!(ExitCode::try_from(value), Ok(code));
+        }
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const COMMANDS: [Command; 5] = [
+        Command::Hide,
+        Command::Show,
+        Command::BringTop,
+        Command::BringHere,
+        Command::Recover,
+    ];
+    fn destination(command: Command) -> u32 {
+        if matches!(command, Command::BringHere | Command::Recover) {
+            7
+        } else {
+            NO_DESTINATION
+        }
+    }
+    fn request(command: Command) -> Request {
+        Request {
+            command,
+            request_id: u64::MAX,
+            reply_xid: 9,
+            epoch: 11,
+        }
+    }
+    fn marker(command: Command) -> CallerMarker {
+        CallerMarker {
+            control_xid: 10,
+            epoch: 11,
+            request_id: u64::MAX,
+            command,
+            destination_desktop: destination(command),
+        }
+    }
+    fn progress() -> PlacementProgress {
+        PlacementProgress {
+            destination_desktop: 7,
+            baseline: Some(PlacementBaseline {
+                desktop: 2,
+                minimized: true,
+                layer: LayerObservation::Normal,
+            }),
+            proof: PlacementProof::default(),
+        }
+    }
+    fn complete(command: Command) -> (Detail, Confirmation, PlacementProgress) {
+        let mut p = progress();
+        p.baseline.as_mut().unwrap().minimized = command == Command::Recover;
+        p.proof.current = PlacementConfirmation {
+            destination: true,
+            geometry: GeometryProof::Verified,
+            layer_preserved: command == Command::BringHere,
+            minimization_preserved: false,
+        };
+        let c = Confirmation {
+            visibility: Some(ConfirmedVisibility::NotMinimizedHere),
+            above: command == Command::Recover,
+        };
+        let d = Detail {
+            visibility: Visibility::NotMinimizedHere,
+            layer: if c.above {
+                LayerObservation::Above
+            } else {
+                LayerObservation::Normal
+            },
+            workspace: Workspace::Current,
+            progress: Progress {
+                not_minimized_confirmed: true,
+                above_confirmed: c.above,
+                input_ready: true,
+                ..Progress::default()
+            },
+            placement: p.proof,
+            ..preflight_detail(
+                Reason::None,
+                if c.above {
+                    Stage::Layer
+                } else {
+                    Stage::Placement
+                },
+            )
+        };
+        (d, c, p)
+    }
+    fn result(
+        command: Command,
+        status: Status,
+        d: Detail,
+        c: Confirmation,
+        p: PlacementProgress,
+    ) -> Result<OperationResult, ResultError> {
+        OperationResult::placement(command, status, d, c, &p)
+    }
+    fn terminal(detail: Detail) -> TerminalResponse {
+        TerminalResponse {
+            status: Status::Success,
+            request_id: u64::MAX,
+            control_xid: 10,
+            detail,
+        }
+    }
+
+    #[test]
+    fn all_five_commands_keep_exact_numeric_values_and_transport_widths() {
+        for (i, command) in COMMANDS.into_iter().enumerate() {
+            let r = request(command);
+            let m = marker(command);
+            assert_eq!(r.encode().unwrap()[0], (2 << 16) | (i as u32 + 1));
+            assert_eq!(Request::decode(&r.encode().unwrap()), Ok(r));
+            assert_eq!(
+                m.encode().unwrap(),
+                [
+                    MAGIC,
+                    2,
+                    10,
+                    11,
+                    u32::MAX,
+                    u32::MAX,
+                    i as u32 + 1,
+                    destination(command)
+                ]
+            );
+            assert_eq!(CallerMarker::decode(&m.encode().unwrap()), Ok(m));
+            // Command and destination correlate through the marker/request ID;
+            // the unchanged five-word reply deliberately has no command field.
+            for status in [
+                Status::Success,
+                Status::Failed,
+                Status::Partial,
+                Status::Busy,
+                Status::Starting,
+                Status::Closing,
+                Status::ProtocolError,
+            ] {
+                let t = TerminalResponse {
+                    status,
+                    ..terminal(preflight_detail(Reason::None, Stage::Preflight))
+                };
+                assert_eq!(TerminalResponse::decode(&t.encode().unwrap()), Ok(t));
+            }
+        }
+    }
+
+    #[test]
+    fn exact_marker_rejects_v1_trailing_words_wrong_headers_and_unknown_command() {
+        let words = marker(Command::Recover).encode().unwrap();
+        assert_eq!(CallerMarker::decode(&words[..7]), Err(DecodeError::Length));
+        let mut trailing = words.to_vec();
+        trailing.push(0);
+        assert_eq!(CallerMarker::decode(&trailing), Err(DecodeError::Length));
+        for (index, word, error) in [
+            (0, 0, DecodeError::Magic),
+            (1, 1, DecodeError::Version),
+            (1, 3, DecodeError::Version),
+            (6, 6, DecodeError::UnknownValue("Command", 6)),
+        ] {
+            let mut bad = words;
+            bad[index] = word;
+            assert_eq!(CallerMarker::decode(&bad), Err(error));
+        }
+    }
+
+    #[test]
+    fn destination_rules_accept_every_ordinary_u32_boundary_without_desktop_count_assumptions() {
+        for command in COMMANDS {
+            for destination_desktop in [0, 1, 7, u32::MAX - 1, NO_DESTINATION] {
+                let m = CallerMarker {
+                    destination_desktop,
+                    ..marker(command)
+                };
+                let expected = matches!(command, Command::BringHere | Command::Recover)
+                    == (destination_desktop != NO_DESTINATION);
+                assert_eq!(m.encode().is_ok(), expected);
+                let mut words = marker(command).encode().unwrap();
+                words[7] = destination_desktop;
+                if expected {
+                    assert_eq!(CallerMarker::decode(&words), Ok(m));
+                    assert!(m.matches(10, request(command)));
+                } else {
+                    assert_eq!(
+                        CallerMarker::decode(&words),
+                        Err(DecodeError::InvalidDestination)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_destination_is_part_of_duplicate_identity_and_is_never_retargeted() {
+        for command in [Command::BringHere, Command::Recover] {
+            let now = Instant::now();
+            let mut active = None;
+            let req = request(command);
+            assert_eq!(
+                admit(&mut active, req, 7, Lifecycle::Ready, false, now),
+                Admission::Admitted
+            );
+            let original = active;
+            for elapsed in [1, 3500, 7000, 9000] {
+                assert_eq!(
+                    admit(
+                        &mut active,
+                        req,
+                        7,
+                        Lifecycle::Closing,
+                        true,
+                        now + Duration::from_millis(elapsed)
+                    ),
+                    Admission::Duplicate
+                );
+                assert_eq!(active, original);
+            }
+            assert_ne!(
+                marker(command),
+                CallerMarker {
+                    destination_desktop: 8,
+                    ..marker(command)
+                }
+            );
+            assert_eq!(
+                admit(&mut active, req, 8, Lifecycle::Ready, false, now),
+                Admission::Reply(Status::Busy, Reason::Busy, Stage::Preflight)
+            );
+            assert_eq!(active, original);
+        }
+    }
+
+    #[test]
+    fn all_five_owner_and_caller_deadlines_are_fixed_from_admission() {
+        for (command, owner, caller) in [
+            (Command::Hide, 1000, 4000),
+            (Command::Show, 2500, 4000),
+            (Command::BringTop, 3500, 5000),
+            (Command::BringHere, 3500, 5000),
+            (Command::Recover, 7000, 9000),
+        ] {
+            let now = Instant::now();
+            let mut active = None;
+            assert_eq!(command.caller_budget(), Duration::from_millis(caller));
+            assert_eq!(
+                admit(
+                    &mut active,
+                    request(command),
+                    destination(command),
+                    Lifecycle::Ready,
+                    false,
+                    now
+                ),
+                Admission::Admitted
+            );
+            let mut op = active.unwrap();
+            assert_eq!(op.deadline, now + Duration::from_millis(owner));
+            assert_eq!(
+                op.bring_top.visibility_cutoff,
+                now + Duration::from_millis(2500)
+            );
+            op.recover_phase = RecoverPhase::Top;
+            op.placement.clear_current();
+            assert_eq!(op.deadline, now + Duration::from_millis(owner));
+        }
+    }
+
+    #[test]
+    fn all_twenty_five_command_pairs_share_one_admission_and_busy_policy() {
+        let now = Instant::now();
+        for first in COMMANDS {
+            for second in COMMANDS {
+                let mut active = None;
+                assert_eq!(
+                    admit(
+                        &mut active,
+                        request(first),
+                        destination(first),
+                        Lifecycle::Ready,
+                        false,
+                        now
+                    ),
+                    Admission::Admitted
+                );
+                let original = active;
+                let other = Request {
+                    request_id: 1,
+                    ..request(second)
+                };
+                assert_eq!(
+                    admit(
+                        &mut active,
+                        other,
+                        destination(second),
+                        Lifecycle::Ready,
+                        false,
+                        now
+                    ),
+                    Admission::Reply(Status::Busy, Reason::Busy, Stage::Preflight)
+                );
+                assert_eq!(active, original);
+            }
+        }
+    }
+
+    #[test]
+    fn new_commands_obey_starting_closing_local_busy_and_invalid_destination_admission() {
+        let now = Instant::now();
+        for command in [Command::BringHere, Command::Recover] {
+            for (lifecycle, busy, expected) in [
+                (
+                    Lifecycle::Starting,
+                    false,
+                    Admission::Reply(Status::Starting, Reason::Starting, Stage::Preflight),
+                ),
+                (
+                    Lifecycle::Closing,
+                    false,
+                    Admission::Reply(Status::Closing, Reason::Closing, Stage::Shutdown),
+                ),
+                (
+                    Lifecycle::Ready,
+                    true,
+                    Admission::Reply(Status::Busy, Reason::Busy, Stage::Preflight),
+                ),
+            ] {
+                let mut active = None;
+                assert_eq!(
+                    admit(&mut active, request(command), 7, lifecycle, busy, now),
+                    expected
+                );
+                assert!(active.is_none());
+            }
+            let mut active = None;
+            assert_eq!(
+                admit(
+                    &mut active,
+                    request(command),
+                    NO_DESTINATION,
+                    Lifecycle::Ready,
+                    false,
+                    now
+                ),
+                Admission::Reply(
+                    Status::ProtocolError,
+                    Reason::MalformedRequest,
+                    Stage::Preflight
+                )
+            );
+            assert!(active.is_none());
+        }
+    }
+
+    #[test]
+    fn v2_detail_bits_preserve_old_fields_and_separate_current_from_history() {
+        let (mut d, _, mut p) = complete(Command::BringHere);
+        p.proof.history = RecoveryHistory {
+            relocation_confirmed: true,
+            restoration_confirmed: true,
+        };
+        d.placement = p.proof;
+        assert_eq!(
+            d.encode() & 0xff00_0000,
+            (1 << 24) | (1 << 25) | (1 << 26) | (2 << 27) | (1 << 30)
+        );
+        assert_eq!(Detail::decode(d.encode()), Ok(d));
+        assert_eq!(
+            TerminalResponse::decode(&terminal(d).encode().unwrap()),
+            Ok(terminal(d))
+        );
+        p.clear_current();
+        d.placement = p.proof;
+        d.workspace = Workspace::Unknown;
+        d.visibility = Visibility::Unknown;
+        d.progress = Progress::default();
+        assert_eq!(d.encode() & 0xff00_0000, (1 << 25) | (1 << 26));
+        assert_eq!(Detail::decode(d.encode()), Ok(d));
+        assert_eq!(Detail::decode(1 << 31), Err(DecodeError::ReservedBits));
+        assert_eq!(
+            Detail::decode(3 << 27),
+            Err(DecodeError::UnknownValue("GeometryProof", 3))
+        );
+    }
+
+    #[test]
+    fn ordinary_bring_here_success_requires_current_geometry_input_destination_and_preserved_layer()
+    {
+        let (d, c, p) = complete(Command::BringHere);
+        assert!(result(Command::BringHere, Status::Success, d, c, p).is_ok());
+        for field in 0..5 {
+            let (mut d, c, mut p) = complete(Command::BringHere);
+            match field {
+                0 => p.proof.current.destination = false,
+                1 => p.proof.current.geometry = GeometryProof::Unknown,
+                2 => p.proof.current.layer_preserved = false,
+                3 => d.progress.input_ready = false,
+                4 => d.workspace = Workspace::Other,
+                _ => unreachable!(),
+            }
+            d.placement = p.proof;
+            assert!(result(Command::BringHere, Status::Success, d, c, p).is_err());
+        }
+    }
+
+    fn minimized_here(geometry: GeometryProof) -> (Detail, Confirmation, PlacementProgress) {
+        let (mut d, _, mut p) = complete(Command::BringHere);
+        p.baseline.as_mut().unwrap().minimized = true;
+        p.proof.current.geometry = geometry;
+        p.proof.current.minimization_preserved = true;
+        d.placement = p.proof;
+        d.visibility = Visibility::Minimized;
+        d.progress = Progress {
+            placement_deferred: geometry == GeometryProof::Deferred,
+            ..Progress::default()
+        };
+        (
+            d,
+            Confirmation {
+                visibility: Some(ConfirmedVisibility::Minimized),
+                above: false,
+            },
+            p,
+        )
+    }
+
+    #[test]
+    fn minimized_here_success_can_report_admissible_deferred_or_verified_geometry_with_input_disabled(
+    ) {
+        for geometry in [GeometryProof::Deferred, GeometryProof::Verified] {
+            for layer in [
+                LayerObservation::Normal,
+                LayerObservation::Above,
+                LayerObservation::Below,
+            ] {
+                let (mut d, c, mut p) = minimized_here(geometry);
+                d.layer = layer;
+                p.baseline.as_mut().unwrap().layer = layer;
+                let r = result(Command::BringHere, Status::Success, d, c, p).unwrap();
+                assert!(!r.detail().progress.input_ready);
+                assert_eq!(
+                    r.detail().progress.placement_deferred,
+                    geometry == GeometryProof::Deferred
+                );
+                assert_eq!(Detail::decode(d.encode()), Ok(d));
+                assert_eq!(
+                    d.encode() & 0xff00_0000,
+                    (1 << 24) | ((geometry as u32) << 27) | (1 << 29) | (1 << 30)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn minimized_here_cannot_claim_input_readiness_or_skip_minimization_and_fit_evidence() {
+        for field in 0..7 {
+            let (mut d, mut c, mut p) = minimized_here(GeometryProof::Deferred);
+            match field {
+                0 => d.progress.input_ready = true,
+                1 => c.visibility = None,
+                2 => p.proof.current.minimization_preserved = false,
+                3 => p.proof.current.geometry = GeometryProof::Unknown,
+                4 => p.baseline.as_mut().unwrap().minimized = false,
+                5 => d.progress.placement_deferred = false,
+                6 => p.proof.current.destination = false,
+                _ => unreachable!(),
+            }
+            d.placement = p.proof;
+            assert!(
+                result(Command::BringHere, Status::Success, d, c, p).is_err(),
+                "field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonminimized_here_cannot_use_the_minimized_geometry_exception() {
+        let (mut d, c, mut p) = complete(Command::BringHere);
+        p.proof.current.geometry = GeometryProof::Deferred;
+        d.progress.placement_deferred = true;
+        d.progress.input_ready = false;
+        d.placement = p.proof;
+        assert!(result(Command::BringHere, Status::Success, d, c, p).is_err());
+    }
+
+    #[test]
+    fn recover_success_requires_every_full_current_postcondition_without_historical_substitution() {
+        for history in 0..4 {
+            let (mut d, c, mut p) = complete(Command::Recover);
+            p.proof.history = RecoveryHistory {
+                relocation_confirmed: history & 1 != 0,
+                restoration_confirmed: history & 2 != 0,
+            };
+            d.placement = p.proof;
+            assert!(result(Command::Recover, Status::Success, d, c, p).is_ok());
+            for field in 0..7 {
+                let (mut bad, mut confirmation, mut proof) = (d, c, p);
+                match field {
+                    0 => proof.proof.current.destination = false,
+                    1 => proof.proof.current.geometry = GeometryProof::Unknown,
+                    2 => bad.progress.input_ready = false,
+                    3 => {
+                        confirmation.above = false;
+                        bad.progress.above_confirmed = false;
+                    }
+                    4 => {
+                        confirmation.visibility = None;
+                        bad.progress.not_minimized_confirmed = false;
+                    }
+                    5 => bad.layer = LayerObservation::Normal,
+                    6 => bad.stage = Stage::Placement,
+                    _ => unreachable!(),
+                }
+                bad.placement = proof.proof;
+                assert!(
+                    result(Command::Recover, Status::Success, bad, confirmation, proof).is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recover_partial_accepts_each_meaningful_history_after_current_evidence_is_lost() {
+        for history in 1..4 {
+            let mut p = progress();
+            p.proof.history = RecoveryHistory {
+                relocation_confirmed: history & 1 != 0,
+                restoration_confirmed: history & 2 != 0,
+            };
+            p.proof.current = complete(Command::Recover).2.proof.current;
+            p.clear_current();
+            let d = Detail {
+                placement: p.proof,
+                ..preflight_detail(Reason::Unverifiable, Stage::Layer)
+            };
+            let r = result(
+                Command::Recover,
+                Status::Partial,
+                d,
+                Confirmation::default(),
+                p,
+            )
+            .unwrap();
+            assert_eq!(r.detail().progress, Progress::default());
+            assert_eq!(
+                r.detail().placement.current,
+                PlacementConfirmation::default()
+            );
+            assert_eq!(Detail::decode(d.encode()), Ok(d));
+            assert!(result(
+                Command::Recover,
+                Status::Failed,
+                d,
+                Confirmation::default(),
+                p
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn recover_noop_geometry_dispatch_and_phase_completion_alone_never_authorize_partial() {
+        for case in 0..4 {
+            let (mut d, c, mut p) = complete(Command::Recover);
+            p.baseline.as_mut().unwrap().desktop = p.destination_desktop;
+            p.baseline.as_mut().unwrap().minimized = false;
+            if case == 1 {
+                d.stage = Stage::Geometry;
+            }
+            if case == 2 {
+                d.progress.host_mutation_dispatched = true;
+            }
+            if case == 3 {
+                d.stage = Stage::Layer;
+            }
+            d.reason = Reason::ConfirmationTimeout;
+            assert_eq!(
+                result(Command::Recover, Status::Partial, d, c, p),
+                Err(ResultError::InvalidPartial)
+            );
+        }
+    }
+
+    #[test]
+    fn historical_proof_requires_real_baseline_transitions_and_here_never_restores() {
+        for command in [Command::BringHere, Command::Recover] {
+            let mut p = progress();
+            p.proof.history.relocation_confirmed = true;
+            let mut d = Detail {
+                placement: p.proof,
+                ..preflight_detail(Reason::LayoutChanged, Stage::Placement)
+            };
+            assert!(result(command, Status::Partial, d, Confirmation::default(), p).is_ok());
+            p.baseline.as_mut().unwrap().desktop = p.destination_desktop;
+            assert!(result(command, Status::Partial, d, Confirmation::default(), p).is_err());
+            p = progress();
+            p.proof.history.restoration_confirmed = true;
+            d.placement = p.proof;
+            assert_eq!(
+                result(command, Status::Partial, d, Confirmation::default(), p).is_ok(),
+                command == Command::Recover
+            );
+            p.baseline.as_mut().unwrap().minimized = false;
+            assert!(result(command, Status::Partial, d, Confirmation::default(), p).is_err());
+        }
+    }
+
+    #[test]
+    fn stale_history_cannot_fabricate_current_destination_or_input_flags() {
+        let mut p = progress();
+        p.proof.history.relocation_confirmed = true;
+        let d = Detail {
+            placement: p.proof,
+            ..preflight_detail(Reason::Unverifiable, Stage::Layer)
+        };
+        let mut bad = d;
+        bad.progress.input_ready = true;
+        assert!(result(
+            Command::Recover,
+            Status::Partial,
+            bad,
+            Confirmation::default(),
+            p
+        )
+        .is_err());
+        bad = d;
+        bad.placement.current.destination = true;
+        assert!(result(
+            Command::Recover,
+            Status::Partial,
+            bad,
+            Confirmation::default(),
+            p
+        )
+        .is_err());
+        p.proof.current.destination = true;
+        assert!(result(
+            Command::Recover,
+            Status::Partial,
+            bad,
+            Confirmation::default(),
+            p
+        )
+        .is_err());
+        assert_eq!(
+            Detail::decode(bad.encode()),
+            Err(DecodeError::ContradictoryProof)
+        );
+    }
+
+    #[test]
+    fn contradictory_wire_proofs_are_rejected_on_both_terminal_encode_and_decode() {
+        let (d, _, _) = minimized_here(GeometryProof::Deferred);
+        for field in 0..6 {
+            let mut bad = d;
+            match field {
+                0 => bad.progress.input_ready = true,
+                1 => bad.progress.placement_deferred = false,
+                2 => bad.placement.current.destination = false,
+                3 => bad.placement.current.geometry = GeometryProof::Verified,
+                4 => bad.placement.history.restoration_confirmed = true,
+                5 => bad.layer = LayerObservation::Unknown,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                Detail::decode(bad.encode()),
+                Err(DecodeError::ContradictoryProof)
+            );
+            assert_eq!(terminal(bad).encode(), Err(DecodeError::ContradictoryProof));
+            let mut words = terminal(d).encode().unwrap();
+            words[4] = bad.encode();
+            assert_eq!(
+                TerminalResponse::decode(&words),
+                Err(DecodeError::ContradictoryProof)
+            );
+        }
+        let (d, _, _) = complete(Command::BringHere);
+        for field in 0..5 {
+            let mut bad = d;
+            match field {
+                0 => bad.placement.current.geometry = GeometryProof::Unknown,
+                1 => bad.placement.current = PlacementConfirmation::default(),
+                2 => bad.progress.above_confirmed = true,
+                3 => bad.progress.not_minimized_confirmed = false,
+                4 => bad.visibility = Visibility::Unknown,
+                _ => unreachable!(),
+            }
+            // Retain historical proof so old current-readiness bits cannot
+            // acquire new placement meaning merely through stale history.
+            bad.placement.history.relocation_confirmed = true;
+            assert_eq!(
+                Detail::decode(bad.encode()),
+                Err(DecodeError::ContradictoryProof)
+            );
+            assert_eq!(terminal(bad).encode(), Err(DecodeError::ContradictoryProof));
+        }
+    }
+
+    #[test]
+    fn placement_status_reason_stage_cross_products_reject_inconsistent_lifecycle_and_progress() {
+        for command in [Command::BringHere, Command::Recover] {
+            for status in [
+                Status::Success,
+                Status::Failed,
+                Status::Partial,
+                Status::Busy,
+                Status::Starting,
+                Status::Closing,
+                Status::ProtocolError,
+            ] {
+                for reason in 0..=17 {
+                    let reason = Reason::try_from(reason).unwrap();
+                    for stage in [
+                        Stage::Preflight,
+                        Stage::Hide,
+                        Stage::Show,
+                        Stage::Geometry,
+                        Stage::Layer,
+                        Stage::Shutdown,
+                        Stage::Placement,
+                    ] {
+                        let d = preflight_detail(reason, stage);
+                        let valid =
+                            result(command, status, d, Confirmation::default(), progress()).is_ok();
+                        let expected = match status {
+                            Status::Success | Status::Partial => false,
+                            Status::Busy => reason == Reason::Busy && stage == Stage::Preflight,
+                            Status::Starting => {
+                                reason == Reason::Starting && stage == Stage::Preflight
+                            }
+                            Status::Closing => {
+                                reason == Reason::Closing && stage == Stage::Shutdown
+                            }
+                            Status::ProtocolError => {
+                                matches!(
+                                    reason,
+                                    Reason::MalformedRequest
+                                        | Reason::WrongVersion
+                                        | Reason::UnknownCommand
+                                        | Reason::StaleInstance
+                                ) && stage == Stage::Preflight
+                            }
+                            Status::Failed => {
+                                matches!(
+                                    reason,
+                                    Reason::Closing
+                                        | Reason::OwnershipLost
+                                        | Reason::BodyDestroyed
+                                        | Reason::Withdrawn
+                                        | Reason::Unverifiable
+                                        | Reason::Unsupported
+                                        | Reason::ConfirmationTimeout
+                                        | Reason::LayoutChanged
+                                        | Reason::LayerChanged
+                                        | Reason::ReleaseFailed
+                                        | Reason::X11Failure
+                                ) && stage != Stage::Hide
+                                    && (command == Command::Recover
+                                        || !matches!(stage, Stage::Show | Stage::Layer))
+                            }
+                        };
+                        assert_eq!(
+                            valid, expected,
+                            "{command:?} {status:?} {reason:?} {stage:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn old_commands_reject_new_proofs_without_weakening_their_accepted_result_rules() {
+        for command in [Command::Hide, Command::Show, Command::BringTop] {
+            let d = Detail {
+                placement: PlacementProof {
+                    history: RecoveryHistory {
+                        relocation_confirmed: true,
+                        restoration_confirmed: false,
+                    },
+                    ..PlacementProof::default()
+                },
+                ..preflight_detail(Reason::Unsupported, Stage::Preflight)
+            };
+            assert_eq!(
+                OperationResult::new(command, Status::Failed, d, Confirmation::default()),
+                Err(ResultError::InconsistentConfirmation)
+            );
+        }
+        for command in [Command::BringHere, Command::Recover] {
+            let (d, c, _) = complete(command);
+            assert!(OperationResult::new(command, Status::Success, d, c).is_err());
+        }
+    }
+    #[test]
+    fn here_success_never_silently_undoes_genuine_minimization() {
+        let (d, c, mut p) = complete(Command::BringHere);
+        p.baseline.as_mut().unwrap().minimized = true;
+        assert!(result(Command::BringHere, Status::Success, d, c, p).is_err());
+    }
+    #[test]
+    fn placement_proof_cross_product_keeps_current_readiness_and_historical_partial_independent() {
+        for command in [Command::BringHere, Command::Recover] {
+            for minimized in [false, true] {
+                for geometry in [
+                    GeometryProof::Unknown,
+                    GeometryProof::Deferred,
+                    GeometryProof::Verified,
+                ] {
+                    // Every combination of destination, preserved layer/minimization,
+                    // historical relocation/restoration and current input readiness.
+                    for bits in 0..64 {
+                        let destination = bits & 1 != 0;
+                        let layer = bits & 2 != 0;
+                        let preserved_min = bits & 4 != 0;
+                        let relocated = bits & 8 != 0;
+                        let restored = bits & 16 != 0;
+                        let input = bits & 32 != 0;
+                        let above = command == Command::Recover && !minimized;
+                        let mut p = progress();
+                        p.baseline.as_mut().unwrap().minimized =
+                            minimized || command == Command::Recover;
+                        p.baseline.as_mut().unwrap().layer = if command == Command::Recover {
+                            LayerObservation::Above
+                        } else {
+                            LayerObservation::Normal
+                        };
+                        p.proof = PlacementProof {
+                            current: PlacementConfirmation {
+                                destination,
+                                geometry,
+                                minimization_preserved: preserved_min,
+                                layer_preserved: layer,
+                            },
+                            history: RecoveryHistory {
+                                relocation_confirmed: relocated,
+                                restoration_confirmed: restored,
+                            },
+                        };
+                        let c = Confirmation {
+                            visibility: Some(if minimized {
+                                ConfirmedVisibility::Minimized
+                            } else {
+                                ConfirmedVisibility::NotMinimizedHere
+                            }),
+                            above,
+                        };
+                        let d = Detail {
+                            visibility: if minimized {
+                                Visibility::Minimized
+                            } else {
+                                Visibility::NotMinimizedHere
+                            },
+                            workspace: Workspace::Current,
+                            layer: p.baseline.unwrap().layer,
+                            progress: Progress {
+                                not_minimized_confirmed: !minimized,
+                                above_confirmed: above,
+                                input_ready: input,
+                                placement_deferred: geometry == GeometryProof::Deferred,
+                                host_mutation_dispatched: false,
+                            },
+                            placement: p.proof,
+                            ..preflight_detail(
+                                Reason::None,
+                                if command == Command::Recover {
+                                    Stage::Layer
+                                } else {
+                                    Stage::Placement
+                                },
+                            )
+                        };
+                        let consistent = (!preserved_min || (minimized && !restored))
+                            && (geometry == GeometryProof::Unknown || destination)
+                            && (geometry != GeometryProof::Deferred || preserved_min)
+                            && (!input
+                                || (!minimized
+                                    && destination
+                                    && geometry == GeometryProof::Verified))
+                            && (command != Command::BringHere || !restored);
+                        let complete = destination
+                            && if command == Command::Recover {
+                                !minimized && geometry == GeometryProof::Verified && input
+                            } else {
+                                layer
+                                    && if minimized {
+                                        preserved_min
+                                            && geometry != GeometryProof::Unknown
+                                            && !input
+                                    } else {
+                                        geometry == GeometryProof::Verified && input
+                                    }
+                            };
+                        let meaningful = relocated || (command == Command::Recover && restored);
+                        for status in [Status::Success, Status::Partial, Status::Failed] {
+                            let detail = Detail {
+                                reason: if status == Status::Success {
+                                    Reason::None
+                                } else {
+                                    Reason::ConfirmationTimeout
+                                },
+                                ..d
+                            };
+                            let expected = consistent
+                                && match status {
+                                    Status::Success => complete,
+                                    Status::Partial => meaningful,
+                                    Status::Failed => !meaningful,
+                                    _ => unreachable!(),
+                                };
+                            assert_eq!(
+                                result(command, status, detail, c, p).is_ok(),
+                                expected,
+                                "{command:?} {status:?} min={minimized} {geometry:?} bits={bits}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn placement_proofs_need_an_ordinary_known_baseline_but_unsupported_needs_none() {
+        for command in [Command::BringHere, Command::Recover] {
+            for field in 0..3 {
+                let (d, c, mut p) = complete(command);
+                match field {
+                    0 => p.baseline = None,
+                    1 => p.baseline.as_mut().unwrap().desktop = NO_DESTINATION,
+                    2 => p.baseline.as_mut().unwrap().layer = LayerObservation::Unknown,
+                    _ => unreachable!(),
+                }
+                assert!(result(command, Status::Success, d, c, p).is_err());
+            }
+            let mut p = progress();
+            p.baseline = None;
+            assert!(result(
+                command,
+                Status::Failed,
+                preflight_detail(Reason::Unsupported, Stage::Preflight),
+                Confirmation::default(),
+                p
+            )
+            .is_ok());
         }
     }
 }
