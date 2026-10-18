@@ -109,6 +109,8 @@ Required tests include complete codec round trips, mixed-v1/v2 rejection, reserv
 
 ## 6. Stage B — strict destination/layout evidence
 
+**Status — ACCEPTED 2026-10-18:** executable `4e2bd4dbfce786cc2b269bd2af0693881324cc93`; matching [CI 39155316992](https://github.com/zNe4/DesktopRoomie/actions/runs/39155316992), 537 passed / 0 failed; independent ChatGPT source review and explicit owner acceptance. Stage B adds no workspace mutation or Bring Here/Recover execution. This acceptance does not authorize H0 or Stage C.
+
 **Purpose:** create a read-only destination model that can prove whether a frozen target is safe and still current.
 
 Primary expected files: `src/x11/monitors.rs`, `src/x11/visibility.rs`, possibly a small pure placement helper.
@@ -126,7 +128,7 @@ Add strict reads/validation for:
 
 A changed count, target workarea, viewport, retained monitor or frozen-current-desktop relationship invalidates the operation; do not silently recompute a different target.
 
-**Gate:** deterministic/injected tests cover missing, malformed, truncated, overflow, too-small, stale and changing destination evidence. No state-changing workspace request exists.
+**Gate — satisfied:** deterministic/injected destination evidence and legacy-layout isolation passed source review and matching CI at `4e2bd4d…`; no state-changing workspace request exists. **Next:** H0 only under a separate owner assignment.
 
 **Recommended Codex:** GPT-6, High reasoning.
 
@@ -287,8 +289,6 @@ Record executable code SHA separately from later documentation-only commits. Pre
 
 ## 16. Immediate next gate
 
-**A00-M03.3-A — protocol v2 and pure operation foundations.**
+**A00-M03.3-H0 — owner-native Openbox feasibility evidence.**
 
-Starting branch for the first implementation prompt is whatever exact `m03` documentation HEAD contains this approved roadmap. The mission must name that SHA explicitly before Codex edits.
-
-Stage A enables no native workspace movement. After its implementation, matching CI and independent review, the owner decides whether to accept A and authorize Stage B.
+Stages A and B are accepted. H0 is an evidence checkpoint, not an implementation stage: begin with passive real-host snapshots of desktop count/workarea/viewport and retained-monitor facts, then perform only explicitly owner-authorized reversible `_NET_WM_DESKTOP` experiments with before/after state and real typing-focus observation. H0 does not authorize Stage C code or permanent host configuration changes. If H0 exposes focus/workspace switching, lost minimization, incompatible viewport semantics or other stop conditions, return to architecture review before implementing relocation.
