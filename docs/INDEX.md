@@ -1,6 +1,6 @@
 # Documentation index
 
-**Current M03.3 status (2026-10-20): Stage D ACCEPTED.** Standalone public `--bring-here` is owner-tested at executable `4c67da0b09ffe7b69605ac4a415d256acf8abd23`, [CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762) (677 tests); see [Stage-D acceptance](../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md) for N01–N16 distinctions. Prior A/B/H0/C remain separately accepted. Recover is still Unsupported and Stage E requires separate authorization.
+**Current M03.3 status (2026-10-20): Stage D accepted; Stage E E-P design approved, E1 pending separate assignment.** Public Bring Here remains accepted at executable `4c67da0b09ffe7b69605ac4a415d256acf8abd23`, [CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762), 677 tests. [E-P approved plan](DesktopRoomie-A00-M03.3-stage-E-approved-plan.md) freezes E1–E4 architecture and refinements without implementing Recover; the native gate and limits remain in [Stage-D acceptance](../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md). Recover remains Unsupported.
 
 DesktopRoomie is the reusable software; Project Vanilla is its private character implementation. This map separates implemented facts and evidence from future possibilities. The [current checkpoint](STATUS.md) carries changing status; this index is not a roadmap or implementation authorization.
 
@@ -38,6 +38,7 @@ DesktopRoomie is the reusable software; Project Vanilla is its private character
 - [A00-M03.3 Stage-C implementation/acceptance](../experiments/desktop-probe/M03.3-C-IMPLEMENTATION.md): historical checked transport-only checkpoint, later consumed by accepted Stage D.
 - [A00-M03.3 Stage-D acceptance](../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md): exact D1–D4.1 code/CI chain, rejected original D4 source review, public Here proof/semantics, owner-native evidence and qualified exclusions.
 - [A00-M03.3 Stage-D historical proposed plan](DesktopRoomie-A00-M03.3-stage-D-proposed-plan.md): originally approved checkpoint design; dated future-tense is not the current executable status.
+- [A00-M03.3 Stage-E **approved** E-P implementation plan](DesktopRoomie-A00-M03.3-stage-E-approved-plan.md): preserved read-only Codex architecture, exact phase/deadline/proof/fatal semantics, binding independent review refinements, and **E1–E4** gated source/CI/native sequence. The plan's approval does not authorize E1 implementation or enable Recover.
 - [Openbox host integration](host/OPENBOX.md): optional user-managed shortcut/launcher/autostart guidance, distinct from correctness-critical executable behavior. Records historical failed F evidence, manual ADD/REMOVE-HIDDEN experiments, implemented request matrix and [corrected F acceptance](host/OPENBOX.md#stage-f-acceptance-recorded-2026-10-13). Hide, local/off-workspace Show, original-workspace Bring Top and standalone Bring Here are accepted on the exercised Openbox host. Optional Openbox shortcuts remain user-managed.
 
 ## Acceptance and historical explanation
@@ -55,7 +56,7 @@ DesktopRoomie is the reusable software; Project Vanilla is its private character
 | M03.3 Stage C | [Stage-C implementation](../experiments/desktop-probe/M03.3-C-IMPLEMENTATION.md): executable `58a1ffa…`, [CI 39159965288](https://github.com/zNe4/DesktopRoomie/actions/runs/39159965288), 542 tests. | Historical unwired checked `_NET_WM_DESKTOP` transport, later consumed by Stage D. |
 | M03.3 Stage D | [Stage-D acceptance](../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md): `4c67da0b09ffe7b69605ac4a415d256acf8abd23`, [CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762), 677 tests. | Public standalone Bring Here, independent source review including D4.1 fatal correction, owner Openbox N01–N09/N14–N16 qualified gates; Recover remains Unsupported. |
 
-Earlier pending/unimplemented labels describe their original checkpoints. Lifecycle notes point to later acceptance without rewriting historical contracts or observations.
+Earlier pending/unimplemented labels describe their original checkpoints. Lifecycle notes point to later acceptance without rewriting historical contracts or observations. **E-P is an approved design checkpoint, not a Stage-E acceptance entry:** none of E1–E4 is implemented or native-tested at this checkpoint.
 
 ## Plans, research and possibilities
 

@@ -201,6 +201,8 @@ Partial requires historically confirmed actual relocation, not a no-op or correc
 
 ## 10. Stage E — composed Recover
 
+**Plan checkpoint — E-P APPROVED 2026-10-20 (documentation only):** the owner approved the [detailed E-P plan](DesktopRoomie-A00-M03.3-stage-E-approved-plan.md), preserving Codex's source inspection and the independent review's three mandatory refinements (clear stale Here current proof at handoff without erasing history, preserve single consumed correction/immutable deadline authority, and apply one D4.1-derived Recover fatal policy across both phases and external loop failures). **E1–E4** are separate gated implementations; E1 has not started and requires its own explicit assignment. The following Stage-E requirements remain approved constraints; Recover remains Unsupported.
+
 **Purpose:** enable `--recover` as one operation: Bring Here → accepted Bring Top.
 
 Do not invoke a second CLI/process/request and do not admit a nested active operation. Reuse the existing Show/geometry readiness and single absolute Above controller after the Here phase succeeds.
@@ -296,5 +298,5 @@ Record executable code SHA separately from later documentation-only commits. Pre
 
 ## 16. Immediate next gate
 
-**A00-M03.3 Stage E — composed Recover, only under a separate approved assignment.** Stages A, B, H0, C and D are accepted at their distinct code identities. Public standalone Bring Here is available and native-accepted on the exercised Openbox host, while Recover remains CLI-unavailable and private-service Unsupported. Stage E must compose the accepted Here and Bring Top with one operation and no silent retargeting. This documentation record does not authorize Stage E or further implementation.
+**A00-M03.3 Stage E1 — pure Recover foundations, only under a separate approved assignment.** The [approved E-P plan](DesktopRoomie-A00-M03.3-stage-E-approved-plan.md) splits Recover into E1–E4, with no E1 code authorized by the planning approval. Stages A, B, H0, C and D are accepted at their distinct code identities. Public standalone Bring Here is available and native-accepted on the exercised Openbox host, while Recover remains CLI-unavailable and private-service Unsupported. Stage E must compose the accepted Here and Bring Top with one operation and no silent retargeting. This documentation record does not authorize Stage E or further implementation.
 
