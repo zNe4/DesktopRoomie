@@ -3704,7 +3704,18 @@ fn service_bring_here_with(
     operation: &mut control::ActiveOperation,
     host: &mut impl BringHereHost,
 ) -> Result<Option<control::OperationResult>, HostError> {
-    let mut outcome = step_bring_here_with(operation, host);
+    let outcome = step_bring_here_with(operation, host);
+    finalize_bring_here_with(operation, host, outcome)
+}
+
+/// Shared D3 safety/history policy for host-method and external native failures.
+/// An externally supplied error enters before invalidation/cleanup, exactly as
+/// an error raised by the Here step. There is no second fatal policy.
+fn finalize_bring_here_with(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl BringHereHost,
+    mut outcome: Result<Option<control::OperationResult>, HostError>,
+) -> Result<Option<control::OperationResult>, HostError> {
     if outcome.is_err() {
         operation
             .placement
@@ -3774,6 +3785,35 @@ fn service_here_owner_with(
         return Ok(());
     }
     let outcome = service_bring_here_with(operation, host);
+    complete_here_owner_with(active, outcome, reply)
+}
+
+/// External fatal teardown bypasses scheduling, never the D3 finalizer. Leave
+/// legacy commands and an already-cleared slot untouched, including the error.
+fn fail_here_owner_with(
+    active: &mut Option<control::ActiveOperation>,
+    host: &mut impl BringHereHost,
+    reply: impl FnOnce(control::OperationResult) -> Result<(), HostError>,
+    original: HostError,
+) -> Result<(), HostError> {
+    let Some(operation) = active
+        .as_mut()
+        .filter(|operation| operation.request.command == control::Command::BringHere)
+    else {
+        return Err(original);
+    };
+    let outcome = finalize_bring_here_with(operation, host, Err(original));
+    complete_here_owner_with(active, outcome, reply)
+}
+
+/// Both service and external failure paths attempt one reply, clear the same
+/// slot, and preserve the original native error over a terminal-send failure.
+fn complete_here_owner_with(
+    active: &mut Option<control::ActiveOperation>,
+    outcome: Result<Option<control::OperationResult>, HostError>,
+    reply: impl FnOnce(control::OperationResult) -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    let operation = active.as_mut().expect("Here owner checked the active slot");
     let (result, primary) = match outcome {
         Ok(None) => return Ok(()),
         Ok(Some(result)) => {
@@ -5132,7 +5172,8 @@ fn service_owner_operation<C: Connection>(
     {
         return Ok(());
     }
-    owner.verify_active_ownership(host.conn)?;
+    // Here's first NativeHere::owned() is the fresh pre-mutation check. Its
+    // native failure must enter D3 fatal handling; a mismatch is OwnershipLost.
     if owner.service_here_with(host.conn, |active, selection, control_xid, reply| {
         let mut here = NativeHere {
             visibility: host,
@@ -5143,6 +5184,7 @@ fn service_owner_operation<C: Connection>(
     })? {
         return Ok(());
     }
+    owner.verify_active_ownership(host.conn)?; // unchanged legacy check
     let operation = owner
         .active_mut()
         .expect("active remote operation checked above");
@@ -5189,6 +5231,33 @@ fn service_owner_operation<C: Connection>(
             }
             Err(error) // original owner-local failure has priority
         }
+    }
+}
+
+/// Finalize any still-active Here before ordinary owner cleanup can classify
+/// it as Closing. No Here slot means the exact legacy fatal error passes through.
+fn fail_owner_operation<C: Connection>(
+    owner: &mut ControlWindow,
+    host: &mut NativeVisibility<'_, C>,
+    original: HostError,
+) -> HostError {
+    let mut original = Some(original);
+    match owner.service_here_with(host.conn, |active, selection, control_xid, reply| {
+        let mut here = NativeHere {
+            visibility: host,
+            selection,
+            control_xid,
+        };
+        fail_here_owner_with(
+            active,
+            &mut here,
+            reply,
+            original.take().expect("one Here fatal dispatch"),
+        )
+    }) {
+        Err(original) => original,
+        Ok(false) => original.expect("non-Here fatal error was not consumed"),
+        Ok(true) => unreachable!("fatal Here finalization returns the original error"),
     }
 }
 
@@ -5277,11 +5346,14 @@ fn run_probe(
     let mut bounds = initial_bounds;
     let mut buffered_event = None;
     let duration_deadline = probe_duration_deadline(Instant::now(), duration_secs)?;
-    loop {
+    // Every native failure, including all Event::Error sites and poll/read/
+    // dispatch failures, leaves through this boundary before global cleanup.
+    // Intentional lifecycle exits use the existing ProbeTermination separately.
+    let outcome = (|| loop {
         let now = Instant::now();
         if duration_deadline.is_some_and(|dl| now >= dl) {
             // Ordered owner cleanup publishes Closing before layer/input teardown.
-            return probe_termination_result(ProbeTermination::DurationExpired);
+            return Ok(Some(ProbeTermination::DurationExpired));
         }
         if let Some((Event::Error(error), _)) = &buffered_event {
             return Err(format!("Asynchronous X11 error: {error:?}").into());
@@ -5301,7 +5373,7 @@ fn run_probe(
             },
         )?;
         if runtime.body == BodyAvailability::Destroyed {
-            return Ok(());
+            return Ok(None);
         }
         if local_layer_service_allowed(owner.active())
             && runtime
@@ -5409,7 +5481,7 @@ fn run_probe(
         })?;
         for (event, sequence) in batch {
             if owner.handle_event(conn, &event)? {
-                return probe_termination_result(ProbeTermination::ControlEndpointLost);
+                return Ok(Some(ProbeTermination::ControlEndpointLost));
             }
             if route_owner_request(
                 owner,
@@ -5427,7 +5499,7 @@ fn run_probe(
                 },
             )? {
                 if runtime.body == BodyAvailability::Destroyed {
-                    return Ok(());
+                    return Ok(None);
                 }
                 continue;
             }
@@ -5450,7 +5522,7 @@ fn run_probe(
                     },
                 )?;
                 if runtime.body == BodyAvailability::Destroyed {
-                    return Ok(());
+                    return Ok(None);
                 }
             }
             if route_here_evidence_event(
@@ -5490,7 +5562,7 @@ fn run_probe(
                                 },
                             )?;
                             if runtime.body == BodyAvailability::Destroyed {
-                                return Ok(());
+                                return Ok(None);
                             }
                             if matches!(&event, Event::UnmapNotify(e) if e.window == window.window)
                             {
@@ -5538,7 +5610,7 @@ fn run_probe(
                         area: &mut usable_area,
                     })?;
                     if runtime.body == BodyAvailability::Destroyed {
-                        return Ok(());
+                        return Ok(None);
                     }
                     continue;
                 }
@@ -5708,7 +5780,7 @@ fn run_probe(
                                     )
                                 },
                             )? {
-                                return Ok(());
+                                return Ok(None);
                             }
                         }
                     }
@@ -5758,7 +5830,7 @@ fn run_probe(
                     window.window_resource.externally_destroyed();
                     runtime.unavailable(true);
                     println!("[LIFECYCLE] Body externally destroyed; shutting down");
-                    return Ok(());
+                    return Ok(None);
                 }
                 Event::ConfigureNotify(ev) if ev.window == window.window => {
                     if matches!(
@@ -5959,7 +6031,7 @@ fn run_probe(
                     renderer.paint(conn, window.window)?;
                 }
                 Event::ClientMessage(ev) if wm_delete_event(&ev, window) => {
-                    return probe_termination_result(ProbeTermination::WmClose);
+                    return Ok(Some(ProbeTermination::WmClose));
                 }
                 Event::Error(error) => {
                     return Err(format!("Asynchronous X11 error: {error:?}").into())
@@ -5985,7 +6057,7 @@ fn run_probe(
             },
         )?;
         if runtime.body == BodyAvailability::Destroyed {
-            return Ok(());
+            return Ok(None);
         }
         publish_ready_if(runtime.body, || owner.publish_ready(conn))?;
         if let Some(popup) = runtime.menu.as_mut() {
@@ -5995,7 +6067,7 @@ fn run_probe(
         // batch boundary must discard the coalesced move just like one within a batch.
         if let Some((event, sequence)) = conn.poll_for_event_with_sequence()? {
             if owner.handle_event(conn, &event)? {
-                return probe_termination_result(ProbeTermination::ControlEndpointLost);
+                return Ok(Some(ProbeTermination::ControlEndpointLost));
             }
             if route_owner_request(
                 owner,
@@ -6013,7 +6085,7 @@ fn run_probe(
                 },
             )? {
                 if runtime.body == BodyAvailability::Destroyed {
-                    return Ok(());
+                    return Ok(None);
                 }
                 continue;
             }
@@ -6056,6 +6128,36 @@ fn run_probe(
             .chain(remote_deadline(owner))
             .min();
         wait_x11(conn, timeout)?;
+    })();
+    finish_probe_run_with(outcome, |original| {
+        fail_owner_operation(
+            owner,
+            &mut NativeVisibility {
+                conn,
+                root,
+                atoms: &visibility_atoms,
+                layout_atoms: atoms,
+                selected_monitor,
+                window,
+                runtime,
+                bounds: &mut bounds,
+                area: &mut usable_area,
+            },
+            original,
+        )
+    })
+}
+
+/// Intentional termination retains its existing classification. Only a fatal
+/// loop error invokes Here-aware teardown; every error object is moved intact.
+fn finish_probe_run_with(
+    outcome: Result<Option<ProbeTermination>, HostError>,
+    fatal: impl FnOnce(HostError) -> HostError,
+) -> Result<(), HostError> {
+    match outcome {
+        Ok(Some(reason)) => probe_termination_result(reason),
+        Ok(None) => Ok(()),
+        Err(original) => Err(fatal(original)),
     }
 }
 
@@ -16573,5 +16675,353 @@ mod here_service_tests {
                 );
             }
         }
+    }
+    fn external_public_tick(
+        owner: &mut HereOwner,
+        host: &mut Fake,
+        original: HostError,
+    ) -> HostError {
+        // The production loop boundary and ControlWindow dispatch are real;
+        // only NativeHere's borrowed X11 operations use the existing fake.
+        finish_probe_run_with(Err(original), |original| {
+            let mut original = Some(original);
+            match owner.service(|active, _, _, reply| {
+                fail_here_owner_with(active, host, reply, original.take().unwrap())
+            }) {
+                Err(original) => original,
+                Ok(false) => original.unwrap(),
+                Ok(true) => panic!("fatal finalization must return its original error"),
+            }
+        })
+        .unwrap_err()
+    }
+    fn error_address(error: &HostError) -> *const () {
+        &**error as *const dyn std::error::Error as *const ()
+    }
+    fn assert_fatal_terminal(owner: &mut HereOwner, history: bool) {
+        let reply = public_terminal(
+            owner,
+            if history {
+                Status::Partial
+            } else {
+                Status::Failed
+            },
+            history,
+        );
+        assert_eq!(reply.detail.reason, Reason::X11Failure);
+        assert_eq!(reply.detail.stage, Stage::Shutdown);
+        assert_eq!(
+            reply.detail.placement.current,
+            control::PlacementConfirmation::default()
+        );
+        assert!(!reply.detail.progress.input_ready);
+        // Actual global cleanup uses finish_remote; neither Closing nor a
+        // later selection-loss classification can emit a second response.
+        owner.shutdown(true);
+        owner.shutdown(false);
+        assert!(owner.active().is_none());
+        assert_eq!(owner.replies().len(), 1);
+    }
+    #[test]
+    fn production_first_ownership_query_failure_is_failed_x11_and_clears_before_cleanup() {
+        let mut host = Fake::new(true, false, L::Normal);
+        let mut owner = public_owner(&mut host);
+        host.faults.push(("owner", 1));
+        let error = public_tick(&mut owner, &mut host).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<NativeFault>(),
+            Some(&NativeFault("owner", 1))
+        );
+        assert_fatal_terminal(&mut owner, false);
+        host.assert_no_mutation();
+        assert_eq!(host.log, ["owner"]);
+    }
+    #[test]
+    fn production_ownership_query_failure_after_dispatch_can_observe_history_once() {
+        let mut host = Fake::new(true, false, L::Below);
+        let mut owner = public_owner(&mut host);
+        public_tick(&mut owner, &mut host).unwrap();
+        assert!(
+            !owner
+                .active()
+                .unwrap()
+                .placement
+                .proof
+                .history
+                .relocation_confirmed
+        );
+        let query = host.count("owner") + 1;
+        let reads = host.count("layout");
+        host.target();
+        host.faults.push(("owner", query));
+        let error = public_tick(&mut owner, &mut host).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<NativeFault>(),
+            Some(&NativeFault("owner", query))
+        );
+        assert_fatal_terminal(&mut owner, true);
+        assert_eq!(
+            host.count("layout"),
+            reads + 2,
+            "one bounded Here evidence round"
+        );
+        assert_eq!(host.count("desktop"), 1);
+        assert_eq!(host.count("correct"), 0);
+        assert_eq!(host.count("shape"), 0);
+    }
+    #[test]
+    fn production_first_ownership_mismatch_remains_ownership_lost_without_mutation() {
+        let mut host = Fake::new(true, false, L::Normal);
+        let mut owner = public_owner(&mut host);
+        host.owned = false;
+        assert!(public_tick(&mut owner, &mut host).is_err());
+        let reply = public_terminal(&owner, Status::Failed, false);
+        assert_eq!(reply.detail.reason, Reason::OwnershipLost);
+        host.assert_no_mutation();
+        assert_eq!(host.log, ["owner"]);
+        owner.shutdown(false);
+        assert_eq!(owner.replies().len(), 1);
+    }
+    #[test]
+    fn external_async_before_mutation_preserves_original_error_and_replies_failed_once() {
+        let mut host = Fake::new(true, false, L::Above);
+        let mut owner = public_owner(&mut host);
+        let original: HostError = Box::new(NativeFault("async before service", 1));
+        let address = error_address(&original);
+        let error = external_public_tick(&mut owner, &mut host, original);
+        assert_eq!(error_address(&error), address);
+        assert_eq!(
+            error.downcast_ref::<NativeFault>(),
+            Some(&NativeFault("async before service", 1))
+        );
+        assert_fatal_terminal(&mut owner, false);
+        host.assert_no_mutation();
+        assert!(
+            host.log.is_empty(),
+            "no baseline or dispatch permits no final evidence read"
+        );
+    }
+    #[test]
+    fn external_async_after_dispatch_uses_one_final_history_round_without_retry() {
+        for (target, prior_history) in [(false, false), (true, false), (true, true)] {
+            let mut host = Fake::new(true, false, L::Normal);
+            let mut owner = public_owner(&mut host);
+            public_tick(&mut owner, &mut host).unwrap();
+            if target {
+                host.target();
+            }
+            if prior_history {
+                host.current.transitional = true;
+                mark_remote_observation(owner.active_mut().unwrap(), false);
+                public_tick(&mut owner, &mut host).unwrap();
+                assert!(
+                    owner
+                        .active()
+                        .unwrap()
+                        .placement
+                        .proof
+                        .history
+                        .relocation_confirmed
+                );
+            }
+            let reads = host.count("layout");
+            let original: HostError = Box::new(NativeFault("async after dispatch", 1));
+            let address = error_address(&original);
+            let error = external_public_tick(&mut owner, &mut host, original);
+            assert_eq!(error_address(&error), address);
+            assert_fatal_terminal(&mut owner, target);
+            assert!(owner.replies()[0].detail.progress.host_mutation_dispatched);
+            assert_eq!(host.count("layout"), reads + 2);
+            assert_eq!(host.count("desktop"), 1);
+            assert_eq!(host.count("correct"), 0);
+            assert_eq!(host.count("shape"), 0);
+        }
+    }
+    fn public_input_enable_boundary(owner: &mut HereOwner, host: &mut Fake, enabled: bool) {
+        public_tick(owner, host).unwrap();
+        host.target();
+        let operation = owner.active_mut().unwrap();
+        let (evidence, decision) = read_here(operation, host).unwrap();
+        assert_eq!(decision, control::HereDecision::Destination);
+        assert!(operation.placement.begin_here_geometry());
+        assert!(operation
+            .placement
+            .confirm_here_geometry(host.actual.origin(), host.actual.size()));
+        assert!(operation.consume_here_input_enable(host.now));
+        if enabled {
+            assert!(host
+                .enable(&evidence, host.actual, operation.deadline)
+                .unwrap());
+            assert!(operation.here_input_restored());
+        }
+    }
+    #[test]
+    fn external_async_during_or_after_input_enable_refences_once_and_never_enables_again() {
+        for enabled in [false, true] {
+            let mut host = Fake::new(true, false, L::Above);
+            let mut owner = public_owner(&mut host);
+            public_input_enable_boundary(&mut owner, &mut host, enabled);
+            let fences = host.count("fence");
+            let original: HostError = Box::new(NativeFault("async enable boundary", 1));
+            let address = error_address(&original);
+            let error = external_public_tick(&mut owner, &mut host, original);
+            assert_eq!(error_address(&error), address);
+            assert_fatal_terminal(&mut owner, true);
+            assert_eq!(host.count("fence"), fences + 1);
+            assert_eq!(host.count("shape"), usize::from(enabled));
+            assert_eq!(host.count("enable"), usize::from(enabled));
+            assert_eq!(host.count("desktop"), 1);
+            assert!(host.fence_settled());
+            assert!(!host.input_active());
+        }
+    }
+    #[test]
+    fn external_error_wins_over_safety_final_read_and_reply_failures_together() {
+        let mut host = Fake::new(true, false, L::Below);
+        let mut owner = public_owner(&mut host);
+        public_input_enable_boundary(&mut owner, &mut host, true);
+        let empty = host.count("empty");
+        let reads = host.count("layout");
+        host.faults = vec![("empty", empty + 1), ("layout", reads + 1)];
+        owner.fail_reply(true);
+        let original: HostError = Box::new(NativeFault("original external error", 99));
+        let address = error_address(&original);
+        let error = external_public_tick(&mut owner, &mut host, original);
+        assert_eq!(error_address(&error), address);
+        assert_eq!(
+            error.downcast_ref::<NativeFault>(),
+            Some(&NativeFault("original external error", 99))
+        );
+        assert_fatal_terminal(&mut owner, true);
+        assert_eq!(host.count("empty"), empty + 1);
+        assert_eq!(host.count("release"), 2);
+        assert_eq!(host.count("popup"), 2);
+        assert_eq!(
+            host.count("layout"),
+            reads + 1,
+            "failed read is never retried"
+        );
+        assert_eq!(host.count("desktop"), 1);
+        assert_eq!(host.count("shape"), 1);
+    }
+    #[test]
+    fn loop_boundary_keeps_clean_shutdown_and_proven_control_loss_out_of_fatal_policy() {
+        for termination in [
+            Some(ProbeTermination::DurationExpired),
+            Some(ProbeTermination::WmClose),
+            Some(ProbeTermination::ControlEndpointLost),
+            None,
+        ] {
+            let mut host = Fake::new(true, false, L::Normal);
+            let mut owner = public_owner(&mut host);
+            public_tick(&mut owner, &mut host).unwrap();
+            let result = finish_probe_run_with(Ok(termination), |_| {
+                panic!("intentional lifecycle exit is not a native failure")
+            });
+            let lost = matches!(termination, Some(ProbeTermination::ControlEndpointLost));
+            assert_eq!(result.is_err(), lost);
+            owner.shutdown(!lost);
+            let reply = public_terminal(&owner, Status::Failed, false);
+            assert_eq!(
+                reply.detail.reason,
+                if lost {
+                    Reason::OwnershipLost
+                } else {
+                    Reason::Closing
+                }
+            );
+            assert_eq!(host.count("desktop"), 1);
+        }
+    }
+    #[test]
+    fn external_fatal_policy_leaves_legacy_commands_and_recover_untouched() {
+        for command in [
+            Command::Hide,
+            Command::Show,
+            Command::BringTop,
+            Command::Recover,
+        ] {
+            let mut host = Fake::new(true, false, L::Normal);
+            let mut active = None;
+            let destination = if command == Command::Recover {
+                2
+            } else {
+                control::NO_DESTINATION
+            };
+            control::admit(
+                &mut active,
+                control::Request {
+                    command,
+                    request_id: 99,
+                    reply_xid: 88,
+                    epoch: 7,
+                },
+                destination,
+                control::Lifecycle::Ready,
+                false,
+                host.now,
+            );
+            let original_active = active;
+            let original: HostError = Box::new(NativeFault("legacy external error", 1));
+            let address = error_address(&original);
+            let error = finish_probe_run_with(Err(original), |error| {
+                fail_here_owner_with(
+                    &mut active,
+                    &mut host,
+                    |_| panic!("no Here reply for another command"),
+                    error,
+                )
+                .unwrap_err()
+            })
+            .unwrap_err();
+            assert_eq!(error_address(&error), address);
+            assert_eq!(active, original_active);
+            assert!(host.log.is_empty());
+            host.assert_no_mutation();
+        }
+    }
+    #[test]
+    fn every_production_async_error_return_is_inside_the_shared_fatal_loop_boundary() {
+        let source = include_str!("main.rs");
+        let probe = source
+            .split("fn run_probe(")
+            .nth(1)
+            .unwrap()
+            .split("fn finish_probe_run_with(")
+            .next()
+            .unwrap();
+        let loop_start = probe.find("let outcome = (|| loop {").unwrap();
+        let loop_end = probe.rfind("    })();").unwrap();
+        let sites: Vec<_> = probe.match_indices("Event::Error(error)").collect();
+        assert_eq!(
+            sites.len(),
+            4,
+            "buffered, batch, later routing, final match"
+        );
+        for (site, _) in sites {
+            assert!(site > loop_start && site < loop_end);
+            assert!(probe[site..].starts_with("Event::Error(error)"));
+        }
+        assert_eq!(
+            probe[loop_start..loop_end]
+                .matches("return Err(format!(\"Asynchronous X11 error:")
+                .count(),
+            4
+        );
+        assert!(probe[loop_end..].contains("finish_probe_run_with(outcome"));
+        assert!(probe[loop_end..].contains("fail_owner_operation("));
+        assert!(!probe[loop_start..loop_end].contains("return probe_termination_result("));
+        let service = source
+            .split("fn service_owner_operation<")
+            .nth(1)
+            .unwrap()
+            .split("fn fail_owner_operation<")
+            .next()
+            .unwrap();
+        assert!(
+            service.find("owner.service_here_with").unwrap()
+                < service.find("owner.verify_active_ownership").unwrap()
+        );
+        assert_eq!(service.matches("owner.verify_active_ownership").count(), 1);
     }
 }
