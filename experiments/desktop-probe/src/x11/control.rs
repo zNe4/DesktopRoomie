@@ -15,6 +15,7 @@ use x11rb::protocol::{ErrorKind, Event};
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as WrapperExt;
 
+use super::monitors::destination::{CallerDesktop, CallerDesktopAtoms, DestinationError};
 use crate::control::{
     self, selection_name, ActiveOperation, Admission, CallerMarker, Command, ExitCode, Lifecycle,
     OwnerDescriptor, Reason, ReplyCorrelation, Request, Stage, Status, TerminalResponse, INSTANCE,
@@ -504,6 +505,63 @@ impl ControlWindow {
 
     pub fn active_mut(&mut self) -> Option<&mut ActiveOperation> {
         self.active.as_mut()
+    }
+
+    /// Borrow the sole Here slot directly into the reviewed owner finalizer.
+    /// Only that finalizer clears it; the reply closure owns correlation values,
+    /// not a second operation, and cannot redirect the reply to another caller.
+    pub fn service_here_with(
+        &mut self,
+        conn: &impl Connection,
+        service: impl FnOnce(
+            &mut Option<ActiveOperation>,
+            u32,
+            u32,
+            &mut dyn FnMut(control::OperationResult) -> Result<()>,
+        ) -> Result<()>,
+    ) -> Result<bool> {
+        let selection = self.selection;
+        self.service_here_with_peer(&mut NativePeer { conn, selection }, service)
+    }
+
+    fn service_here_with_peer(
+        &mut self,
+        host: &mut impl PeerHost,
+        service: impl FnOnce(
+            &mut Option<ActiveOperation>,
+            u32,
+            u32,
+            &mut dyn FnMut(control::OperationResult) -> Result<()>,
+        ) -> Result<()>,
+    ) -> Result<bool> {
+        let Some(operation) = self.active.as_ref() else {
+            return Ok(false);
+        };
+        if operation.request.command != Command::BringHere {
+            return Ok(false);
+        }
+        let request = operation.request;
+        let control_xid = self.descriptor.control_xid;
+        let atoms = self.transport;
+        service(
+            &mut self.active,
+            self.selection,
+            control_xid,
+            &mut |result| {
+                host.send(reply_event(
+                    atoms,
+                    request.reply_xid,
+                    TerminalResponse {
+                        status: result.status(),
+                        detail: result.detail(),
+                        request_id: request.request_id,
+                        control_xid,
+                    },
+                )?)?;
+                Ok(())
+            },
+        )?;
+        Ok(true)
     }
 
     pub fn verify_active_ownership(&mut self, conn: &impl Connection) -> Result<()> {
@@ -1020,9 +1078,8 @@ fn route_request_with(
             (status, control::preflight_detail(reason, stage))
         }
         Admission::Admitted => {
-            if matches!(request.command, Command::BringHere | Command::Recover) {
-                // Stage A boundary: PeerHost has no body/WM/input methods. End
-                // here before main's accepted visibility/layer paths can run.
+            if request.command == Command::Recover {
+                // Recover remains unavailable before any body/WM/input call.
                 return finish_active(
                     host,
                     atoms,
@@ -1037,10 +1094,10 @@ fn route_request_with(
                 .map(|()| true);
             }
             let operation = active.as_mut().unwrap();
-            operation.stage = if request.command == Command::Hide {
-                Stage::Hide
-            } else {
-                Stage::Show
+            operation.stage = match request.command {
+                Command::Hide => Stage::Hide,
+                Command::BringHere => Stage::Placement,
+                _ => Stage::Show,
             };
             operation.detail = control::preflight_detail(Reason::None, operation.stage);
             return Ok(true);
@@ -1060,6 +1117,7 @@ fn route_request_with(
 pub enum CallerOutcome {
     NoInstance,
     Protocol,
+    InvalidDestination(String),
     Lifecycle(Lifecycle),
     Terminal(TerminalResponse),
     Unknown(&'static str),
@@ -1068,7 +1126,7 @@ impl CallerOutcome {
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::NoInstance => ExitCode::NoInstance,
-            Self::Protocol => ExitCode::Protocol,
+            Self::Protocol | Self::InvalidDestination(_) => ExitCode::Protocol,
             Self::Lifecycle(_) => ExitCode::Busy,
             Self::Terminal(response) => response.status.exit_code(),
             Self::Unknown(_) => ExitCode::OutcomeUnknown,
@@ -1078,9 +1136,13 @@ impl CallerOutcome {
         let message = match self {
             Self::NoInstance => "no running instance".into(),
             Self::Protocol => "incompatible, stale, or malformed owner endpoint".into(),
+            Self::InvalidDestination(reason) => format!("{reason}; request not sent"),
             Self::Lifecycle(lifecycle) => format!("owner is {lifecycle:?}"),
             Self::Terminal(response) if command == Command::BringTop => {
                 bring_top_diagnostic(response)
+            }
+            Self::Terminal(response) if command == Command::BringHere => {
+                bring_here_diagnostic(response)
             }
             Self::Terminal(response)
                 if command == Command::Hide && response.status == Status::Success =>
@@ -1125,6 +1187,36 @@ impl CallerOutcome {
             Self::Unknown(reason) => format!("outcome unknown — {reason}"),
         };
         format!("{command}: {message}")
+    }
+}
+
+fn bring_here_diagnostic(response: &TerminalResponse) -> String {
+    let d = response.detail;
+    let reason = match d.reason {
+        Reason::LayoutChanged => "workspace/layout changed",
+        Reason::LayerChanged => "effective layer changed",
+        Reason::ConfirmationTimeout => "confirmation timed out",
+        Reason::X11Failure => "X11 failure",
+        Reason::OwnershipLost => "owner selection lost",
+        Reason::Closing => "owner shutdown",
+        Reason::Unverifiable => "state unverifiable",
+        Reason::Unsupported => "required WM support unavailable",
+        reason => return here_terminal_diagnostic(response, &format!("{reason:?}")),
+    };
+    here_terminal_diagnostic(response, reason)
+}
+
+fn here_terminal_diagnostic(response: &TerminalResponse, reason: &str) -> String {
+    let d = response.detail;
+    match response.status {
+        Status::Success if d.progress.placement_deferred => "existing body confirmed on caller's frozen workspace while remaining genuinely minimized; layer preserved; placement/input deferred".into(),
+        Status::Success => format!("existing body {} on caller's frozen workspace; layer and minimization semantics preserved; placement verified, input ready",
+            if d.placement.history.relocation_confirmed { "relocated and confirmed" } else { "confirmed" }),
+        Status::Partial => format!("partial — actual relocation was confirmed earlier, but the complete final Bring Here postcondition was not retained; {reason}"),
+        Status::Failed => format!("failed — complete Bring Here was not confirmed; no accepted relocation history; {reason}{}",
+            if d.progress.host_mutation_dispatched { "; native dispatch occurred, so later WM movement remains possible" } else { "" }),
+        Status::Busy => "Busy — another remote or local layer/placement operation is active".into(),
+        status => format!("{status:?} — {reason} ({:?})", d.stage),
     }
 }
 
@@ -1217,6 +1309,11 @@ fn caller_request(window: u32, screen: &Screen) -> CreateWindowRequest<'static> 
 }
 
 trait CallerHost: PeerHost {
+    fn capture_desktop(&mut self) -> std::result::Result<CallerDesktop, DestinationError>;
+    fn revalidate_desktop(
+        &mut self,
+        captured: CallerDesktop,
+    ) -> std::result::Result<(), DestinationError>;
     fn atoms(&mut self, screen_num: u32) -> Result<(u32, TransportAtoms)>;
     fn watch(&mut self, owner: u32) -> Result<bool>;
     fn create_reply(&mut self, marker: CallerMarker) -> Result<u32>;
@@ -1229,6 +1326,7 @@ struct NativeCaller<'a> {
     screen: &'a Screen,
     atoms: TransportAtoms,
     reply: Option<(u32, OwnedResource)>,
+    here_atoms: Option<CallerDesktopAtoms>,
 }
 impl PeerHost for NativeCaller<'_> {
     fn now(&self) -> Instant {
@@ -1245,6 +1343,21 @@ impl PeerHost for NativeCaller<'_> {
     }
 }
 impl CallerHost for NativeCaller<'_> {
+    fn capture_desktop(&mut self) -> std::result::Result<CallerDesktop, DestinationError> {
+        let atoms = CallerDesktopAtoms::intern(self.peer.conn)?;
+        let captured = atoms.capture(self.peer.conn, self.screen.root)?;
+        self.here_atoms = Some(atoms);
+        Ok(captured)
+    }
+    fn revalidate_desktop(
+        &mut self,
+        captured: CallerDesktop,
+    ) -> std::result::Result<(), DestinationError> {
+        self.here_atoms
+            .as_ref()
+            .expect("Here capture precedes revalidation")
+            .revalidate(self.peer.conn, self.screen.root, captured)
+    }
     fn atoms(&mut self, screen_num: u32) -> Result<(u32, TransportAtoms)> {
         let conn = self.peer.conn;
         self.peer.selection = conn
@@ -1341,9 +1454,7 @@ fn caller_budget(command: Command) -> Duration {
     command.caller_budget()
 }
 
-/// D2 preparation only: D4 will write this immutable v2 marker once, after
-/// capture and before strict pre-send revalidation. No production caller uses it.
-#[allow(dead_code)]
+/// The immutable v2 marker is built once from the invoking caller's capture.
 fn here_caller_marker(
     captured: super::monitors::destination::CallerDesktop,
     owner: OwnerDescriptor,
@@ -1368,15 +1479,33 @@ fn caller_with(
     // This begins before atom/selection discovery and never changes.
     let deadline = host.now() + caller_budget(command);
     let operation = (|| {
+        let captured = if command == Command::BringHere {
+            match host.capture_desktop() {
+                Ok(captured) => Some(captured),
+                Err(error) => {
+                    return Ok(CallerOutcome::InvalidDestination(format!(
+                        "caller workspace capture failed: {error}"
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+        let expired =
+            || CallerOutcome::Unknown("caller deadline expired before send; request not sent");
+        if host.now() >= deadline {
+            return Ok(expired());
+        }
         let (instance, atoms) = host.atoms(screen_num)?;
+        if host.now() >= deadline {
+            return Ok(expired());
+        }
         let owner = match discover(host, root, screen_num, instance)? {
             Ok(owner) => owner,
             Err(outcome) => return Ok(outcome),
         };
         if host.now() >= deadline {
-            return Ok(CallerOutcome::Unknown(
-                "caller deadline expired before send",
-            ));
+            return Ok(expired());
         }
         if owner.lifecycle != Lifecycle::Ready {
             return Ok(CallerOutcome::Lifecycle(owner.lifecycle));
@@ -1384,16 +1513,28 @@ fn caller_with(
         if !host.watch(owner.control_xid)? {
             return Ok(CallerOutcome::Protocol);
         }
-        let marker = CallerMarker {
-            control_xid: owner.control_xid,
-            epoch: owner.epoch,
-            request_id: id()?,
-            command,
-            // Only the three accepted CLI commands reach this path in Stage A.
-            // No destination observation is performed or synthesized here.
-            destination_desktop: control::NO_DESTINATION,
+        if host.now() >= deadline {
+            return Ok(expired());
+        }
+        let request_id = id()?;
+        let marker = if let Some(captured) = captured {
+            here_caller_marker(captured, owner, request_id)
+        } else {
+            CallerMarker {
+                control_xid: owner.control_xid,
+                epoch: owner.epoch,
+                request_id,
+                command,
+                destination_desktop: control::NO_DESTINATION,
+            }
         };
+        if host.now() >= deadline {
+            return Ok(expired());
+        }
         let reply = host.create_reply(marker)?;
+        if host.now() >= deadline {
+            return Ok(expired());
+        }
         // Revalidate endpoint, identity and lifecycle at the send boundary. Never
         // redirect to a replacement owner or send with a stale epoch.
         let current = match discover(host, root, screen_num, instance)? {
@@ -1407,9 +1548,15 @@ fn caller_with(
             return Ok(CallerOutcome::Lifecycle(current.lifecycle));
         }
         if host.now() >= deadline {
-            return Ok(CallerOutcome::Unknown(
-                "caller deadline expired before send",
-            ));
+            return Ok(expired());
+        }
+        if let Some(captured) = captured {
+            if let Err(error) = host.revalidate_desktop(captured) {
+                return Ok(CallerOutcome::InvalidDestination(format!("frozen caller workspace changed or could not be revalidated before dispatch: {error}")));
+            }
+        }
+        if host.now() >= deadline {
+            return Ok(expired());
         }
         let request = Request {
             command,
@@ -1487,6 +1634,7 @@ pub fn invoke(command: Command) -> Result<CallerOutcome> {
         screen,
         atoms: TransportAtoms::default(),
         reply: None,
+        here_atoms: None,
     };
     caller_with(
         &mut host,
@@ -2358,7 +2506,7 @@ mod tests {
     }
 }
 #[cfg(test)]
-mod transport_tests {
+pub(crate) mod transport_tests {
     use super::*;
     use std::collections::VecDeque;
     use x11rb::protocol::xproto::DestroyNotifyEvent;
@@ -2419,6 +2567,16 @@ mod transport_tests {
             },
         }
     }
+    fn cardinal(word: u32) -> GetPropertyReply {
+        GetPropertyReply {
+            format: 32,
+            type_: AtomEnum::CARDINAL.into(),
+            length: 1,
+            value_len: 1,
+            value: word.to_ne_bytes().to_vec(),
+            ..Default::default()
+        }
+    }
     fn response() -> TerminalResponse {
         TerminalResponse {
             status: Status::Failed,
@@ -2453,6 +2611,10 @@ mod transport_tests {
         watch_ok: bool,
         send_ok: bool,
         failure: Option<&'static str>,
+        caller_pair: (u32, u32),
+        discovery_pair: Option<(u32, u32)>,
+        caller_snapshots:
+            VecDeque<std::result::Result<(GetPropertyReply, GetPropertyReply), DestinationError>>,
     }
     impl Fake {
         fn new() -> Self {
@@ -2471,6 +2633,9 @@ mod transport_tests {
                 watch_ok: true,
                 send_ok: true,
                 failure: None,
+                caller_pair: (9, 7),
+                discovery_pair: None,
+                caller_snapshots: VecDeque::new(),
             }
         }
         fn call(&mut self, name: &'static str) -> Result<()> {
@@ -2510,6 +2675,17 @@ mod transport_tests {
         fn call_command(&mut self) -> Result<CallerOutcome> {
             caller_with(self, ROOT, 0, Command::Show, || Ok(ID))
         }
+        fn read_caller(&mut self) -> std::result::Result<CallerDesktop, DestinationError> {
+            super::super::monitors::destination::capture_caller_with(|| {
+                self.call("caller count")
+                    .map_err(|e| DestinationError::Unverifiable(e.to_string()))?;
+                self.call("caller current")
+                    .map_err(|e| DestinationError::Unverifiable(e.to_string()))?;
+                self.caller_snapshots.pop_front().unwrap_or_else(|| {
+                    Ok((cardinal(self.caller_pair.0), cardinal(self.caller_pair.1)))
+                })
+            })
+        }
     }
     impl PeerHost for Fake {
         fn now(&self) -> Instant {
@@ -2517,6 +2693,9 @@ mod transport_tests {
         }
         fn owner(&mut self) -> Result<u32> {
             self.call("owner")?;
+            if let Some(pair) = self.discovery_pair {
+                self.caller_pair = pair;
+            }
             Ok(self.owners.pop_front().unwrap_or(self.owner))
         }
         fn evidence(&mut self, window: u32, property: u32) -> Result<Option<EndpointEvidence>> {
@@ -2538,6 +2717,19 @@ mod transport_tests {
         }
     }
     impl CallerHost for Fake {
+        fn capture_desktop(&mut self) -> std::result::Result<CallerDesktop, DestinationError> {
+            self.call("capture")
+                .map_err(|e| DestinationError::Unverifiable(e.to_string()))?;
+            self.read_caller()
+        }
+        fn revalidate_desktop(
+            &mut self,
+            captured: CallerDesktop,
+        ) -> std::result::Result<(), DestinationError> {
+            self.call("revalidate")
+                .map_err(|e| DestinationError::Unverifiable(e.to_string()))?;
+            captured.revalidate(self.read_caller()?)
+        }
         fn atoms(&mut self, _: u32) -> Result<(u32, TransportAtoms)> {
             self.call("atoms")?;
             Ok((30, atoms()))
@@ -3011,6 +3203,15 @@ mod transport_tests {
         }
 
         impl CallerHost for CoupledShow {
+            fn capture_desktop(&mut self) -> std::result::Result<CallerDesktop, DestinationError> {
+                panic!("Show must not capture caller workspace")
+            }
+            fn revalidate_desktop(
+                &mut self,
+                _: CallerDesktop,
+            ) -> std::result::Result<(), DestinationError> {
+                panic!("Show must not revalidate caller workspace")
+            }
             fn atoms(&mut self, screen_num: u32) -> Result<(u32, TransportAtoms)> {
                 self.transport.atoms(screen_num)
             }
@@ -4508,33 +4709,32 @@ mod transport_tests {
         }
     }
     #[test]
-    fn v2_placement_requests_end_unsupported_in_transport_without_an_active_body_operation() {
-        for command in [Command::BringHere, Command::Recover] {
-            let mut host = Fake::new();
-            host.evidence
-                .push_back(Some(evidence(&marker(command).encode().unwrap())));
-            let mut active = None;
-            host.route(
-                &mut active,
-                Lifecycle::Ready,
-                false,
-                &request_event(atoms(), CONTROL, request(command)).unwrap(),
-            )
-            .unwrap();
-            assert!(active.is_none());
-            assert_eq!(host.sent.len(), 1);
-            let event = host.sent[0];
-            assert_eq!((event.window, event.type_), (REPLY_WINDOW, atoms().reply));
-            let reply = TerminalResponse::decode(&event.data.as_data32()).unwrap();
-            assert_eq!(
-                (reply.status, reply.detail.reason, reply.detail.stage),
-                (Status::Failed, Reason::Unsupported, Stage::Preflight)
-            );
-            assert_eq!(reply.detail.progress, control::Progress::default());
-            assert_eq!(reply.detail.placement, control::PlacementProof::default());
-            assert_eq!(reply.request_id, ID);
-            assert_eq!(host.log, ["owner", "evidence", "owner", "send"]);
-        }
+    fn recover_requests_end_unsupported_in_transport_without_an_active_body_operation() {
+        let command = Command::Recover;
+        let mut host = Fake::new();
+        host.evidence
+            .push_back(Some(evidence(&marker(command).encode().unwrap())));
+        let mut active = None;
+        host.route(
+            &mut active,
+            Lifecycle::Ready,
+            false,
+            &request_event(atoms(), CONTROL, request(command)).unwrap(),
+        )
+        .unwrap();
+        assert!(active.is_none());
+        assert_eq!(host.sent.len(), 1);
+        let event = host.sent[0];
+        assert_eq!((event.window, event.type_), (REPLY_WINDOW, atoms().reply));
+        let reply = TerminalResponse::decode(&event.data.as_data32()).unwrap();
+        assert_eq!(
+            (reply.status, reply.detail.reason, reply.detail.stage),
+            (Status::Failed, Reason::Unsupported, Stage::Preflight)
+        );
+        assert_eq!(reply.detail.progress, control::Progress::default());
+        assert_eq!(reply.detail.placement, control::PlacementProof::default());
+        assert_eq!(reply.request_id, ID);
+        assert_eq!(host.log, ["owner", "evidence", "owner", "send"]);
     }
 
     #[test]
@@ -4727,6 +4927,579 @@ mod transport_tests {
         }
     }
 
+    /// Test facade over actual transport admission, production command dispatch,
+    /// reply correlation and shutdown. No native connection or body constructor.
+    pub(crate) struct HereOwner {
+        endpoint: ControlWindow,
+        peer: Fake,
+    }
+    impl HereOwner {
+        pub(crate) fn new(now: Instant, destination: u32) -> Self {
+            let mut endpoint = ControlWindow::candidate(0, CONTROL, 77, 50, 51, 52);
+            endpoint.descriptor = owner();
+            endpoint.root = ROOT;
+            endpoint.transport = atoms();
+            endpoint.owns_selection = true;
+            let mut peer = Fake::new();
+            peer.now = now;
+            let mut result = Self { endpoint, peer };
+            result.request(ID, destination, false);
+            assert!(result.peer.sent.is_empty());
+            let active = result.active().unwrap();
+            assert_eq!(active.request, request(Command::BringHere));
+            assert_eq!(active.placement.destination_desktop, destination);
+            assert_eq!(active.stage, Stage::Placement);
+            assert!(active.placement.observation_due());
+            assert_eq!(result.peer.log, ["owner", "evidence", "owner"]);
+            result
+        }
+        pub(crate) fn request(&mut self, id: u64, destination: u32, busy: bool) {
+            let marker = CallerMarker {
+                request_id: id,
+                destination_desktop: destination,
+                ..marker(Command::BringHere)
+            };
+            self.peer
+                .evidence
+                .push_back(Some(evidence(&marker.encode().unwrap())));
+            self.peer
+                .route(
+                    &mut self.endpoint.active,
+                    Lifecycle::Ready,
+                    busy,
+                    &request_event(
+                        atoms(),
+                        CONTROL,
+                        Request {
+                            request_id: id,
+                            ..request(Command::BringHere)
+                        },
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        pub(crate) fn active(&self) -> Option<&ActiveOperation> {
+            self.endpoint.active()
+        }
+        pub(crate) fn active_mut(&mut self) -> Option<&mut ActiveOperation> {
+            self.endpoint.active_mut()
+        }
+        pub(crate) fn service(
+            &mut self,
+            service: impl FnOnce(
+                &mut Option<ActiveOperation>,
+                u32,
+                u32,
+                &mut dyn FnMut(control::OperationResult) -> Result<()>,
+            ) -> Result<()>,
+        ) -> Result<bool> {
+            self.endpoint
+                .service_here_with_peer(&mut self.peer, service)
+        }
+        pub(crate) fn replies(&self) -> Vec<TerminalResponse> {
+            self.peer
+                .sent
+                .iter()
+                .map(|event| {
+                    assert_eq!((event.window, event.type_), (REPLY_WINDOW, atoms().reply));
+                    let reply = TerminalResponse::decode(&event.data.as_data32()).unwrap();
+                    assert_eq!(reply.control_xid, CONTROL);
+                    reply
+                })
+                .collect()
+        }
+        pub(crate) fn fail_reply(&mut self, fatal: bool) {
+            if fatal {
+                self.peer.failure = Some("send");
+            } else {
+                self.peer.send_ok = false;
+            }
+        }
+        pub(crate) fn shutdown(&mut self, owned: bool) {
+            self.endpoint.owns_selection = owned;
+            self.endpoint.finish_remote_with(&mut self.peer).unwrap();
+        }
+        pub(crate) fn advance_peer(&mut self, elapsed: Duration) {
+            self.peer.now += elapsed;
+        }
+        pub(crate) fn original_id(&self) -> u64 {
+            ID
+        }
+    }
+
+    #[test]
+    fn public_bring_here_roundtrip_uses_actual_caller_admission_dispatch_and_correlated_reply() {
+        struct Coupled {
+            caller: Fake,
+            peer: Fake,
+            endpoint: ControlWindow,
+            remote: bool,
+            minimized: bool,
+            layer: control::LayerObservation,
+        }
+        impl PeerHost for Coupled {
+            fn now(&self) -> Instant {
+                self.caller.now()
+            }
+            fn owner(&mut self) -> Result<u32> {
+                self.caller.owner()
+            }
+            fn evidence(&mut self, window: u32, property: u32) -> Result<Option<EndpointEvidence>> {
+                self.caller.evidence(window, property)
+            }
+            fn send(&mut self, event: ClientMessageEvent) -> Result<bool> {
+                self.caller.send(event)?;
+                let marker = self.caller.marker.unwrap();
+                assert_eq!(marker.destination_desktop, 2);
+                self.peer
+                    .evidence
+                    .push_back(Some(evidence(&marker.encode().unwrap())));
+                self.peer
+                    .route(&mut self.endpoint.active, Lifecycle::Ready, false, &event)?;
+                assert!(self.endpoint.active.is_some());
+                assert!(
+                    self.peer.sent.is_empty(),
+                    "admission must not reply Unsupported"
+                );
+                assert!(self.endpoint.service_here_with_peer(
+                    &mut self.peer,
+                    |active, _, _, reply| {
+                        crate::here_service_tests::public_roundtrip_service(
+                            active,
+                            self.remote,
+                            self.minimized,
+                            self.layer,
+                            reply,
+                        )
+                    }
+                )?);
+                assert!(self.endpoint.active.is_none());
+                assert_eq!(self.peer.sent.len(), 1);
+                self.caller
+                    .events
+                    .push_back(Event::ClientMessage(self.peer.sent[0]));
+                Ok(true)
+            }
+        }
+        impl CallerHost for Coupled {
+            fn capture_desktop(&mut self) -> std::result::Result<CallerDesktop, DestinationError> {
+                self.caller.capture_desktop()
+            }
+            fn revalidate_desktop(
+                &mut self,
+                captured: CallerDesktop,
+            ) -> std::result::Result<(), DestinationError> {
+                self.caller.revalidate_desktop(captured)
+            }
+            fn atoms(&mut self, screen: u32) -> Result<(u32, TransportAtoms)> {
+                self.caller.atoms(screen)
+            }
+            fn watch(&mut self, owner: u32) -> Result<bool> {
+                self.caller.watch(owner)
+            }
+            fn create_reply(&mut self, marker: CallerMarker) -> Result<u32> {
+                self.caller.create_reply(marker)
+            }
+            fn next(&mut self) -> Result<Option<Event>> {
+                self.caller.next()
+            }
+            fn wait(&mut self, deadline: Instant) -> Result<()> {
+                self.caller.wait(deadline)
+            }
+            fn cleanup(&mut self) -> Result<()> {
+                self.caller.cleanup()
+            }
+        }
+        for remote in [false, true] {
+            for minimized in [false, true] {
+                for layer in [
+                    control::LayerObservation::Normal,
+                    control::LayerObservation::Above,
+                    control::LayerObservation::Below,
+                ] {
+                    let mut caller = Fake::new();
+                    caller.caller_pair = (5, 2);
+                    let mut endpoint = ControlWindow::candidate(0, CONTROL, 77, 50, 51, 52);
+                    endpoint.descriptor = owner();
+                    endpoint.transport = atoms();
+                    endpoint.root = ROOT;
+                    let mut host = Coupled {
+                        caller,
+                        peer: Fake::new(),
+                        endpoint,
+                        remote,
+                        minimized,
+                        layer,
+                    };
+                    let crate::CliMode::Control(command) =
+                        crate::parse_args(["--bring-here"]).unwrap()
+                    else {
+                        panic!("caller role")
+                    };
+                    let result = caller_with(&mut host, ROOT, 0, command, || Ok(ID)).unwrap();
+                    let CallerOutcome::Terminal(reply) = &result else {
+                        panic!("terminal reply: {result:?}")
+                    };
+                    assert_eq!(result.exit_code(), ExitCode::Success);
+                    assert_eq!(reply.request_id, ID);
+                    assert_eq!(reply.control_xid, CONTROL);
+                    assert_eq!(reply.detail.layer, layer);
+                    assert_eq!(reply.detail.placement.history.relocation_confirmed, remote);
+                    assert_eq!(reply.detail.progress.placement_deferred, minimized);
+                    assert_eq!(host.caller.sent.len(), 1);
+                    assert_eq!(
+                        host.caller
+                            .log
+                            .iter()
+                            .filter(|&&s| s == "create reply")
+                            .count(),
+                        1
+                    );
+                    assert_eq!(host.caller.log.last(), Some(&"cleanup"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn production_here_dispatch_excludes_recover_and_all_legacy_commands() {
+        for command in [
+            Command::Hide,
+            Command::Show,
+            Command::BringTop,
+            Command::Recover,
+        ] {
+            let mut peer = Fake::new();
+            let mut endpoint = ControlWindow::candidate(0, CONTROL, 77, 50, 51, 52);
+            endpoint.descriptor = owner();
+            endpoint.root = ROOT;
+            endpoint.transport = atoms();
+            peer.evidence
+                .push_back(Some(evidence(&marker(command).encode().unwrap())));
+            peer.route(
+                &mut endpoint.active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, request(command)).unwrap(),
+            )
+            .unwrap();
+            let active = endpoint.active;
+            assert!(!endpoint
+                .service_here_with_peer(&mut peer, |_, _, _, _| panic!(
+                    "non-Here must never compose Here"
+                ))
+                .unwrap());
+            assert_eq!(endpoint.active, active);
+            if command == Command::Recover {
+                assert!(active.is_none());
+                let reply = TerminalResponse::decode(&peer.sent[0].data.as_data32()).unwrap();
+                assert_eq!(
+                    (reply.status, reply.detail.reason, reply.detail.stage),
+                    (Status::Failed, Reason::Unsupported, Stage::Preflight)
+                );
+                assert_eq!(peer.log, ["owner", "evidence", "owner", "send"]);
+            } else {
+                assert!(active.is_some());
+                assert!(peer.sent.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn public_here_admission_rejects_selection_loss_before_and_after_marker_validation() {
+        for owners in [vec![CONTROL + 1], vec![CONTROL, CONTROL + 1]] {
+            let mut host = Fake::new();
+            host.owners = owners.into();
+            host.evidence.push_back(Some(evidence(
+                &marker(Command::BringHere).encode().unwrap(),
+            )));
+            let mut active = None;
+            assert!(host
+                .route(
+                    &mut active,
+                    Lifecycle::Ready,
+                    false,
+                    &request_event(atoms(), CONTROL, request(Command::BringHere)).unwrap()
+                )
+                .is_err());
+            assert!(active.is_none());
+            assert!(host.sent.is_empty());
+        }
+    }
+
+    #[test]
+    fn public_here_capture_marker_rediscovery_revalidation_send_order_is_exact() {
+        let mut host = Fake::new();
+        host.events.push_back(terminal());
+        let outcome = caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID)).unwrap();
+        assert_eq!(outcome, CallerOutcome::Terminal(response()));
+        assert_eq!(host.marker, Some(marker(Command::BringHere)));
+        assert_eq!(host.sent.len(), 1);
+        assert_eq!(
+            Request::decode(&host.sent[0].data.as_data32()).unwrap(),
+            request(Command::BringHere)
+        );
+        assert_eq!(
+            host.log,
+            [
+                "capture",
+                "caller count",
+                "caller current",
+                "caller count",
+                "caller current",
+                "atoms",
+                "owner",
+                "evidence",
+                "owner",
+                "watch",
+                "create reply",
+                "owner",
+                "evidence",
+                "owner",
+                "revalidate",
+                "caller count",
+                "caller current",
+                "caller count",
+                "caller current",
+                "send",
+                "next",
+                "cleanup",
+            ]
+        );
+    }
+
+    #[test]
+    fn public_here_capture_failure_or_invalid_two_read_evidence_never_discovers_or_sends() {
+        for case in 0..7 {
+            let mut host = Fake::new();
+            match case {
+                0 => host.failure = Some("capture"),
+                1 => host.failure = Some("caller current"),
+                2 => host.caller_pair = (0, 0),
+                3 => host.caller_pair = (9, 9),
+                4 => host.caller_pair = (9, u32::MAX),
+                5 => host
+                    .caller_snapshots
+                    .push_back(Ok((GetPropertyReply::default(), cardinal(7)))),
+                _ => {
+                    host.caller_snapshots
+                        .push_back(Ok((cardinal(9), cardinal(6))));
+                }
+            }
+            let outcome = caller_with(&mut host, ROOT, 0, Command::BringHere, || {
+                panic!("no ID before capture")
+            })
+            .unwrap();
+            assert_eq!(outcome.exit_code(), ExitCode::Protocol);
+            assert!(outcome
+                .diagnostic(Command::BringHere)
+                .contains("capture failed"));
+            assert!(outcome
+                .diagnostic(Command::BringHere)
+                .contains("request not sent"));
+            assert!(!host.log.contains(&"owner"));
+            assert!(host.marker.is_none());
+            assert!(host.sent.is_empty());
+            assert_eq!(host.log.last(), Some(&"cleanup"));
+        }
+    }
+
+    #[test]
+    fn public_here_discovery_drift_never_retargets_rewrites_retries_or_sends() {
+        for (count, current) in [(10, 7), (9, 6), (9, u32::MAX), (0, 0)] {
+            let mut host = Fake::new();
+            host.discovery_pair = Some((count, current));
+            let outcome = caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID)).unwrap();
+            assert_eq!(outcome.exit_code(), ExitCode::Protocol);
+            assert!(outcome
+                .diagnostic(Command::BringHere)
+                .contains("frozen caller workspace changed"));
+            assert_eq!(host.marker, Some(marker(Command::BringHere)));
+            assert_eq!(host.log.iter().filter(|&&s| s == "create reply").count(), 1);
+            assert_eq!(host.log.iter().filter(|&&s| s == "capture").count(), 1);
+            assert_eq!(host.log.iter().filter(|&&s| s == "revalidate").count(), 1);
+            assert!(host.sent.is_empty());
+            assert_eq!(host.log.last(), Some(&"cleanup"));
+        }
+        let mut host = Fake::new();
+        host.failure = Some("revalidate");
+        assert_eq!(
+            caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID))
+                .unwrap()
+                .exit_code(),
+            ExitCode::Protocol
+        );
+        assert_eq!(host.marker, Some(marker(Command::BringHere)));
+        assert_eq!(host.log.iter().filter(|&&s| s == "create reply").count(), 1);
+        assert!(host.sent.is_empty());
+        assert_eq!(host.log.last(), Some(&"cleanup"));
+    }
+
+    #[test]
+    fn public_here_capture_and_revalidation_share_original_five_second_deadline() {
+        for step in [
+            "capture",
+            "atoms",
+            "owner",
+            "evidence",
+            "watch",
+            "create reply",
+            "revalidate",
+            "caller count",
+            "caller current",
+        ] {
+            let mut host = Fake::new();
+            host.cost = Some((step, Duration::from_millis(5000)));
+            let outcome = caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID)).unwrap();
+            assert_eq!(outcome.exit_code(), ExitCode::OutcomeUnknown, "{step}");
+            assert!(outcome
+                .diagnostic(Command::BringHere)
+                .contains("request not sent"));
+            assert!(host.sent.is_empty(), "{step}");
+            assert_eq!(host.log.last(), Some(&"cleanup"));
+        }
+        for step in ["capture", "create reply", "revalidate"] {
+            let mut host = Fake::new();
+            let start = host.now;
+            host.cost = Some((step, Duration::from_millis(1700)));
+            assert_eq!(
+                caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID))
+                    .unwrap()
+                    .exit_code(),
+                ExitCode::OutcomeUnknown
+            );
+            assert_eq!(host.waits, [start + Duration::from_millis(5000)]);
+            assert_eq!(host.now, start + Duration::from_millis(5000));
+            assert_eq!(host.sent.len(), 1);
+        }
+    }
+
+    #[test]
+    fn public_here_cleanup_covers_each_setup_send_and_wait_failure_boundary() {
+        for step in [
+            "atoms",
+            "owner",
+            "evidence",
+            "watch",
+            "create reply",
+            "send",
+            "next",
+            "wait",
+        ] {
+            let mut host = Fake::new();
+            host.failure = Some(step);
+            assert_eq!(
+                caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID))
+                    .unwrap_err()
+                    .to_string(),
+                step
+            );
+            assert_eq!(host.log.last(), Some(&"cleanup"));
+            assert_eq!(host.log.iter().filter(|&&s| s == "cleanup").count(), 1);
+            assert!(host.sent.len() <= 1);
+        }
+        let mut host = Fake::new();
+        assert!(caller_with(&mut host, ROOT, 0, Command::BringHere, || Err(
+            "id failed".into()
+        ))
+        .is_err());
+        assert_eq!(host.log.last(), Some(&"cleanup"));
+        assert!(host.sent.is_empty());
+    }
+
+    #[test]
+    fn public_here_owner_replacement_epoch_or_lifecycle_change_prevents_dispatch() {
+        for case in 0..4 {
+            let mut host = Fake::new();
+            let changed = OwnerDescriptor {
+                control_xid: if case == 0 { CONTROL + 1 } else { CONTROL },
+                epoch: if case == 1 { 78 } else { 77 },
+                lifecycle: match case {
+                    2 => Lifecycle::Starting,
+                    3 => Lifecycle::Closing,
+                    _ => Lifecycle::Ready,
+                },
+                ..owner()
+            };
+            host.owners =
+                VecDeque::from([CONTROL, CONTROL, changed.control_xid, changed.control_xid]);
+            host.evidence = VecDeque::from([
+                Some(evidence(&owner().encode().unwrap())),
+                Some(evidence(&changed.encode().unwrap())),
+            ]);
+            let outcome = caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID)).unwrap();
+            assert!(!matches!(outcome, CallerOutcome::Terminal(_)));
+            assert_eq!(host.marker, Some(marker(Command::BringHere)));
+            assert!(!host.log.contains(&"revalidate"));
+            assert!(host.sent.is_empty());
+            assert_eq!(host.log.last(), Some(&"cleanup"));
+        }
+    }
+
+    #[test]
+    fn public_here_replies_keep_full_correlation_and_owner_loss_is_bounded_unknown() {
+        let mut host = Fake::new();
+        for case in 0..4 {
+            let mut reply = reply_event(atoms(), REPLY_WINDOW, response()).unwrap();
+            let mut words = reply.data.as_data32();
+            match case {
+                0 => words[1] ^= 1,
+                1 => words[3] += 1,
+                2 => reply.window += 1,
+                _ => reply.type_ += 1,
+            }
+            reply.data = words.into();
+            host.events.push_back(Event::ClientMessage(reply));
+        }
+        host.events.push_back(terminal());
+        assert_eq!(
+            caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID)).unwrap(),
+            CallerOutcome::Terminal(response())
+        );
+        assert_eq!(host.log.iter().filter(|&&s| s == "next").count(), 5);
+        assert_eq!(host.sent.len(), 1);
+        for events in [vec![destroyed(false)], vec![]] {
+            let mut host = Fake::new();
+            let start = host.now;
+            host.events = events.into();
+            assert_eq!(
+                caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID))
+                    .unwrap()
+                    .exit_code(),
+                ExitCode::OutcomeUnknown
+            );
+            assert!(host.now <= start + Duration::from_millis(5000));
+            assert_eq!(host.sent.len(), 1);
+            assert_eq!(host.log.last(), Some(&"cleanup"));
+        }
+    }
+
+    #[test]
+    fn public_here_legacy_callers_do_not_read_here_identity() {
+        for command in [Command::Hide, Command::Show, Command::BringTop] {
+            let mut host = Fake::new();
+            host.failure = Some("capture");
+            host.caller_pair = (0, u32::MAX);
+            host.events.push_back(terminal());
+            assert_eq!(
+                caller_with(&mut host, ROOT, 0, command, || Ok(ID)).unwrap(),
+                CallerOutcome::Terminal(response())
+            );
+            assert_eq!(
+                host.marker.unwrap().destination_desktop,
+                control::NO_DESTINATION
+            );
+            assert!(!host.log.iter().any(|s| [
+                "capture",
+                "revalidate",
+                "caller count",
+                "caller current"
+            ]
+            .contains(s)));
+        }
+    }
+
     #[test]
     fn prepared_here_marker_freezes_only_the_validated_destination_in_existing_v2_shape() {
         use super::super::monitors::destination::capture_caller_with;
@@ -4770,8 +5543,7 @@ mod transport_tests {
             ..Default::default()
         };
         let captured = capture_caller_with(|| Ok((cardinal(9), cardinal(7)))).unwrap();
-        // D2 exercises the preparation/revalidation seams directly. Production
-        // caller_with still never chooses this path or writes a Here marker.
+        // Retain the D2 seam-level validation cases beside public routing tests.
         for case in 0..9 {
             let mut host = Fake::new();
             let original = here_caller_marker(captured, owner(), ID);

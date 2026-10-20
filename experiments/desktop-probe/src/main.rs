@@ -90,10 +90,11 @@ where
                     duration_secs = Some(value);
                 }
             }
-            flag @ ("--hide" | "--show" | "--bring-top") => {
+            flag @ ("--hide" | "--show" | "--bring-top" | "--bring-here") => {
                 let next = match flag {
                     "--hide" => control::Command::Hide,
                     "--show" => control::Command::Show,
+                    "--bring-here" => control::Command::BringHere,
                     _ => control::Command::BringTop,
                 };
                 if command.replace(next).is_some() {
@@ -129,23 +130,26 @@ where
     }
 }
 
+const HELP: &str = "DesktopRoomie - A00-M03.3: Desktop Probe
+
+Left click toggles color; left drag moves the body.
+Right click opens Above/Normal/Below/Dismiss/Quit after release. Outside left click dismisses.
+
+USAGE:
+  desktop-probe [OPTIONS]
+
+OPTIONS:
+  -h, --help              Show this help message and exit
+  --diagnose              Run pure X11 environment diagnostics and exit
+  --delay <SECONDS>       Delay in seconds before mapping window (for typing test)
+  --duration <SECONDS>    Run for a specified duration in seconds, then exit
+  --show       Restore the existing body without activation or workspace/layer changes
+  --hide       Minimize the existing body without workspace/layer changes
+  --bring-top  Ensure the existing body is not minimized and set Above on its existing workspace
+  --bring-here Move the existing body to the caller's current workspace, preserving its effective layer and genuine minimized state; do not activate it or switch the user's workspace";
+
 fn print_help() {
-    println!("DesktopRoomie - A00-M03.2: Desktop Probe");
-    println!();
-    println!("Left click toggles color; left drag moves the body.");
-    println!("Right click opens Above/Normal/Below/Dismiss/Quit after release. Outside left click dismisses.");
-    println!();
-    println!("USAGE:");
-    println!("  desktop-probe [OPTIONS]");
-    println!();
-    println!("OPTIONS:");
-    println!("  -h, --help              Show this help message and exit");
-    println!("  --diagnose              Run pure X11 environment diagnostics and exit");
-    println!("  --delay <SECONDS>       Delay in seconds before mapping window (for typing test)");
-    println!("  --duration <SECONDS>    Run for a specified duration in seconds, then exit");
-    println!(
-        "  --show       Restore the existing body without activation or workspace/layer changes\n  --hide       Minimize the existing body without workspace/layer changes\n  --bring-top  Ensure the existing body is not minimized and set Above on its existing workspace"
-    );
+    println!("{HELP}");
 }
 
 fn main() {
@@ -2291,9 +2295,10 @@ fn service_visibility_with(
             Ok(outcome)
         }
         control::Command::BringTop => unreachable!("Bring Top uses the remote composition service"),
-        control::Command::BringHere | control::Command::Recover => {
-            Ok(Some(unsupported_placement(operation)))
+        control::Command::BringHere => {
+            Err("Bring Here requires the dedicated Here owner service".into())
         }
+        control::Command::Recover => Ok(Some(unsupported_placement(operation))),
     }
 }
 
@@ -2327,7 +2332,7 @@ fn observe_visibility(
             operation.show.layout_interrupted,
         ),
         control::Command::BringHere | control::Command::Recover => {
-            unreachable!("Stage A has no placement observation")
+            unreachable!("Placement uses its dedicated owner service")
         }
     };
     if layout_interrupted {
@@ -3217,10 +3222,10 @@ fn service_remote_with(
     operation: &mut control::ActiveOperation,
     host: &mut impl BringTopHost,
 ) -> Result<Option<control::OperationResult>, HostError> {
-    if matches!(
-        operation.request.command,
-        control::Command::BringHere | control::Command::Recover
-    ) {
+    if operation.request.command == control::Command::BringHere {
+        return Err("Bring Here requires the dedicated Here owner service".into());
+    }
+    if operation.request.command == control::Command::Recover {
         return Ok(Some(unsupported_placement(operation)));
     }
     if operation.request.command == control::Command::BringTop {
@@ -3230,7 +3235,7 @@ fn service_remote_with(
     }
 }
 
-/// Defense at the service boundary too: no host method is called for Stage A.
+/// Recover remains unavailable at the service boundary without any host call.
 fn unsupported_placement(operation: &control::ActiveOperation) -> control::OperationResult {
     control::OperationResult::placement(
         operation.request.command,
@@ -3239,7 +3244,7 @@ fn unsupported_placement(operation: &control::ActiveOperation) -> control::Opera
         control::Confirmation::default(),
         &operation.placement,
     )
-    .expect("Stage A placement commands are unsupported without progress")
+    .expect("Recover is unsupported without progress")
 }
 
 /// Retains marked dispatch even when the native check fails. A transitional
@@ -3302,17 +3307,13 @@ struct NativeVisibility<'a, C> {
 
 /// Strict D2.1 evidence. Ordinary invalid evidence is deliberately separate
 /// from the outer, fatal native acquisition error.
-#[allow(dead_code)]
 struct HereEvidence {
     layout: Result<control::DestinationIdentity, x11::monitors::destination::DestinationError>,
     observation: control::HereObservation,
     snapshot: x11::visibility::VisibilitySnapshot,
 }
 
-/// Guarded D3 owner service. This interface deliberately has no Show, layer,
-/// activation, resize, or current-desktop operation. D4 alone may connect it to
-/// production admission/service; both Unsupported boundaries still precede it.
-#[allow(dead_code)]
+/// Here owner service with no Show, layer, activation, resize, or current-desktop operation.
 trait BringHereHost {
     fn now(&self) -> Instant;
     fn owned(&mut self) -> Result<bool, HostError>;
@@ -3356,7 +3357,6 @@ fn here_destination_reason(
     }
 }
 
-#[allow(dead_code)] // D3 is exercised only through injected owner seams until D4.
 fn read_here(
     operation: &mut control::ActiveOperation,
     host: &mut impl BringHereHost,
@@ -3382,7 +3382,6 @@ fn read_here(
     Ok((evidence, decision))
 }
 
-#[allow(dead_code)]
 fn incomplete_here(
     operation: &mut control::ActiveOperation,
     reason: control::Reason,
@@ -3397,7 +3396,6 @@ fn incomplete_here(
         .expect("Incomplete Here clears current claims and retains genuine history")
 }
 
-#[allow(dead_code)]
 fn complete_here(
     operation: &mut control::ActiveOperation,
     evidence: &HereEvidence,
@@ -3440,7 +3438,6 @@ fn complete_here(
 /// Read-only final visible proof brackets actual geometry with fresh strict
 /// evidence. Neither checked ConfigureWindow nor SHAPE acknowledgment supplies
 /// this proof. Used by safe no-op, restored input, and expiry finalization.
-#[allow(dead_code)]
 fn verify_here_visible(
     operation: &mut control::ActiveOperation,
     host: &mut impl BringHereHost,
@@ -3475,7 +3472,6 @@ fn verify_here_visible(
 
 /// No loops/polling: immediate safety phases are bounded, then observation is
 /// driven by notifications or the earliest fixed deadline.
-#[allow(dead_code)]
 fn step_bring_here_with(
     operation: &mut control::ActiveOperation,
     host: &mut impl BringHereHost,
@@ -3704,7 +3700,6 @@ fn step_bring_here_with(
 /// Preserve the exact primary native error through final observation/cleanup.
 /// Committing fatal teardown precedes the bounded history-only read: no later
 /// snapshot can reconstruct Success for an owner that is already terminating.
-#[allow(dead_code)]
 fn service_bring_here_with(
     operation: &mut control::ActiveOperation,
     host: &mut impl BringHereHost,
@@ -3767,7 +3762,6 @@ fn service_bring_here_with(
 
 /// Internal owner completion seam: caller disappearance does not cancel work;
 /// terminal send failure clears active exactly once and never undoes progress.
-#[allow(dead_code)]
 fn service_here_owner_with(
     active: &mut Option<control::ActiveOperation>,
     host: &mut impl BringHereHost,
@@ -3810,9 +3804,7 @@ fn service_here_owner_with(
     }
 }
 
-/// Borrows the existing runtime/resources; owns no request or controller. No
-/// production constructor/call site exists before D4.
-#[allow(dead_code)]
+/// Borrows the existing runtime/resources; owns no request or controller.
 struct NativeHere<'a, 'b, C> {
     visibility: &'a mut NativeVisibility<'b, C>,
     selection: u32,
@@ -3986,7 +3978,6 @@ fn here_evidence_with(
 }
 
 impl<C: Connection> NativeVisibility<'_, C> {
-    #[allow(dead_code)] // Guarded D3 adapter; both production guards remain closed until D4.
     fn here_observe(&mut self, frozen_destination: u32) -> Result<HereEvidence, HostError> {
         use x11::monitors::destination::query_destination_layout_preserving_native;
         let (conn, root, atoms, selected) = (
@@ -4011,7 +4002,6 @@ impl<C: Connection> NativeVisibility<'_, C> {
         )
     }
 
-    #[allow(dead_code)] // D1/D3 own one-shot authority, never this guarded adapter.
     fn here_correct(
         &mut self,
         target: Point,
@@ -4058,7 +4048,7 @@ fn here_correct_with(
 
 /// Explicit, already-admitted envelope inputs. The consuming Stage-C primitive
 /// alone handles expiry/possible dispatch/checking, with no WM confirmation.
-#[allow(dead_code, clippy::too_many_arguments)] // Guarded native seam until D4.
+#[allow(clippy::too_many_arguments)]
 fn request_here_desktop(
     conn: &impl Connection,
     runtime: &ProbeRuntime,
@@ -5143,6 +5133,16 @@ fn service_owner_operation<C: Connection>(
         return Ok(());
     }
     owner.verify_active_ownership(host.conn)?;
+    if owner.service_here_with(host.conn, |active, selection, control_xid, reply| {
+        let mut here = NativeHere {
+            visibility: host,
+            selection,
+            control_xid,
+        };
+        service_here_owner_with(active, &mut here, reply)
+    })? {
+        return Ok(());
+    }
     let operation = owner
         .active_mut()
         .expect("active remote operation checked above");
@@ -5159,9 +5159,8 @@ fn service_owner_operation<C: Connection>(
                 operation.detail.reason
             };
             let result = match operation.request.command {
-                control::Command::BringHere | control::Command::Recover => {
-                    unsupported_placement(operation)
-                }
+                control::Command::BringHere => unreachable!("Here uses its own owner finalizer"),
+                control::Command::Recover => unsupported_placement(operation),
                 control::Command::Hide => hide_result(operation, control::Status::Failed, reason),
                 control::Command::Show => {
                     show_result(operation, control::Status::Failed, reason, None)
@@ -8961,22 +8960,36 @@ mod cli_tests {
             ("--hide", Command::Hide),
             ("--show", Command::Show),
             ("--bring-top", Command::BringTop),
+            ("--bring-here", Command::BringHere),
         ] {
             assert_eq!(parse_args([flag]), Ok(CliMode::Control(command)));
         }
     }
     #[test]
-    fn guarded_placement_commands_remain_unknown_cli_options() {
-        for flag in ["--bring-here", "--recover"] {
-            let error = parse_args([flag]).unwrap_err();
-            assert_eq!(error.exit_code(), ExitCode::Usage);
-            assert!(error.0.contains(&format!("Unknown option: '{flag}'")));
-        }
+    fn help_advertises_only_enabled_bring_here_with_preservation_semantics() {
+        assert!(HELP.contains("A00-M03.3"));
+        assert!(HELP.contains("--bring-here"));
+        assert!(HELP.contains("genuine minimized state"));
+        assert!(HELP.contains("do not activate it or switch the user's workspace"));
+        assert!(!HELP.contains("--recover"));
+    }
+    #[test]
+    fn recover_remains_unknown_cli_option() {
+        let flag = "--recover";
+        let error = parse_args([flag]).unwrap_err();
+        assert_eq!(error.exit_code(), ExitCode::Usage);
+        assert!(error.0.contains(&format!("Unknown option: '{flag}'")));
     }
     #[test]
     fn control_conflicts_in_either_order_are_usage_errors() {
-        for a in ["--hide", "--show", "--bring-top"] {
-            for b in ["--hide", "--show", "--bring-top", "--diagnose"] {
+        for a in ["--hide", "--show", "--bring-top", "--bring-here"] {
+            for b in [
+                "--hide",
+                "--show",
+                "--bring-top",
+                "--bring-here",
+                "--diagnose",
+            ] {
                 for args in [[a, b], [b, a]] {
                     assert_eq!(parse_args(args).unwrap_err().exit_code(), ExitCode::Usage);
                 }
@@ -9743,37 +9756,69 @@ mod show_tests {
         reading(Visibility::NotMinimizedHere, L::Normal, 2, 2)
     }
     #[test]
-    fn stage_a_placement_service_cannot_call_any_body_host_method() {
-        for command in [Command::BringHere, Command::Recover] {
-            let mut host = Fake::new(visible());
-            let mut active = None;
-            control::admit(
-                &mut active,
-                control::Request {
-                    command,
-                    request_id: 99,
-                    reply_xid: 88,
-                    epoch: 7,
-                },
-                2,
-                Lifecycle::Ready,
-                false,
-                host.now,
-            );
-            let mut operation = active.unwrap();
-            let original = operation;
-            let result = service_remote_with(&mut operation, &mut host)
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                (result.status(), result.detail().reason),
-                (Status::Failed, Reason::Unsupported)
-            );
-            assert!(host.log.is_empty());
-            assert!(host.mutations.is_empty());
-            assert_eq!(operation, original);
-            assert_eq!(host.runtime.body, BodyAvailability::Ready);
-        }
+    fn recover_service_cannot_call_any_body_host_method() {
+        let command = Command::Recover;
+        let mut host = Fake::new(visible());
+        let mut active = None;
+        control::admit(
+            &mut active,
+            control::Request {
+                command,
+                request_id: 99,
+                reply_xid: 88,
+                epoch: 7,
+            },
+            2,
+            Lifecycle::Ready,
+            false,
+            host.now,
+        );
+        let mut operation = active.unwrap();
+        let original = operation;
+        let result = service_remote_with(&mut operation, &mut host)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                result.status(),
+                result.detail().reason,
+                result.detail().stage
+            ),
+            (
+                Status::Failed,
+                Reason::Unsupported,
+                control::Stage::Preflight
+            )
+        );
+        assert!(host.log.is_empty());
+        assert!(host.mutations.is_empty());
+        assert_eq!(operation, original);
+        assert_eq!(host.runtime.body, BodyAvailability::Ready);
+    }
+
+    #[test]
+    fn here_cannot_enter_legacy_visibility_or_bring_top_service() {
+        let mut host = Fake::new(visible());
+        let mut active = None;
+        control::admit(
+            &mut active,
+            control::Request {
+                command: Command::BringHere,
+                request_id: 99,
+                reply_xid: 88,
+                epoch: 7,
+            },
+            2,
+            Lifecycle::Ready,
+            false,
+            host.now,
+        );
+        let operation = active.as_mut().unwrap();
+        assert!(service_remote_with(operation, &mut host).is_err());
+        assert!(service_visibility_with(operation, &mut host).is_err());
+        assert!(host.log.is_empty());
+        assert!(host.mutations.is_empty());
+        assert!(host.runtime.layers.pending().is_none());
     }
 
     fn assert_success(result: control::OperationResult, here: bool, dispatched: bool) {
@@ -16111,6 +16156,422 @@ mod here_service_tests {
             );
             assert_eq!(result.detail().stage, Stage::Shutdown);
             assert_eq!(result.detail().reason, Reason::Closing);
+        }
+    }
+    use x11::control::transport_tests::HereOwner;
+
+    pub(crate) fn public_roundtrip_service(
+        active: &mut Option<ActiveOperation>,
+        remote: bool,
+        minimized: bool,
+        layer: L,
+        reply: &mut dyn FnMut(control::OperationResult) -> Result<(), HostError>,
+    ) -> Result<(), HostError> {
+        let mut host = Fake::new(remote, minimized, layer);
+        host.window.window = 88;
+        assert_eq!(active.as_ref().unwrap().placement.destination_desktop, 2);
+        service_here_owner_with(active, &mut host, &mut *reply)?;
+        if remote {
+            host.target();
+            mark_remote_observation(active.as_mut().unwrap(), false);
+            service_here_owner_with(active, &mut host, &mut *reply)?;
+        }
+        assert!(active.is_none());
+        assert_eq!(host.count("desktop"), usize::from(remote));
+        assert_eq!(host.window.window, 88);
+        Ok(())
+    }
+
+    fn public_tick(owner: &mut HereOwner, host: &mut Fake) -> Result<bool, HostError> {
+        // Same scoped transport callback and D3 finalizer as production; only
+        // the borrowed NativeHere adapter is replaced with its injected host.
+        owner.service(|active, selection, control_xid, reply| {
+            assert_eq!((selection, control_xid), (50, 10));
+            service_here_owner_with(active, host, reply)
+        })
+    }
+    fn public_owner(host: &mut Fake) -> HereOwner {
+        // The fixture publishes 88 as its existing body; no create/map API is
+        // available in the Here service. Track that exact resource throughout.
+        host.window.window = 88;
+        HereOwner::new(host.now, 2)
+    }
+    fn public_terminal(
+        owner: &HereOwner,
+        status: Status,
+        history: bool,
+    ) -> control::TerminalResponse {
+        assert!(owner.active().is_none());
+        let replies = owner.replies();
+        assert_eq!(replies.len(), 1);
+        let reply = replies[0];
+        assert_eq!(reply.request_id, owner.original_id());
+        assert_eq!(reply.status, status);
+        assert_eq!(reply.detail.placement.history.relocation_confirmed, history);
+        assert!(!reply.detail.placement.history.restoration_confirmed);
+        let caller = x11::control::CallerOutcome::Terminal(reply);
+        let before = caller.exit_code();
+        let text = caller.diagnostic(Command::BringHere);
+        assert!(text.starts_with("bring-here:"));
+        assert_eq!(before, status.exit_code());
+        assert_eq!(
+            caller.exit_code(),
+            before,
+            "diagnostics cannot reclassify results"
+        );
+        reply
+    }
+    #[test]
+    fn public_admission_dispatch_and_completion_preserve_each_layer_and_minimization() {
+        for remote in [false, true] {
+            for minimized in [false, true] {
+                for layer in [L::Normal, L::Above, L::Below] {
+                    let mut host = Fake::new(remote, minimized, layer);
+                    let mut owner = public_owner(&mut host);
+                    assert!(public_tick(&mut owner, &mut host).unwrap());
+                    if remote {
+                        assert!(owner.active().is_some());
+                        assert_eq!(host.count("desktop"), 1);
+                        let deadline = owner.active().unwrap().deadline;
+                        // D3 schedules one fresh observation after checked dispatch.
+                        assert!(public_tick(&mut owner, &mut host).unwrap());
+                        let calls = host.log.len();
+                        assert!(public_tick(&mut owner, &mut host).unwrap());
+                        assert_eq!(host.log.len(), calls);
+                        assert_eq!(owner.active().unwrap().deadline, deadline);
+                        let send = host.log.iter().position(|s| *s == "desktop").unwrap();
+                        let release = host.log.iter().position(|s| *s == "release").unwrap();
+                        assert!(release < send);
+                        assert!(host.log[release..send].contains(&"layout"));
+                        host.target();
+                        mark_remote_observation(owner.active_mut().unwrap(), false);
+                        assert!(public_tick(&mut owner, &mut host).unwrap());
+                    }
+                    let reply = public_terminal(&owner, Status::Success, remote);
+                    assert_eq!(reply.detail.layer, layer);
+                    assert_eq!(reply.detail.progress.placement_deferred, minimized);
+                    assert_eq!(reply.detail.progress.input_ready, !minimized);
+                    let diagnostic =
+                        x11::control::CallerOutcome::Terminal(reply).diagnostic(Command::BringHere);
+                    assert!(diagnostic.contains("layer"));
+                    assert!(diagnostic.contains("preserved"));
+                    if minimized {
+                        assert!(diagnostic.contains("remaining genuinely minimized"));
+                        assert!(diagnostic.contains("placement/input deferred"));
+                        assert!(!diagnostic.contains("restored"));
+                        assert_eq!(host.count("shape"), 0);
+                        assert_eq!(host.count("geometry"), 0);
+                    } else {
+                        assert!(diagnostic.contains("placement verified, input ready"));
+                        assert_eq!(diagnostic.contains("relocated"), remote);
+                        assert_eq!(host.count("shape"), usize::from(remote));
+                    }
+                    assert_eq!(host.count("desktop"), usize::from(remote));
+                    assert_eq!(host.count("correct"), 0);
+                    if !remote && !minimized {
+                        host.assert_no_mutation();
+                    }
+                    assert_eq!(host.window.window, 88);
+                    assert!(host.runtime.layers.pending().is_none());
+                    let log = host.log.clone();
+                    assert!(!public_tick(&mut owner, &mut host).unwrap());
+                    assert_eq!(host.log, log);
+                    assert_eq!(owner.replies().len(), 1);
+                }
+            }
+        }
+    }
+    #[test]
+    fn public_local_repair_uses_d3_correction_without_relocation_or_false_moved_diagnostic() {
+        let mut host = Fake::new(false, false, L::Below);
+        host.actual = Rect::new(900, -30, 160, 160);
+        let mut owner = public_owner(&mut host);
+        assert!(public_tick(&mut owner, &mut host).unwrap());
+        assert_eq!(host.count("correct"), 1);
+        mark_remote_observation(owner.active_mut().unwrap(), false);
+        assert!(public_tick(&mut owner, &mut host).unwrap());
+        let reply = public_terminal(&owner, Status::Success, false);
+        let text = x11::control::CallerOutcome::Terminal(reply).diagnostic(Command::BringHere);
+        assert!(!text.contains("relocated"));
+        assert!(!text.contains("moved"));
+        assert!(text.contains("confirmed on caller's frozen workspace"));
+        assert_eq!(host.actual.origin(), Point::new(640, 0));
+        assert_eq!(host.count("desktop"), 0);
+        assert_eq!(host.count("correct"), 1);
+        assert_eq!(host.count("shape"), 1);
+    }
+    #[test]
+    fn public_existing_placement_is_busy_without_body_calls() {
+        let mut host = Fake::new(true, false, L::Normal);
+        host.runtime.correction = Some((Point::new(0, 0), host.now));
+        let mut owner = public_owner(&mut host);
+        assert!(public_tick(&mut owner, &mut host).unwrap());
+        public_terminal(&owner, Status::Busy, false);
+        assert_eq!(host.count("layout"), 0);
+        host.assert_no_mutation();
+        assert!(host.runtime.correction.is_some());
+    }
+    #[test]
+    fn public_out_of_range_destination_never_falls_back_to_zero() {
+        let mut host = Fake::new(true, false, L::Normal);
+        let mut owner = HereOwner::new(host.now, 9);
+        assert_eq!(owner.active().unwrap().placement.destination_desktop, 9);
+        public_tick(&mut owner, &mut host).unwrap();
+        let reply = public_terminal(&owner, Status::Failed, false);
+        assert_eq!(reply.detail.reason, Reason::LayoutChanged);
+        host.assert_no_mutation();
+    }
+    #[test]
+    fn public_duplicate_busy_and_changed_marker_cannot_restart_or_retarget_here() {
+        let mut host = Fake::new(true, false, L::Normal);
+        let mut owner = public_owner(&mut host);
+        public_tick(&mut owner, &mut host).unwrap();
+        public_tick(&mut owner, &mut host).unwrap(); // D3 post-dispatch observation
+        let original = *owner.active().unwrap();
+        owner.advance_peer(Duration::from_millis(800));
+        owner.request(owner.original_id(), 2, false);
+        assert_eq!(*owner.active().unwrap(), original);
+        assert!(owner.replies().is_empty());
+        let log = host.log.clone();
+        public_tick(&mut owner, &mut host).unwrap();
+        assert_eq!(host.log, log);
+        owner.request(owner.original_id(), 3, false);
+        owner.request(owner.original_id() + 1, 2, false);
+        assert_eq!(*owner.active().unwrap(), original);
+        assert_eq!(owner.replies().len(), 2);
+        assert!(owner.replies().iter().all(|r| r.status == Status::Busy));
+        host.target();
+        mark_remote_observation(owner.active_mut().unwrap(), false);
+        public_tick(&mut owner, &mut host).unwrap();
+        assert!(owner.active().is_none());
+        assert_eq!(host.count("desktop"), 1);
+        assert_eq!(owner.replies().len(), 3);
+        assert_eq!(owner.replies()[2].status, Status::Success);
+    }
+    #[test]
+    fn public_frozen_target_and_current_drift_invalidate_without_chasing() {
+        for phase in 0..3 {
+            let after_history = phase == 2;
+            let mut host = Fake::new(true, false, L::Above);
+            let mut owner = public_owner(&mut host);
+            if phase > 0 {
+                public_tick(&mut owner, &mut host).unwrap();
+            }
+            if after_history {
+                host.target();
+                host.current.transitional = true;
+                mark_remote_observation(owner.active_mut().unwrap(), false);
+                public_tick(&mut owner, &mut host).unwrap();
+                assert!(
+                    owner
+                        .active()
+                        .unwrap()
+                        .placement
+                        .proof
+                        .history
+                        .relocation_confirmed
+                );
+            }
+            host.layout = Err(DestinationError::Changed);
+            if let Some(op) = owner.active_mut() {
+                mark_remote_observation(op, false);
+            }
+            public_tick(&mut owner, &mut host).unwrap();
+            let reply = public_terminal(
+                &owner,
+                if after_history {
+                    Status::Partial
+                } else {
+                    Status::Failed
+                },
+                after_history,
+            );
+            assert_eq!(reply.detail.reason, Reason::LayoutChanged);
+            let text = x11::control::CallerOutcome::Terminal(reply).diagnostic(Command::BringHere);
+            assert!(text.contains("workspace/layout changed"));
+            assert_eq!(host.count("desktop"), usize::from(phase > 0));
+            assert_eq!(host.count("correct"), 0);
+            assert_eq!(host.count("shape"), 0);
+        }
+    }
+    #[test]
+    fn public_native_failure_uses_d3_history_and_preserves_original_error_over_reply_failure() {
+        for history in [false, true] {
+            let mut host = Fake::new(true, false, L::Normal);
+            let mut owner = public_owner(&mut host);
+            let fault = if history {
+                public_tick(&mut owner, &mut host).unwrap();
+                host.target();
+                mark_remote_observation(owner.active_mut().unwrap(), false);
+                ("shape", 1)
+            } else {
+                ("desktop", 1)
+            };
+            host.faults.push(fault);
+            owner.fail_reply(true);
+            let error = public_tick(&mut owner, &mut host).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<NativeFault>(),
+                Some(&NativeFault(fault.0, fault.1))
+            );
+            let reply = public_terminal(
+                &owner,
+                if history {
+                    Status::Partial
+                } else {
+                    Status::Failed
+                },
+                history,
+            );
+            assert_eq!(reply.detail.reason, Reason::X11Failure);
+            let text = x11::control::CallerOutcome::Terminal(reply).diagnostic(Command::BringHere);
+            assert!(text.contains("X11 failure"));
+            if history {
+                assert!(text.contains("actual relocation was confirmed earlier"));
+            } else {
+                assert!(text.contains("no accepted relocation history"));
+                assert!(text.contains("later WM movement remains possible"));
+            }
+            assert_eq!(host.count("desktop"), 1);
+            assert!(!public_tick(&mut owner, &mut host).unwrap());
+        }
+    }
+    #[test]
+    fn public_owner_loss_keeps_history_and_never_mutates_after_loss() {
+        for history in [false, true] {
+            let mut host = Fake::new(true, false, L::Below);
+            let mut owner = public_owner(&mut host);
+            if history {
+                public_tick(&mut owner, &mut host).unwrap();
+                host.target();
+                host.current.transitional = true;
+                mark_remote_observation(owner.active_mut().unwrap(), false);
+                public_tick(&mut owner, &mut host).unwrap();
+            }
+            host.owned = false;
+            mark_remote_observation(owner.active_mut().unwrap(), false);
+            let mutations = (
+                host.count("desktop"),
+                host.count("correct"),
+                host.count("shape"),
+                host.count("fence"),
+            );
+            assert!(public_tick(&mut owner, &mut host).is_err());
+            let reply = public_terminal(
+                &owner,
+                if history {
+                    Status::Partial
+                } else {
+                    Status::Failed
+                },
+                history,
+            );
+            assert_eq!(reply.detail.reason, Reason::OwnershipLost);
+            assert_eq!(
+                mutations,
+                (
+                    host.count("desktop"),
+                    host.count("correct"),
+                    host.count("shape"),
+                    host.count("fence")
+                )
+            );
+        }
+    }
+    #[test]
+    fn public_caller_disappearance_reply_failure_and_shutdown_clear_once() {
+        for fatal in [false, true] {
+            let mut host = Fake::new(true, true, L::Above);
+            let mut owner = public_owner(&mut host);
+            public_tick(&mut owner, &mut host).unwrap();
+            owner.fail_reply(fatal);
+            host.target();
+            mark_remote_observation(owner.active_mut().unwrap(), false);
+            assert_eq!(public_tick(&mut owner, &mut host).is_err(), fatal);
+            public_terminal(&owner, Status::Success, true);
+            assert_eq!(host.count("desktop"), 1);
+            assert!(!public_tick(&mut owner, &mut host).unwrap());
+        }
+        for history in [false, true] {
+            for owned in [false, true] {
+                let mut host = Fake::new(true, false, L::Normal);
+                let mut owner = public_owner(&mut host);
+                public_tick(&mut owner, &mut host).unwrap();
+                if history {
+                    host.target();
+                    host.current.transitional = true;
+                    mark_remote_observation(owner.active_mut().unwrap(), false);
+                    public_tick(&mut owner, &mut host).unwrap();
+                }
+                owner.shutdown(owned);
+                let reply = public_terminal(
+                    &owner,
+                    if history {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    },
+                    history,
+                );
+                assert_eq!(reply.detail.stage, Stage::Shutdown);
+                assert_eq!(
+                    reply.detail.reason,
+                    if owned {
+                        Reason::Closing
+                    } else {
+                        Reason::OwnershipLost
+                    }
+                );
+                owner.shutdown(owned);
+                assert_eq!(owner.replies().len(), 1);
+                assert_eq!(host.count("desktop"), 1);
+            }
+        }
+    }
+    #[test]
+    fn public_here_partial_and_failed_diagnostics_explain_reason_without_exit_changes() {
+        for history in [false, true] {
+            for (reason, expected) in [
+                (Reason::LayoutChanged, "workspace/layout changed"),
+                (Reason::LayerChanged, "effective layer changed"),
+                (Reason::ConfirmationTimeout, "confirmation timed out"),
+                (Reason::X11Failure, "X11 failure"),
+                (Reason::OwnershipLost, "owner selection lost"),
+                (Reason::Closing, "owner shutdown"),
+            ] {
+                let mut host = Fake::new(true, false, L::Normal);
+                let mut op = host.operation();
+                host.run(&mut op);
+                if history {
+                    host.target();
+                    host.current.transitional = true;
+                    host.run(&mut op);
+                }
+                let result = op.here_shutdown(reason).unwrap();
+                let reply = control::TerminalResponse {
+                    status: result.status(),
+                    detail: result.detail(),
+                    request_id: 99,
+                    control_xid: 10,
+                };
+                let outcome = x11::control::CallerOutcome::Terminal(reply);
+                let text = outcome.diagnostic(Command::BringHere);
+                assert!(text.contains(expected));
+                assert!(text.contains(if history {
+                    "actual relocation was confirmed earlier"
+                } else {
+                    "no accepted relocation history"
+                }));
+                assert!(!text.contains("rollback"));
+                assert_eq!(
+                    outcome.exit_code(),
+                    if history {
+                        control::ExitCode::Partial
+                    } else {
+                        control::ExitCode::OperationFailed
+                    }
+                );
+            }
         }
     }
 }
