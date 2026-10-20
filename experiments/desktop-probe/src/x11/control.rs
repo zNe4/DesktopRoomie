@@ -550,6 +550,22 @@ impl ControlWindow {
         let Some(operation) = self.active.as_mut() else {
             return Ok(());
         };
+        if operation.request.command == Command::BringHere {
+            let result = operation
+                .here_shutdown(if self.owns_selection {
+                    Reason::Closing
+                } else {
+                    Reason::OwnershipLost
+                })
+                .expect("Here shutdown clears current proof and retains relocation history");
+            let response = TerminalResponse {
+                status: result.status(),
+                detail: result.detail(),
+                request_id: operation.request.request_id,
+                control_xid: self.descriptor.control_xid,
+            };
+            return finish_active(host, self.transport, &mut self.active, response);
+        }
         if operation.request.command == Command::BringTop {
             operation.detail = control::Detail {
                 progress: control::Progress {
@@ -3154,6 +3170,80 @@ mod transport_tests {
         assert_eq!(response.status, Status::Busy);
         assert!(!response.detail.progress.host_mutation_dispatched);
     }
+    #[test]
+    fn guarded_here_shutdown_at_every_service_phase_replies_once_with_history_and_dispatch() {
+        for (phase, operation) in crate::here_service_tests::lifecycle_snapshots() {
+            for owned in [false, true] {
+                for fail_reply in [false, true] {
+                    let mut host = Fake::new();
+                    host.failure = fail_reply.then_some("send");
+                    let mut endpoint = ControlWindow::candidate(0, CONTROL, 11, 50, 51, 52);
+                    endpoint.transport = atoms();
+                    endpoint.descriptor = owner();
+                    endpoint.owns_selection = owned;
+                    endpoint.active = Some(operation);
+                    let history = operation.placement.proof.history;
+                    let dispatched = operation.detail.progress.host_mutation_dispatched;
+                    assert_eq!(
+                        endpoint.finish_remote_with(&mut host).is_err(),
+                        fail_reply,
+                        "{phase}"
+                    );
+                    assert!(endpoint.active().is_none());
+                    endpoint.finish_remote_with(&mut host).unwrap();
+                    assert_eq!(host.sent.len(), 1);
+                    let reply = TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap();
+                    assert_eq!(
+                        reply.status,
+                        if history.relocation_confirmed {
+                            Status::Partial
+                        } else {
+                            Status::Failed
+                        }
+                    );
+                    assert_eq!(reply.detail.stage, Stage::Shutdown);
+                    assert_eq!(
+                        reply.detail.reason,
+                        if owned {
+                            Reason::Closing
+                        } else {
+                            Reason::OwnershipLost
+                        }
+                    );
+                    assert_eq!(reply.detail.placement.history, history);
+                    assert_eq!(
+                        reply.detail.placement.current,
+                        control::PlacementConfirmation::default()
+                    );
+                    assert_eq!(reply.detail.progress.host_mutation_dispatched, dispatched);
+                    assert!(!reply.detail.progress.input_ready);
+                    assert_eq!(host.log, ["send"]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recover_shutdown_keeps_existing_generic_closing_semantics() {
+        let mut host = Fake::new();
+        let mut endpoint = ControlWindow::candidate(0, CONTROL, 11, 50, 51, 52);
+        endpoint.transport = atoms();
+        endpoint.descriptor = owner();
+        control::admit(
+            &mut endpoint.active,
+            request(Command::Recover),
+            7,
+            Lifecycle::Ready,
+            false,
+            host.now,
+        );
+        endpoint.finish_remote_with(&mut host).unwrap();
+        assert!(endpoint.active().is_none());
+        let reply = TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap();
+        assert_eq!(reply.status, Status::Closing);
+        assert_eq!(reply.detail.placement, control::PlacementProof::default());
+    }
+
     #[test]
     fn bring_top_shutdown_retains_history_and_clears_stale_current_confirmations() {
         for restored in [false, true] {

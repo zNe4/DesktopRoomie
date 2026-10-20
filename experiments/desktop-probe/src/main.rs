@@ -615,6 +615,10 @@ struct InputFence {
     blocked: bool,
     empty_confirmed: bool,
     enabled_after: Option<u64>,
+    // Fence-local safety only; no completed request/destination is retained.
+    // An explicit command has its own correction budget. Late ordinary events
+    // may restore already-safe input, but cannot repeat a Here correction.
+    automatic_correction_blocked: bool,
 }
 impl InputFence {
     fn rejects(&self, event: &Event, body: u32, sequence: u64) -> bool {
@@ -632,8 +636,8 @@ impl InputFence {
     }
 }
 
-/// Supplied by a fresh retained-monitor/layout and root-geometry validation, never
-/// a MapNotify or the desired Ready state. No destination-workspace layout is used.
+/// Supplied by fresh retained-monitor/layout and root-geometry validation, never
+/// a MapNotify or the desired Ready state.
 struct InputPlacement {
     selected_monitor: u32,
     observed_monitor: u32,
@@ -832,6 +836,7 @@ impl ProbeRuntime {
         self.input_fence.enabled_after = Some(sequence);
         self.pending_map_input = None; // checked restoration supplies the post-map silhouette
         self.input_fence.blocked = false;
+        self.input_fence.automatic_correction_blocked = false;
         Ok(())
     }
 
@@ -1072,6 +1077,9 @@ impl ProbeRuntime {
             self.body = BodyAvailability::Ready;
         } else {
             self.body = BodyAvailability::Validating;
+            if self.input_fence.blocked && self.input_fence.automatic_correction_blocked {
+                return Ok(());
+            }
             request(window, target)?;
             self.correction = Some((target, Instant::now() + CONFIRMATION_TIMEOUT));
             println!("[PLACEMENT] Changed bounds require one corrective placement to {target}; awaiting verification");
@@ -3292,13 +3300,638 @@ struct NativeVisibility<'a, C> {
     area: &'a mut crate::geometry::Rect,
 }
 
-/// D2 evidence only. D3 will own progression and final evidence/geometry rounds;
-/// neither production placement guard can currently invoke these adapters.
+/// Strict D2.1 evidence. Ordinary invalid evidence is deliberately separate
+/// from the outer, fatal native acquisition error.
 #[allow(dead_code)]
 struct HereEvidence {
     layout: Result<control::DestinationIdentity, x11::monitors::destination::DestinationError>,
     observation: control::HereObservation,
     snapshot: x11::visibility::VisibilitySnapshot,
+}
+
+/// Guarded D3 owner service. This interface deliberately has no Show, layer,
+/// activation, resize, or current-desktop operation. D4 alone may connect it to
+/// production admission/service; both Unsupported boundaries still precede it.
+#[allow(dead_code)]
+trait BringHereHost {
+    fn now(&self) -> Instant;
+    fn owned(&mut self) -> Result<bool, HostError>;
+    fn live(&self) -> bool;
+    fn evidence(&mut self, destination: u32) -> Result<HereEvidence, HostError>;
+    fn placement_busy(&self) -> bool;
+    fn input_active(&self) -> bool;
+    fn visible_ready(&self) -> bool;
+    fn fence_settled(&self) -> bool;
+    fn fence(&mut self) -> Result<(), HostError>;
+    fn desktop(
+        &mut self,
+        destination: u32,
+        deadline: Instant,
+        dispatched: &mut bool,
+    ) -> Result<bool, HostError>;
+    fn geometry(&mut self) -> Result<geometry::Rect, HostError>;
+    fn restrict_automatic_correction(&mut self);
+    fn correct(
+        &mut self,
+        target: Point,
+        deadline: Instant,
+        dispatched: &mut bool,
+    ) -> Result<Option<Instant>, HostError>;
+    fn enable(
+        &mut self,
+        evidence: &HereEvidence,
+        geometry: geometry::Rect,
+        deadline: Instant,
+    ) -> Result<bool, HostError>;
+}
+
+fn here_destination_reason(
+    error: &x11::monitors::destination::DestinationError,
+) -> control::Reason {
+    use x11::monitors::destination::DestinationError;
+    match error {
+        DestinationError::Changed => control::Reason::LayoutChanged,
+        DestinationError::UnsupportedViewport => control::Reason::Unsupported,
+        DestinationError::Unverifiable(_) => control::Reason::Unverifiable,
+    }
+}
+
+#[allow(dead_code)] // D3 is exercised only through injected owner seams until D4.
+fn read_here(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl BringHereHost,
+) -> Result<(HereEvidence, control::HereDecision), HostError> {
+    let evidence = host.evidence(operation.placement.destination_desktop)?;
+    let layout = evidence.layout.as_ref().copied().map_err(|error| {
+        eprintln!("[HERE] Destination evidence: {error}");
+        here_destination_reason(error)
+    });
+    let sticky = evidence
+        .snapshot
+        .observation
+        .as_ref()
+        .is_some_and(|o| o.desktop == control::Evidence::Readable(u32::MAX));
+    let layout = if sticky || evidence.snapshot.candidate.reason == control::Reason::Unsupported {
+        layout.and(Err(control::Reason::Unsupported))
+    } else {
+        layout
+    };
+    let decision = operation
+        .placement
+        .observe_here(layout, evidence.observation);
+    Ok((evidence, decision))
+}
+
+#[allow(dead_code)]
+fn incomplete_here(
+    operation: &mut control::ActiveOperation,
+    reason: control::Reason,
+) -> control::OperationResult {
+    operation.placement.invalidate_here(reason);
+    let dispatched = operation.detail.progress.host_mutation_dispatched;
+    operation.detail = control::preflight_detail(reason, operation.stage);
+    operation.detail.progress.host_mutation_dispatched = dispatched;
+    operation
+        .placement
+        .here_result(operation.detail, control::Confirmation::default())
+        .expect("Incomplete Here clears current claims and retains genuine history")
+}
+
+#[allow(dead_code)]
+fn complete_here(
+    operation: &mut control::ActiveOperation,
+    evidence: &HereEvidence,
+    input_ready: bool,
+) -> control::OperationResult {
+    use control::{ConfirmedVisibility, GeometryProof, LayerObservation, Visibility};
+    let minimized = evidence.observation.visibility == Visibility::Minimized;
+    let above = !minimized && evidence.observation.layer == LayerObservation::Above;
+    operation.detail = control::Detail {
+        visibility: evidence.observation.visibility,
+        workspace: control::Workspace::Current,
+        layer: evidence.observation.layer,
+        progress: control::Progress {
+            host_mutation_dispatched: operation.detail.progress.host_mutation_dispatched,
+            not_minimized_confirmed: !minimized,
+            above_confirmed: above,
+            placement_deferred: operation.placement.proof.current.geometry
+                == GeometryProof::Deferred,
+            input_ready,
+        },
+        placement: operation.placement.proof,
+        ..control::preflight_detail(control::Reason::None, operation.stage)
+    };
+    operation
+        .placement
+        .here_result(
+            operation.detail,
+            control::Confirmation {
+                visibility: Some(if minimized {
+                    ConfirmedVisibility::Minimized
+                } else {
+                    ConfirmedVisibility::NotMinimizedHere
+                }),
+                above,
+            },
+        )
+        .expect("Here Success requires complete fresh placement/input proof")
+}
+
+/// Read-only final visible proof brackets actual geometry with fresh strict
+/// evidence. Neither checked ConfigureWindow nor SHAPE acknowledgment supplies
+/// this proof. Used by safe no-op, restored input, and expiry finalization.
+#[allow(dead_code)]
+fn verify_here_visible(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl BringHereHost,
+) -> Result<control::OperationResult, HostError> {
+    use control::{HereDecision, Reason, Visibility};
+    let (_, before) = read_here(operation, host)?;
+    if let HereDecision::Invalid(reason) = before {
+        return Ok(incomplete_here(operation, reason));
+    }
+    if before != HereDecision::Destination || !host.visible_ready() {
+        return Ok(incomplete_here(operation, Reason::Unverifiable));
+    }
+    let actual = host.geometry()?;
+    let (fresh, after) = read_here(operation, host)?;
+    if let HereDecision::Invalid(reason) = after {
+        return Ok(incomplete_here(operation, reason));
+    }
+    if after != HereDecision::Destination
+        || fresh.observation.visibility != Visibility::NotMinimizedHere
+        || !host.visible_ready()
+        || !operation
+            .placement
+            .confirm_here_geometry(actual.origin(), actual.size())
+    {
+        return Ok(incomplete_here(operation, Reason::Unverifiable));
+    }
+    if !host.owned()? {
+        return Ok(operation.here_shutdown(Reason::OwnershipLost).unwrap());
+    }
+    Ok(complete_here(operation, &fresh, true))
+}
+
+/// No loops/polling: immediate safety phases are bounded, then observation is
+/// driven by notifications or the earliest fixed deadline.
+#[allow(dead_code)]
+fn step_bring_here_with(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl BringHereHost,
+) -> Result<Option<control::OperationResult>, HostError> {
+    use control::{HereDecision as D, HerePhase as P, Reason as R, Stage, Visibility as V};
+    if !host.owned()? {
+        return Ok(Some(operation.here_shutdown(R::OwnershipLost).unwrap()));
+    }
+    if !host.live() {
+        return Ok(Some(operation.here_shutdown(R::BodyDestroyed).unwrap()));
+    }
+    if operation.placement.here_phase() == P::Observe && host.placement_busy() {
+        return Ok(Some(
+            control::OperationResult::placement(
+                control::Command::BringHere,
+                control::Status::Busy,
+                control::preflight_detail(R::Busy, Stage::Preflight),
+                control::Confirmation::default(),
+                &operation.placement,
+            )
+            .expect("Unstarted Here does not steal existing placement ownership"),
+        ));
+    }
+    let (mut evidence, mut decision) = read_here(operation, host)?;
+    if let D::Invalid(reason) = decision {
+        return Ok(Some(incomplete_here(operation, reason)));
+    }
+    operation.stage = match operation.placement.here_phase() {
+        P::Geometry | P::EnablingInput | P::InputRestored => Stage::Geometry,
+        _ => Stage::Placement,
+    };
+    if decision == D::Pending
+        && operation
+            .placement
+            .correction()
+            .is_some_and(|(_, dl)| host.now() >= dl)
+    {
+        return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
+    }
+    // At total expiry there is only this bounded final read (plus geometry for
+    // already enabled input). No mutation authority is renewed by a late read.
+    if host.now() >= operation.deadline {
+        if decision == D::Destination {
+            if evidence.observation.visibility == V::Minimized
+                && host.fence_settled()
+                && operation.placement.defer_here_geometry()
+            {
+                if !host.owned()? {
+                    return Ok(Some(operation.here_shutdown(R::OwnershipLost).unwrap()));
+                }
+                return Ok(Some(complete_here(operation, &evidence, false)));
+            }
+            if host.visible_ready() {
+                return verify_here_visible(operation, host).map(Some);
+            }
+        }
+        return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
+    }
+    if operation.placement.here_phase() == P::Observe {
+        if decision == D::Destination
+            && evidence.observation.visibility == V::NotMinimizedHere
+            && host.visible_ready()
+        {
+            let actual = host.geometry()?;
+            if operation
+                .placement
+                .confirm_here_geometry(actual.origin(), actual.size())
+            {
+                return verify_here_visible(operation, host).map(Some);
+            }
+        }
+        if host.now() >= operation.deadline {
+            return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
+        }
+        if !host.owned()? {
+            return Ok(Some(operation.here_shutdown(R::OwnershipLost).unwrap()));
+        }
+        if host.now() >= operation.deadline {
+            return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
+        }
+        if !host.fence_settled() {
+            operation.detail.reason = R::ReleaseFailed;
+            host.fence()?;
+        }
+        if !host.fence_settled() {
+            return Ok(Some(incomplete_here(operation, R::ReleaseFailed)));
+        }
+        assert!(operation.placement.here_fenced());
+        (evidence, decision) = read_here(operation, host)?;
+        if let D::Invalid(reason) = decision {
+            return Ok(Some(incomplete_here(operation, reason)));
+        }
+        if operation.placement.baseline.unwrap().desktop != operation.placement.destination_desktop
+        {
+            // The fresh pre-send round must still prove the original body,
+            // including preservation. Transitional evidence grants no send.
+            if decision != D::Original {
+                if decision == D::Pending && host.now() < operation.deadline {
+                    return Ok(None);
+                }
+                return Ok(Some(incomplete_here(operation, R::LayoutChanged)));
+            }
+        }
+    }
+    if operation.placement.here_phase() == P::Fenced
+        && operation.placement.baseline.unwrap().desktop != operation.placement.destination_desktop
+    {
+        if decision == D::Pending && host.now() < operation.deadline {
+            return Ok(None);
+        }
+        if !host.owned()? {
+            return Ok(Some(operation.here_shutdown(R::OwnershipLost).unwrap()));
+        }
+        if !host.fence_settled() || !operation.consume_here_desktop_attempt(host.now()) {
+            return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
+        }
+        let mut dispatched = false;
+        let transport = host.desktop(
+            operation.placement.destination_desktop,
+            operation.deadline,
+            &mut dispatched,
+        );
+        operation.detail.progress.host_mutation_dispatched |= dispatched;
+        operation
+            .placement
+            .record_here_desktop_transport(dispatched, matches!(transport, Ok(true)));
+        return match transport? {
+            true => Ok(None), // drain WM evidence before observing again
+            false => Ok(Some(incomplete_here(operation, R::ConfirmationTimeout))),
+        };
+    }
+    if decision != D::Destination {
+        return Ok(None);
+    }
+    if operation.placement.baseline.unwrap().minimized {
+        // No geometry query, correction, map, hidden mutation, or enable here.
+        let (fresh, final_decision) = read_here(operation, host)?;
+        if let D::Invalid(reason) = final_decision {
+            return Ok(Some(incomplete_here(operation, reason)));
+        }
+        if final_decision == D::Destination
+            && host.fence_settled()
+            && operation.placement.defer_here_geometry()
+        {
+            if !host.owned()? {
+                return Ok(Some(operation.here_shutdown(R::OwnershipLost).unwrap()));
+            }
+            return Ok(Some(complete_here(operation, &fresh, false)));
+        }
+        return Ok(None);
+    }
+    if evidence.observation.visibility != V::NotMinimizedHere {
+        return Ok(None);
+    }
+    if matches!(
+        operation.placement.here_phase(),
+        P::Fenced | P::AwaitDestination
+    ) {
+        assert!(operation.placement.begin_here_geometry());
+    }
+    operation.stage = Stage::Geometry;
+    let actual = host.geometry()?;
+    // Discard geometry permission unless the complete fresh evidence bracket
+    // still agrees. This also clears old current proof while retaining history.
+    (evidence, decision) = read_here(operation, host)?;
+    if let D::Invalid(reason) = decision {
+        return Ok(Some(incomplete_here(operation, reason)));
+    }
+    if decision != D::Destination || evidence.observation.visibility != V::NotMinimizedHere {
+        if operation
+            .placement
+            .correction()
+            .is_some_and(|(_, dl)| host.now() >= dl)
+        {
+            return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
+        }
+        return Ok(None);
+    }
+    let layout = operation.placement.layout().unwrap();
+    if actual.size() != layout.body_size {
+        return Ok(Some(incomplete_here(operation, R::Unverifiable)));
+    }
+    if !operation
+        .placement
+        .confirm_here_geometry(actual.origin(), actual.size())
+    {
+        if let Some((_, deadline)) = operation.placement.correction() {
+            return if host.now() >= deadline {
+                Ok(Some(incomplete_here(operation, R::Unverifiable)))
+            } else {
+                Ok(None)
+            };
+        }
+        if !host.owned()? {
+            return Ok(Some(operation.here_shutdown(R::OwnershipLost).unwrap()));
+        }
+        let target = layout.valid_origins.clamp(actual.origin());
+        if !host.fence_settled() || !operation.consume_here_correction(target, host.now()) {
+            return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
+        }
+        // Consume runtime's automatic budget before even a failing native call.
+        host.restrict_automatic_correction();
+        let mut dispatched = false;
+        let correction = host.correct(target, operation.deadline, &mut dispatched);
+        operation.detail.progress.host_mutation_dispatched |= dispatched;
+        return match correction? {
+            Some(_) => Ok(None), // D1's earlier immutable deadline governs
+            None => Ok(Some(incomplete_here(operation, R::ConfirmationTimeout))),
+        };
+    }
+    if !host.owned()? {
+        return Ok(Some(operation.here_shutdown(R::OwnershipLost).unwrap()));
+    }
+    if !host.fence_settled() || !operation.consume_here_input_enable(host.now()) {
+        return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
+    }
+    // Attempt consumed before checked SHAPE. The wrapper re-fences even when a
+    // failing check may already have enabled native input.
+    if !host.enable(&evidence, actual, operation.deadline)? {
+        return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
+    }
+    assert!(operation.here_input_restored());
+    verify_here_visible(operation, host).map(Some)
+}
+
+/// Preserve the exact primary native error through final observation/cleanup.
+/// Committing fatal teardown precedes the bounded history-only read: no later
+/// snapshot can reconstruct Success for an owner that is already terminating.
+#[allow(dead_code)]
+fn service_bring_here_with(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl BringHereHost,
+) -> Result<Option<control::OperationResult>, HostError> {
+    let mut outcome = step_bring_here_with(operation, host);
+    if outcome.is_err() {
+        operation
+            .placement
+            .invalidate_here(control::Reason::X11Failure);
+    }
+    let failed = match &outcome {
+        Err(_) => true,
+        Ok(Some(result)) => !matches!(
+            result.status(),
+            control::Status::Success | control::Status::Busy
+        ),
+        Ok(None) => false,
+    };
+    if failed
+        && host.live()
+        && operation.placement.baseline.is_some()
+        && (host.input_active()
+            || matches!(
+                operation.placement.here_phase(),
+                control::HerePhase::EnablingInput | control::HerePhase::InputRestored
+            ))
+    {
+        if operation.placement.correction().is_some() {
+            host.restrict_automatic_correction();
+        }
+        let cleanup = host
+            .owned()
+            .and_then(|owned| if owned { host.fence() } else { Ok(()) });
+        if let Err(error) = cleanup {
+            eprintln!("[HERE] Input safety cleanup: {error}");
+            if outcome.is_ok() {
+                outcome = Err(error);
+            }
+        }
+    }
+    if let Err(original) = outcome {
+        operation
+            .placement
+            .invalidate_here(control::Reason::X11Failure);
+        if operation.detail.progress.host_mutation_dispatched
+            && host.live()
+            && host.owned().unwrap_or(false)
+        {
+            if let Err(error) = read_here(operation, host) {
+                eprintln!("[HERE] Final history observation after native failure: {error}");
+            }
+        }
+        operation
+            .here_shutdown(control::Reason::X11Failure)
+            .unwrap();
+        return Err(original);
+    }
+    outcome
+}
+
+/// Internal owner completion seam: caller disappearance does not cancel work;
+/// terminal send failure clears active exactly once and never undoes progress.
+#[allow(dead_code)]
+fn service_here_owner_with(
+    active: &mut Option<control::ActiveOperation>,
+    host: &mut impl BringHereHost,
+    reply: impl FnOnce(control::OperationResult) -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    let Some(operation) = active.as_mut() else {
+        return Ok(());
+    };
+    if !remote_service_due(operation, host.now()) {
+        return Ok(());
+    }
+    let outcome = service_bring_here_with(operation, host);
+    let (result, primary) = match outcome {
+        Ok(None) => return Ok(()),
+        Ok(Some(result)) => {
+            // Losing the selection ends the owner run after its one reply;
+            // ordinary local services must not resume against a replacement.
+            let primary: Option<HostError> = (result.detail().reason
+                == control::Reason::OwnershipLost)
+                .then(|| "Control selection ownership lost during Bring Here".into());
+            (result, primary)
+        }
+        Err(error) => (
+            operation
+                .here_shutdown(control::Reason::X11Failure)
+                .unwrap(),
+            Some(error),
+        ),
+    };
+    *active = None;
+    let sent = reply(result);
+    match primary {
+        Some(error) => {
+            if let Err(reply) = sent {
+                eprintln!("[HERE] Terminal reply after failure: {reply}");
+            }
+            Err(error)
+        }
+        None => sent,
+    }
+}
+
+/// Borrows the existing runtime/resources; owns no request or controller. No
+/// production constructor/call site exists before D4.
+#[allow(dead_code)]
+struct NativeHere<'a, 'b, C> {
+    visibility: &'a mut NativeVisibility<'b, C>,
+    selection: u32,
+    control_xid: u32,
+}
+
+impl<C: Connection> BringHereHost for NativeHere<'_, '_, C> {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn owned(&mut self) -> Result<bool, HostError> {
+        use x11rb::protocol::xproto::ConnectionExt;
+        Ok(self
+            .visibility
+            .conn
+            .get_selection_owner(self.selection)?
+            .reply()?
+            .owner
+            == self.control_xid)
+    }
+    fn live(&self) -> bool {
+        self.visibility.runtime.body != BodyAvailability::Destroyed
+    }
+    fn evidence(&mut self, destination: u32) -> Result<HereEvidence, HostError> {
+        self.visibility.here_observe(destination)
+    }
+    fn placement_busy(&self) -> bool {
+        self.visibility.runtime.correction.is_some()
+    }
+    fn input_active(&self) -> bool {
+        !self.visibility.runtime.input_fence.blocked
+    }
+    fn visible_ready(&self) -> bool {
+        here_runtime_ready(self.visibility.runtime, self.visibility.window)
+    }
+    fn fence_settled(&self) -> bool {
+        self.visibility.runtime.visibility_dispatch_eligible()
+    }
+    fn fence(&mut self) -> Result<(), HostError> {
+        self.visibility.fence()
+    }
+    fn desktop(
+        &mut self,
+        destination: u32,
+        deadline: Instant,
+        dispatched: &mut bool,
+    ) -> Result<bool, HostError> {
+        let h = &mut self.visibility;
+        request_here_desktop(
+            h.conn,
+            h.runtime,
+            h.root,
+            h.window.window,
+            h.atoms.desktop,
+            destination,
+            deadline,
+            dispatched,
+        )
+    }
+    fn geometry(&mut self) -> Result<geometry::Rect, HostError> {
+        self.visibility
+            .window
+            .query_actual_root_geometry(self.visibility.conn, self.visibility.root)
+    }
+    fn restrict_automatic_correction(&mut self) {
+        self.visibility
+            .runtime
+            .input_fence
+            .automatic_correction_blocked = true;
+    }
+    fn correct(
+        &mut self,
+        target: Point,
+        deadline: Instant,
+        dispatched: &mut bool,
+    ) -> Result<Option<Instant>, HostError> {
+        self.visibility.here_correct(target, deadline, dispatched)
+    }
+    fn enable(
+        &mut self,
+        evidence: &HereEvidence,
+        actual: geometry::Rect,
+        deadline: Instant,
+    ) -> Result<bool, HostError> {
+        let layout = evidence
+            .layout
+            .as_ref()
+            .expect("Fresh accepted Here layout gates enable");
+        let h = &mut self.visibility;
+        *h.bounds = layout.valid_origins;
+        *h.area = layout.usable_area;
+        let input = InputPlacement {
+            selected_monitor: h.selected_monitor,
+            observed_monitor: layout.monitor_name,
+            geometry: actual,
+            bounds: layout.valid_origins,
+        };
+        h.enable(&evidence.snapshot, &input, Some(deadline))
+    }
+}
+
+fn here_runtime_ready(runtime: &ProbeRuntime, window: &ManagedProbeWindow) -> bool {
+    runtime.body == BodyAvailability::Ready
+        && !runtime.input_fence.blocked
+        && runtime.input_fence.enabled_after.is_some()
+        && runtime.pending_map_input.is_none()
+        && !runtime.pointer.is_grabbed()
+        && runtime.menu.is_none()
+        && matches!(
+            runtime.interaction.state(),
+            InteractionState::Idle | InteractionState::SuppressedUntilRelease { .. }
+        )
+        && runtime.pending_move.is_none()
+        && runtime.final_target.is_none()
+        && runtime.confirmation_deadline.is_none()
+        && runtime.correction.is_none()
+        && runtime.safety.deadline.is_none()
+        && runtime.safety.observation.is_none()
+        && window.in_flight_moves.is_empty()
 }
 
 fn here_observation(snapshot: &x11::visibility::VisibilitySnapshot) -> control::HereObservation {
@@ -3353,7 +3986,7 @@ fn here_evidence_with(
 }
 
 impl<C: Connection> NativeVisibility<'_, C> {
-    #[allow(dead_code)] // D2 only; both production guards remain closed until D4.
+    #[allow(dead_code)] // Guarded D3 adapter; both production guards remain closed until D4.
     fn here_observe(&mut self, frozen_destination: u32) -> Result<HereEvidence, HostError> {
         use x11::monitors::destination::query_destination_layout_preserving_native;
         let (conn, root, atoms, selected) = (
@@ -3378,7 +4011,7 @@ impl<C: Connection> NativeVisibility<'_, C> {
         )
     }
 
-    #[allow(dead_code)] // D2 only; D1/D3 own one-shot authority, never this adapter.
+    #[allow(dead_code)] // D1/D3 own one-shot authority, never this guarded adapter.
     fn here_correct(
         &mut self,
         target: Point,
@@ -3425,7 +4058,7 @@ fn here_correct_with(
 
 /// Explicit, already-admitted envelope inputs. The consuming Stage-C primitive
 /// alone handles expiry/possible dispatch/checking, with no WM confirmation.
-#[allow(dead_code, clippy::too_many_arguments)] // Guarded D2 native seam until D3/D4.
+#[allow(dead_code, clippy::too_many_arguments)] // Guarded native seam until D4.
 fn request_here_desktop(
     conn: &impl Connection,
     runtime: &ProbeRuntime,
@@ -3512,7 +4145,7 @@ mod here_adapter_tests {
         (&destination_layout()).into()
     }
 
-    fn snapshot(
+    pub(super) fn snapshot(
         wm_state: WmState,
         map: MapState,
         hidden: bool,
@@ -4313,11 +4946,52 @@ fn visibility_layout_interruption(
         || matches!(event, Event::PropertyNotify(e) if e.window == root && e.atom == layout.workarea)
 }
 
+fn here_evidence_event(
+    event: &Event,
+    root: u32,
+    body: u32,
+    visibility: &x11::visibility::VisibilityAtoms,
+    layout: &x11::monitors::LayoutAtoms,
+) -> bool {
+    visibility_event(event, root, body, visibility, layout)
+        || matches!(event, Event::PropertyNotify(e) if e.window == root
+            && [layout.number_of_desktops, layout.desktop_viewport].contains(&e.atom))
+}
+
+fn remote_owns_placement(operation: &control::ActiveOperation) -> bool {
+    operation.request.command == control::Command::BringHere
+}
+
+/// Consume before every legacy map/layout/geometry consumer. Notification
+/// payloads never establish proof, including expected relocation UnmapNotify.
+fn route_here_evidence_event(
+    operation: Option<&mut control::ActiveOperation>,
+    event: &Event,
+    root: u32,
+    body: u32,
+    visibility: &x11::visibility::VisibilityAtoms,
+    layout: &x11::monitors::LayoutAtoms,
+) -> bool {
+    if let Some(operation) = operation.filter(|op| remote_owns_placement(op)) {
+        if here_evidence_event(event, root, body, visibility, layout) {
+            mark_remote_observation(operation, false);
+            return true;
+        }
+    }
+    false
+}
+
 fn remote_deadline(owner: &ControlWindow) -> Option<Instant> {
     owner.active().map(remote_operation_deadline)
 }
 
 fn remote_operation_deadline(operation: &control::ActiveOperation) -> Instant {
+    if remote_owns_placement(operation) {
+        return operation
+            .placement
+            .correction()
+            .map_or(operation.deadline, |(_, dl)| dl.min(operation.deadline));
+    }
     if remote_owns_layer(operation) {
         return operation
             .bring_top
@@ -4352,7 +5026,7 @@ fn remote_consumes_visibility_event(
 }
 
 fn local_layer_service_allowed(operation: Option<&control::ActiveOperation>) -> bool {
-    !operation.is_some_and(remote_owns_layer)
+    !operation.is_some_and(|op| remote_owns_layer(op) || remote_owns_placement(op))
 }
 
 fn remote_service_due(operation: &control::ActiveOperation, now: Instant) -> bool {
@@ -4363,7 +5037,8 @@ fn remote_service_due(operation: &control::ActiveOperation, now: Instant) -> boo
             operation.bring_top.layer_observe
         }
         control::Command::BringTop => operation.show.observe,
-        control::Command::BringHere | control::Command::Recover => true,
+        control::Command::BringHere => operation.placement.observation_due(),
+        control::Command::Recover => true,
     };
     observe || now >= remote_operation_deadline(operation)
 }
@@ -4381,7 +5056,8 @@ fn mark_remote_observation(operation: &mut control::ActiveOperation, layout_inte
             operation.hide.observe = true;
             operation.hide.layout_interrupted |= layout_interrupted;
         }
-        control::Command::BringHere | control::Command::Recover => {}
+        control::Command::BringHere => operation.placement.request_here_observation(),
+        control::Command::Recover => {}
     }
 }
 
@@ -4643,69 +5319,73 @@ fn run_probe(
                 None,
             )?;
         }
-        // Confirmation is bounded even during sustained incoming event traffic.
-        if let Some((_, deadline)) = runtime.correction {
-            if now >= deadline {
-                if !window.is_viewable(conn)? {
-                    runtime.cancel(
-                        conn,
-                        window,
-                        "body unavailable during correction verification",
-                    )?;
-                    runtime.unavailable(false);
-                    continue;
-                }
-                let actual = window.query_actual_root_geometry(conn, root)?;
-                if actual.size() != Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()) {
-                    return Err("Body resized during bounds correction".into());
-                }
-                runtime.check_correction(now, actual.origin(), &bounds)?;
-                window.cancel_in_flight_moves();
-                runtime.placement(conn, root, window, &bounds)?;
-            }
-        } else {
-            let window_id = window.window;
-            check_confirmation_timeout_with(
-                &mut runtime.confirmation_deadline,
-                window,
-                &mut runtime.final_target,
-                &mut runtime.interaction,
-                &mut runtime.pending_move,
-                || {
-                    let actual = ManagedProbeWindow::query_window_actual_root_geometry(
-                        conn, window_id, root,
-                    )?;
-                    if actual.size() != Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()) {
-                        return Err("Body resized during movement verification".into());
+        // Here owns geometry and cancellation until completion. Its correction
+        // lives under ActiveOperation, never the ordinary movement controller.
+        if !owner.active().is_some_and(remote_owns_placement) {
+            // Confirmation is bounded even during sustained incoming event traffic.
+            if let Some((_, deadline)) = runtime.correction {
+                if now >= deadline {
+                    if !window.is_viewable(conn)? {
+                        runtime.cancel(
+                            conn,
+                            window,
+                            "body unavailable during correction verification",
+                        )?;
+                        runtime.unavailable(false);
+                        continue;
                     }
-                    Ok(actual.origin())
-                },
-                |time| runtime.pointer.release_if_held(conn, time).map(|_| ()),
-            )?;
-            if runtime.menu.is_some()
-                && !matches!(
-                    runtime.interaction.state(),
-                    InteractionState::MenuOpen { .. }
-                )
-            {
-                runtime.cancel(conn, window, "movement confirmation cancellation")?;
+                    let actual = window.query_actual_root_geometry(conn, root)?;
+                    if actual.size() != Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()) {
+                        return Err("Body resized during bounds correction".into());
+                    }
+                    runtime.check_correction(now, actual.origin(), &bounds)?;
+                    window.cancel_in_flight_moves();
+                    runtime.placement(conn, root, window, &bounds)?;
+                }
+            } else {
+                let window_id = window.window;
+                check_confirmation_timeout_with(
+                    &mut runtime.confirmation_deadline,
+                    window,
+                    &mut runtime.final_target,
+                    &mut runtime.interaction,
+                    &mut runtime.pending_move,
+                    || {
+                        let actual = ManagedProbeWindow::query_window_actual_root_geometry(
+                            conn, window_id, root,
+                        )?;
+                        if actual.size() != Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()) {
+                            return Err("Body resized during movement verification".into());
+                        }
+                        Ok(actual.origin())
+                    },
+                    |time| runtime.pointer.release_if_held(conn, time).map(|_| ()),
+                )?;
+                if runtime.menu.is_some()
+                    && !matches!(
+                        runtime.interaction.state(),
+                        InteractionState::MenuOpen { .. }
+                    )
+                {
+                    runtime.cancel(conn, window, "movement confirmation cancellation")?;
+                }
+                if runtime.interaction.active_button().is_none() {
+                    runtime.safety.clear();
+                }
             }
-            if runtime.interaction.active_button().is_none() {
-                runtime.safety.clear();
+            if runtime.safety.deadline.is_some_and(|dl| now >= dl) {
+                let button = runtime
+                    .interaction
+                    .active_button()
+                    .ok_or("Safety timer without an initiating button")?;
+                let (sequence, buttons) = crate::x11::pointer::button_state(conn, root)?;
+                runtime.safety.observed_buttons(
+                    button,
+                    buttons,
+                    !runtime.interaction.has_left_gesture(),
+                    sequence,
+                );
             }
-        }
-        if runtime.safety.deadline.is_some_and(|dl| now >= dl) {
-            let button = runtime
-                .interaction
-                .active_button()
-                .ok_or("Safety timer without an initiating button")?;
-            let (sequence, buttons) = crate::x11::pointer::button_state(conn, root)?;
-            runtime.safety.observed_buttons(
-                button,
-                buttons,
-                !runtime.interaction.has_left_gesture(),
-                sequence,
-            );
         }
 
         if owner.active().is_none()
@@ -4773,6 +5453,20 @@ fn run_probe(
                 if runtime.body == BodyAvailability::Destroyed {
                     return Ok(());
                 }
+            }
+            if route_here_evidence_event(
+                owner.active_mut(),
+                &event,
+                root,
+                window.window,
+                &visibility_atoms,
+                atoms,
+            ) {
+                if matches!(&event, Event::DestroyNotify(e) if e.window == window.window) {
+                    window.window_resource.externally_destroyed();
+                    runtime.unavailable(true);
+                }
+                continue;
             }
             if visibility_event(&event, root, window.window, &visibility_atoms, atoms) {
                 if let Some(operation) = owner.active_mut() {
@@ -13788,6 +14482,1635 @@ mod show_tests {
             for step in ["user_time_zero", "map", "geometry", "enable"] {
                 assert_eq!(h.count(step), 0);
             }
+        }
+    }
+    #[test]
+    fn here_restricted_deferred_recovery_cannot_correct_but_can_restore_fresh_in_bounds_input() {
+        let mut h = Fake::new(visible());
+        h.fence().unwrap();
+        h.runtime.input_fence.automatic_correction_blocked = true;
+        h.geometry = Rect::new(999, 999, 160, 160);
+        for _ in 0..3 {
+            restore_deferred_input(&mut h).unwrap();
+            assert_eq!(h.count("deferred_correct"), 0);
+            assert_eq!(h.count("enable"), 0);
+            assert!(h.runtime.input_fence.blocked);
+            assert!(h.runtime.correction.is_none());
+        }
+        h.geometry = Rect::new(100, 100, 160, 160);
+        restore_deferred_input(&mut h).unwrap();
+        assert_eq!(h.count("enable"), 1);
+        assert!(!h.runtime.input_fence.blocked);
+        assert!(!h.runtime.input_fence.automatic_correction_blocked);
+    }
+
+    #[test]
+    fn new_explicit_show_and_bring_top_have_fresh_correction_budget_after_here_restriction() {
+        for command in [Command::Show, Command::BringTop] {
+            let mut h = Fake::new(visible());
+            h.fence().unwrap();
+            h.runtime.input_fence.automatic_correction_blocked = true;
+            h.geometry = Rect::new(999, 999, 160, 160);
+            let mut op = h.command_operation(command);
+            assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
+            assert_eq!(h.count("correct"), 1);
+            h.now = op.show.correction.unwrap().1;
+            let result = service_remote_with(&mut op, &mut h).unwrap().unwrap();
+            assert_eq!(result.status(), Status::Success);
+            assert!(!h.runtime.input_fence.automatic_correction_blocked);
+            assert_eq!(h.count("correct"), 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod here_service_tests {
+    use super::*;
+    use control::{
+        ActiveOperation, Command, HerePhase, LayerObservation as L, MapState, Reason, Stage,
+        Status, WmState,
+    };
+    use geometry::Rect;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use x11::monitors::destination::DestinationError;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct NativeFault(&'static str, usize);
+    impl std::fmt::Display for NativeFault {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "native {} #{}", self.0, self.1)
+        }
+    }
+    impl std::error::Error for NativeFault {}
+
+    #[derive(Clone, Copy)]
+    struct Reading {
+        desktop: u32,
+        layer: L,
+        minimized: bool,
+        transitional: bool,
+    }
+    impl Reading {
+        fn snapshot(self) -> x11::visibility::VisibilitySnapshot {
+            here_adapter_tests::snapshot(
+                if self.minimized || self.desktop != 2 || self.transitional {
+                    WmState::Iconic
+                } else {
+                    WmState::Normal
+                },
+                if self.minimized || self.desktop != 2 {
+                    MapState::Unmapped
+                } else {
+                    MapState::Viewable
+                },
+                self.minimized,
+                self.desktop,
+                self.layer,
+            )
+        }
+    }
+    fn layout() -> control::DestinationIdentity {
+        let area = Rect::new(0, 0, 800, 600);
+        control::DestinationIdentity {
+            desktop_count: 5,
+            destination_desktop: 2,
+            current_desktop: 2,
+            monitor_name: 20,
+            monitor_bounds: area,
+            target_workarea: Some(area),
+            viewport: control::DestinationViewport::AllZero,
+            usable_area: area,
+            body_size: Size::new(160, 160),
+            valid_origins: checked_probe_bounds(area).unwrap(),
+        }
+    }
+    struct Fake {
+        now: Instant,
+        runtime: ProbeRuntime,
+        window: ManagedProbeWindow,
+        current: Reading,
+        reads: VecDeque<Reading>,
+        layout: Result<control::DestinationIdentity, DestinationError>,
+        layouts: VecDeque<Result<control::DestinationIdentity, DestinationError>>,
+        actual: Rect,
+        geometries: VecDeque<Rect>,
+        log: Vec<&'static str>,
+        faults: Vec<(&'static str, usize)>,
+        changes: VecDeque<(&'static str, Reading)>,
+        advances: VecDeque<(&'static str, Duration)>,
+        owned: bool,
+        refuse_correction: bool,
+        send_before_cookie: bool,
+        terminal: Option<control::Visibility>,
+        lose_at: Option<(&'static str, usize)>,
+    }
+    impl Fake {
+        fn new(remote: bool, minimized: bool, layer: L) -> Self {
+            let mut runtime = visibility_fence_tests::runtime(0);
+            runtime.input_fence.enabled_after = Some(10);
+            Self {
+                now: Instant::now(),
+                runtime,
+                window: tests::test_window(),
+                current: Reading {
+                    desktop: if remote { 0 } else { 2 },
+                    minimized,
+                    layer,
+                    transitional: false,
+                },
+                reads: VecDeque::new(),
+                layout: Ok(layout()),
+                layouts: VecDeque::new(),
+                actual: Rect::new(100, 100, 160, 160),
+                geometries: VecDeque::new(),
+                log: vec![],
+                faults: vec![],
+                changes: VecDeque::new(),
+                advances: VecDeque::new(),
+                owned: true,
+                refuse_correction: false,
+                send_before_cookie: false,
+                terminal: None,
+                lose_at: None,
+            }
+        }
+        pub(super) fn operation(&self) -> ActiveOperation {
+            let mut active = None;
+            assert_eq!(
+                control::admit(
+                    &mut active,
+                    control::Request {
+                        reply_xid: 9,
+                        request_id: 99,
+                        epoch: 11,
+                        command: Command::BringHere,
+                    },
+                    2,
+                    control::Lifecycle::Ready,
+                    false,
+                    self.now
+                ),
+                control::Admission::Admitted
+            );
+            active.unwrap()
+        }
+        fn count(&self, step: &str) -> usize {
+            self.log.iter().filter(|&&s| s == step).count()
+        }
+        fn step(&mut self, step: &'static str) -> Result<(), HostError> {
+            self.log.push(step);
+            if self.changes.front().is_some_and(|(s, _)| *s == step) {
+                self.current = self.changes.pop_front().unwrap().1;
+            }
+            if self.advances.front().is_some_and(|(s, _)| *s == step) {
+                self.now += self.advances.pop_front().unwrap().1;
+            }
+            let count = self.count(step);
+            if self.lose_at == Some((step, count)) {
+                self.owned = false;
+            }
+            if self.faults.contains(&(step, count)) {
+                return Err(Box::new(NativeFault(step, count)));
+            }
+            Ok(())
+        }
+        fn read_layout(
+            &mut self,
+        ) -> Result<Result<control::DestinationIdentity, DestinationError>, HostError> {
+            self.step("layout")?;
+            Ok(self
+                .layouts
+                .pop_front()
+                .unwrap_or_else(|| self.layout.clone()))
+        }
+        fn target(&mut self) {
+            self.current.desktop = 2;
+            self.current.transitional = false;
+        }
+        fn run(&mut self, op: &mut ActiveOperation) -> Option<control::OperationResult> {
+            service_bring_here_with(op, self).unwrap()
+        }
+        fn arrived(&mut self, op: &mut ActiveOperation) -> control::OperationResult {
+            self.target();
+            mark_remote_observation(op, false);
+            self.run(op).unwrap()
+        }
+        fn assert_no_mutation(&self) {
+            for step in ["empty", "release", "popup", "desktop", "correct", "shape"] {
+                assert_eq!(self.count(step), 0, "{step}");
+            }
+        }
+    }
+    impl BringHereHost for Fake {
+        fn now(&self) -> Instant {
+            self.now
+        }
+        fn owned(&mut self) -> Result<bool, HostError> {
+            self.step("owner")?;
+            Ok(self.owned)
+        }
+        fn live(&self) -> bool {
+            self.runtime.body != BodyAvailability::Destroyed
+        }
+        fn evidence(&mut self, _: u32) -> Result<HereEvidence, HostError> {
+            let cell = RefCell::new(&mut *self);
+            here_evidence_with(
+                || cell.borrow_mut().read_layout(),
+                || {
+                    let mut h = cell.borrow_mut();
+                    h.step("observe")?;
+                    let reading = h.reads.pop_front().unwrap_or(h.current);
+                    let mut snapshot = reading.snapshot();
+                    if let Some(terminal) = h.terminal {
+                        if terminal == control::Visibility::Destroyed {
+                            snapshot.evidence.destroyed = true;
+                            h.window.window_resource.externally_destroyed();
+                            h.runtime.unavailable(true);
+                        } else {
+                            snapshot.evidence.wm_state = WmState::Withdrawn;
+                            snapshot.observation.as_mut().unwrap().wm_state = WmState::Withdrawn;
+                        }
+                        snapshot.candidate = control::classify(snapshot.evidence);
+                    }
+                    Ok(snapshot)
+                },
+            )
+        }
+        fn placement_busy(&self) -> bool {
+            self.runtime.correction.is_some()
+        }
+        fn input_active(&self) -> bool {
+            !self.runtime.input_fence.blocked
+        }
+        fn visible_ready(&self) -> bool {
+            here_runtime_ready(&self.runtime, &self.window)
+        }
+        fn fence_settled(&self) -> bool {
+            self.runtime.visibility_dispatch_eligible()
+        }
+        fn fence(&mut self) -> Result<(), HostError> {
+            self.log.push("fence");
+            let empty = self.step("empty");
+            let release = self.step("release");
+            let popup = self.step("popup");
+            self.runtime.fence_visibility_input_with(
+                &mut self.window,
+                || empty.map(|()| 100),
+                |_, _| release,
+                |_| popup,
+            )
+        }
+        fn desktop(
+            &mut self,
+            target: u32,
+            deadline: Instant,
+            dispatched: &mut bool,
+        ) -> Result<bool, HostError> {
+            assert_eq!(target, 2);
+            assert!(self.fence_settled());
+            if self.now >= deadline {
+                return Ok(false);
+            }
+            if !self.send_before_cookie {
+                *dispatched = true;
+            }
+            self.step("desktop")?;
+            Ok(true)
+        }
+        fn geometry(&mut self) -> Result<Rect, HostError> {
+            self.step("geometry")?;
+            Ok(self.geometries.pop_front().unwrap_or(self.actual))
+        }
+        fn restrict_automatic_correction(&mut self) {
+            self.runtime.input_fence.automatic_correction_blocked = true;
+            self.log.push("restrict");
+        }
+        fn correct(
+            &mut self,
+            target: Point,
+            deadline: Instant,
+            dispatched: &mut bool,
+        ) -> Result<Option<Instant>, HostError> {
+            assert!(self.runtime.input_fence.automatic_correction_blocked);
+            assert!(self.fence_settled());
+            if self.now + CONFIRMATION_TIMEOUT > deadline {
+                return Ok(None);
+            }
+            *dispatched = true;
+            self.step("correct")?;
+            if !self.refuse_correction {
+                self.actual = Rect::new(target.x, target.y, 160, 160);
+            }
+            self.runtime.body = BodyAvailability::Validating;
+            Ok(Some(self.now + CONFIRMATION_TIMEOUT))
+        }
+        fn enable(
+            &mut self,
+            evidence: &HereEvidence,
+            actual: Rect,
+            deadline: Instant,
+        ) -> Result<bool, HostError> {
+            assert!(self.now < deadline);
+            self.step("enable")?;
+            let shape = self.step("shape");
+            self.window.confirmed_origin = actual.origin();
+            self.window.cancel_in_flight_moves();
+            self.runtime.body = BodyAvailability::Ready;
+            self.runtime.restore_visibility_input_with(
+                &self.window,
+                evidence.snapshot.evidence,
+                &InputPlacement {
+                    selected_monitor: 20,
+                    observed_monitor: evidence.layout.as_ref().unwrap().monitor_name,
+                    geometry: actual,
+                    bounds: evidence.layout.as_ref().unwrap().valid_origins,
+                },
+                || shape.map(|()| 1000),
+            )?;
+            Ok(true)
+        }
+    }
+    fn check_result(result: control::OperationResult, status: Status, history: bool) {
+        assert_eq!(result.status(), status);
+        assert_eq!(
+            result.detail().placement.history.relocation_confirmed,
+            history
+        );
+        assert!(!result.detail().placement.history.restoration_confirmed);
+        let reply = control::TerminalResponse {
+            status,
+            detail: result.detail(),
+            request_id: 99,
+            control_xid: 10,
+        };
+        assert_eq!(
+            control::TerminalResponse::decode(&reply.encode().unwrap()).unwrap(),
+            reply
+        );
+        if status != Status::Success {
+            assert_eq!(
+                result.detail().placement.current,
+                control::PlacementConfirmation::default()
+            );
+        }
+    }
+
+    #[test]
+    fn safe_local_noop_is_fresh_and_has_zero_mutations_for_all_layers() {
+        for layer in [L::Normal, L::Above, L::Below] {
+            let mut h = Fake::new(false, false, layer);
+            let mut op = h.operation();
+            let result = h.run(&mut op).unwrap();
+            check_result(result, Status::Success, false);
+            h.assert_no_mutation();
+            assert!(h.count("layout") >= 6);
+            assert!(h.count("geometry") >= 2);
+            assert_eq!(
+                result.detail().placement.current.geometry,
+                control::GeometryProof::Verified
+            );
+        }
+    }
+    #[test]
+    fn local_unsafe_fence_cancels_every_gesture_popup_and_release_debt_neutrally() {
+        for case in 0..6 {
+            let mut h = Fake::new(false, false, L::Below);
+            h.runtime = visibility_fence_tests::runtime(case);
+            let mut op = h.operation();
+            let result = h.run(&mut op).unwrap();
+            check_result(result, Status::Success, false);
+            assert_eq!(h.count("fence"), 1);
+            assert_eq!(h.count("desktop"), 0);
+            assert_eq!(h.count("correct"), 0);
+            assert_eq!(h.count("shape"), 1);
+            assert!(!h.runtime.pointer.is_grabbed());
+            assert!(h.runtime.menu.is_none());
+            assert!(h.runtime.pending_move.is_none());
+            assert!(h.runtime.final_target.is_none());
+        }
+    }
+    #[test]
+    fn stronger_noop_checks_all_runtime_obligations() {
+        for case in 0..11 {
+            let mut h = Fake::new(false, false, L::Normal);
+            match case {
+                0 => h.runtime.pending_map_input = Some(1),
+                1 => h.runtime.pending_move = Some(Point::new(120, 120)),
+                2 => h.runtime.final_target = Some(Point::new(120, 120)),
+                3 => h.runtime.confirmation_deadline = Some(h.now),
+                4 => h.runtime.safety.deadline = Some(h.now),
+                5 => h.runtime.body = BodyAvailability::Validating,
+                6 => h.runtime.pointer.require_transition_release(),
+                7 => h.runtime.input_fence.enabled_after = None,
+                8 => h.window.in_flight_moves.push_back(Point::new(120, 120)),
+                9 => h.runtime.menu = Some(MenuPopup::test_popup(200, 1)),
+                _ => h.runtime.input_fence.blocked = true,
+            }
+            let mut op = h.operation();
+            check_result(h.run(&mut op).unwrap(), Status::Success, false);
+            assert_eq!(h.count("fence"), 1, "case {case}");
+        }
+    }
+    #[test]
+    fn existing_ordinary_correction_is_busy_and_not_stolen() {
+        let mut h = Fake::new(false, false, L::Normal);
+        let mut op = h.operation();
+        h.runtime.correction = Some((Point::new(0, 0), h.now));
+        assert_eq!(h.run(&mut op).unwrap().status(), Status::Busy);
+        h.assert_no_mutation();
+        assert!(h.runtime.correction.is_some());
+        assert_eq!(h.count("layout"), 0);
+    }
+    #[test]
+    fn local_correction_clamps_live_origin_once_and_cannot_authorize_partial() {
+        let mut h = Fake::new(false, false, L::Normal);
+        h.actual = Rect::new(900, -30, 160, 160);
+        let mut op = h.operation();
+        assert!(h.run(&mut op).is_none());
+        assert_eq!(op.placement.correction().unwrap().0, Point::new(640, 0));
+        check_result(h.run(&mut op).unwrap(), Status::Success, false);
+        assert_eq!(h.count("correct"), 1);
+        assert_eq!(h.count("desktop"), 0);
+        assert_eq!(h.count("shape"), 1);
+    }
+    #[test]
+    fn local_and_remote_minimized_preserve_each_layer_and_defer_without_geometry() {
+        for remote in [false, true] {
+            for layer in [L::Normal, L::Above, L::Below] {
+                let mut h = Fake::new(remote, true, layer);
+                h.actual = Rect::new(9999, 9999, 160, 160);
+                let mut op = h.operation();
+                let result = if remote {
+                    assert!(h.run(&mut op).is_none());
+                    h.arrived(&mut op)
+                } else {
+                    h.run(&mut op).unwrap()
+                };
+                check_result(result, Status::Success, remote);
+                let d = result.detail();
+                assert!(d.progress.placement_deferred);
+                assert!(!d.progress.input_ready);
+                assert!(!d.progress.above_confirmed);
+                assert_eq!(d.layer, layer);
+                assert_eq!(
+                    d.placement.current.geometry,
+                    control::GeometryProof::Deferred
+                );
+                for step in ["geometry", "correct", "shape"] {
+                    assert_eq!(h.count(step), 0);
+                }
+                assert!(h.fence_settled());
+                assert!(!h.runtime.input_fence.automatic_correction_blocked);
+            }
+        }
+    }
+    #[test]
+    fn remote_visible_each_layer_including_iconic_unmapped_without_hidden() {
+        for layer in [L::Normal, L::Above, L::Below] {
+            let mut h = Fake::new(true, false, layer);
+            let mut op = h.operation();
+            assert!(h.run(&mut op).is_none());
+            assert!(!op.placement.baseline.unwrap().minimized);
+            assert!(!op.placement.proof.history.relocation_confirmed);
+            assert_eq!(h.count("desktop"), 1);
+            let log = &h.log;
+            let send = log.iter().position(|s| *s == "desktop").unwrap();
+            let release = log.iter().position(|s| *s == "release").unwrap();
+            assert!(send > release);
+            assert!(log[release..send].contains(&"layout"));
+            check_result(h.arrived(&mut op), Status::Success, true);
+            assert_eq!(h.count("shape"), 1);
+            assert_eq!(h.count("desktop"), 1);
+            assert_eq!(h.count("correct"), 0);
+        }
+    }
+    #[test]
+    fn initial_transitional_or_invalid_evidence_never_establishes_mutation_authority() {
+        for variant in 0..5 {
+            let mut h = Fake::new(true, false, L::Normal);
+            match variant {
+                0 => {
+                    h.current.desktop = 2;
+                    h.current.transitional = true;
+                }
+                1 => h.current.layer = L::Unknown,
+                2 => h.layout = Err(DestinationError::UnsupportedViewport),
+                3 => h.layout = Err(DestinationError::Changed),
+                _ => h.layout = Err(DestinationError::Unverifiable("bad monitor".into())),
+            }
+            let mut op = h.operation();
+            check_result(h.run(&mut op).unwrap(), Status::Failed, false);
+            h.assert_no_mutation();
+        }
+    }
+    #[test]
+    fn every_fence_failure_stops_send_but_attempts_release_and_popup_cleanup() {
+        for step in ["empty", "release", "popup"] {
+            let mut h = Fake::new(true, false, L::Normal);
+            h.runtime = visibility_fence_tests::runtime(3);
+            h.faults.push((step, 1));
+            let mut op = h.operation();
+            let error = service_bring_here_with(&mut op, &mut h).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<NativeFault>(),
+                Some(&NativeFault(step, 1))
+            );
+            assert_eq!(h.count("release"), 1);
+            assert_eq!(h.count("popup"), 1);
+            assert_eq!(h.count("desktop"), 0);
+            assert!(h.runtime.input_fence.blocked);
+            assert_eq!(op.detail.stage, Stage::Shutdown);
+        }
+    }
+    #[test]
+    fn failed_enable_gets_exactly_one_refence_and_original_error_priority() {
+        for remote in [false, true] {
+            for cleanup_fails in [false, true] {
+                let mut h = Fake::new(remote, false, L::Normal);
+                h.runtime.input_fence.enabled_after = None;
+                let mut op = h.operation();
+                if remote {
+                    assert!(h.run(&mut op).is_none());
+                    h.target();
+                }
+                h.faults.push(("shape", 1));
+                if cleanup_fails {
+                    h.faults.push(("empty", 2));
+                }
+                let error = service_bring_here_with(&mut op, &mut h).unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<NativeFault>(),
+                    Some(&NativeFault("shape", 1))
+                );
+                assert_eq!(h.count("fence"), 2);
+                assert_eq!(h.count("shape"), 1);
+                assert!(h.runtime.input_fence.blocked);
+                assert_eq!(op.detail.reason, Reason::X11Failure);
+                check_result(
+                    op.placement
+                        .here_result(op.detail, control::Confirmation::default())
+                        .unwrap(),
+                    if remote {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    },
+                    remote,
+                );
+            }
+        }
+    }
+    #[test]
+    fn final_loss_after_enable_refences_once_and_never_reenables() {
+        for remote in [false, true] {
+            let mut h = Fake::new(remote, false, L::Normal);
+            h.runtime.input_fence.enabled_after = None;
+            let mut op = h.operation();
+            if remote {
+                assert!(h.run(&mut op).is_none());
+                h.target();
+            }
+            let mut changed = h.current;
+            changed.layer = L::Below;
+            h.changes.push_back(("shape", changed));
+            let result = h.run(&mut op).unwrap();
+            check_result(
+                result,
+                if remote {
+                    Status::Partial
+                } else {
+                    Status::Failed
+                },
+                remote,
+            );
+            assert_eq!(result.detail().reason, Reason::LayerChanged);
+            assert_eq!(h.count("shape"), 1);
+            assert_eq!(h.count("fence"), 2);
+            assert!(h.runtime.input_fence.blocked);
+        }
+    }
+    #[test]
+    fn lost_final_noop_safety_also_fences_without_creating_relocation_history() {
+        let mut h = Fake::new(false, false, L::Normal);
+        let mut op = h.operation();
+        h.geometries = VecDeque::from([h.actual, Rect::new(999, 999, 160, 160)]);
+        check_result(h.run(&mut op).unwrap(), Status::Failed, false);
+        assert_eq!(h.count("fence"), 1);
+        assert_eq!(h.count("desktop"), 0);
+        assert_eq!(h.count("shape"), 0);
+    }
+    #[test]
+    fn uncertain_send_can_only_gain_history_from_bounded_fresh_membership() {
+        for before_cookie in [false, true] {
+            for reaches_target in [false, true] {
+                let mut h = Fake::new(true, false, L::Normal);
+                h.send_before_cookie = before_cookie;
+                h.faults.push(("desktop", 1));
+                let mut changed = h.current;
+                changed.desktop = 2;
+                if reaches_target {
+                    h.changes.push_back(("desktop", changed));
+                }
+                let mut op = h.operation();
+                let err = service_bring_here_with(&mut op, &mut h).unwrap_err();
+                assert_eq!(
+                    err.downcast_ref::<NativeFault>(),
+                    Some(&NativeFault("desktop", 1))
+                );
+                let history = !before_cookie && reaches_target;
+                check_result(
+                    op.placement
+                        .here_result(op.detail, control::Confirmation::default())
+                        .unwrap(),
+                    if history {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    },
+                    history,
+                );
+                assert_eq!(h.count("desktop"), 1);
+                assert_eq!(h.count("correct"), 0);
+                assert_eq!(h.count("shape"), 0);
+            }
+        }
+    }
+    #[test]
+    fn outer_layout_native_failure_before_send_after_possible_send_and_after_history() {
+        for phase in 0..3 {
+            for final_fails in [false, true] {
+                let mut h = Fake::new(true, false, L::Normal);
+                let mut op = h.operation();
+                if phase > 0 {
+                    assert!(h.run(&mut op).is_none());
+                }
+                if phase == 2 {
+                    h.target();
+                    h.current.transitional = true;
+                    assert!(h.run(&mut op).is_none());
+                    assert!(op.placement.proof.history.relocation_confirmed);
+                }
+                let fault_at = h.count("layout") + 1;
+                h.faults.push(("layout", fault_at));
+                if final_fails {
+                    h.faults.push(("layout", fault_at + 1));
+                } else if phase > 0 {
+                    h.target();
+                }
+                let err = service_bring_here_with(&mut op, &mut h).unwrap_err();
+                assert_eq!(
+                    err.downcast_ref::<NativeFault>(),
+                    Some(&NativeFault("layout", fault_at))
+                );
+                let history = phase == 2 || (phase == 1 && !final_fails);
+                let result = op
+                    .placement
+                    .here_result(op.detail, control::Confirmation::default())
+                    .unwrap();
+                check_result(
+                    result,
+                    if history {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    },
+                    history,
+                );
+                assert_eq!(result.detail().stage, Stage::Shutdown);
+                assert_eq!(result.detail().reason, Reason::X11Failure);
+                assert_eq!(h.count("desktop"), usize::from(phase > 0));
+                assert_eq!(h.count("shape"), 0);
+                if phase == 0 {
+                    h.assert_no_mutation();
+                    assert_eq!(h.count("layout"), 1);
+                }
+            }
+        }
+    }
+    #[test]
+    fn inner_destination_errors_are_ordinary_results_at_all_corresponding_phases() {
+        for phase in 0..3 {
+            for error in [
+                DestinationError::Changed,
+                DestinationError::UnsupportedViewport,
+                DestinationError::Unverifiable("invalid viewport/monitor".into()),
+            ] {
+                let mut h = Fake::new(true, false, L::Normal);
+                let mut op = h.operation();
+                if phase > 0 {
+                    assert!(h.run(&mut op).is_none());
+                }
+                if phase == 2 {
+                    h.target();
+                    h.current.transitional = true;
+                    assert!(h.run(&mut op).is_none());
+                }
+                h.layout = Err(error.clone());
+                let result = h.run(&mut op).unwrap();
+                check_result(
+                    result,
+                    if phase == 2 {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    },
+                    phase == 2,
+                );
+                assert_eq!(result.detail().reason, here_destination_reason(&error));
+                assert_ne!(result.detail().stage, Stage::Shutdown);
+                assert_eq!(h.count("desktop"), usize::from(phase > 0));
+            }
+        }
+    }
+    #[test]
+    fn native_primary_survives_final_inner_error_and_terminal_reply_error() {
+        let mut h = Fake::new(true, false, L::Normal);
+        let mut active = Some(h.operation());
+        h.faults.push(("desktop", 1));
+        h.target();
+        h.current.desktop = 0;
+        h.layouts = VecDeque::from([
+            Ok(layout()),
+            Ok(layout()),
+            Ok(layout()),
+            Ok(layout()),
+            Err(DestinationError::Changed),
+            Err(DestinationError::Changed),
+        ]);
+        let mut target = h.current;
+        target.desktop = 2;
+        h.changes.push_back(("desktop", target));
+        let mut replies = vec![];
+        let err = service_here_owner_with(&mut active, &mut h, |r| {
+            replies.push(r);
+            Err("reply failed".into())
+        })
+        .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<NativeFault>(),
+            Some(&NativeFault("desktop", 1))
+        );
+        assert!(active.is_none());
+        assert_eq!(replies.len(), 1);
+        check_result(replies[0], Status::Partial, true);
+        assert_eq!(replies[0].detail().reason, Reason::X11Failure);
+    }
+    #[test]
+    fn layout_and_preservation_drift_never_retarget_or_mutate_layer() {
+        for phase in 0..3 {
+            for drift in 0..10 {
+                let mut h = Fake::new(true, false, L::Above);
+                let mut op = h.operation();
+                if phase > 0 {
+                    assert!(h.run(&mut op).is_none());
+                }
+                if phase == 2 {
+                    h.target();
+                    h.current.transitional = true;
+                    assert!(h.run(&mut op).is_none());
+                    h.current.transitional = false;
+                }
+                let mut changed = layout();
+                match drift {
+                    0 => changed.desktop_count += 1,
+                    1 => changed.current_desktop = 3,
+                    2 => changed.target_workarea = None,
+                    3 => changed.viewport = control::DestinationViewport::Absent,
+                    4 => changed.monitor_name += 1,
+                    5 => changed.monitor_bounds = Rect::new(1, 0, 800, 600),
+                    6 => {
+                        h.current.layer = L::Below;
+                    }
+                    7 => {
+                        h.current.minimized = true;
+                    }
+                    8 => {
+                        h.current.desktop = 3;
+                    }
+                    _ => {
+                        h.current.desktop = 0;
+                    }
+                }
+                if phase == 0 && drift < 6 {
+                    // changes are detected against the admitted round, not a fabricated baseline
+                    h.layouts =
+                        VecDeque::from([Ok(layout()), Ok(layout()), Ok(changed), Ok(changed)]);
+                } else if drift < 6 {
+                    h.layout = Ok(changed);
+                }
+                if phase == 0 && drift == 9 {
+                    continue;
+                }
+                if phase == 0 && drift >= 6 {
+                    h.reads.push_back(Reading {
+                        desktop: 0,
+                        layer: L::Above,
+                        minimized: false,
+                        transitional: false,
+                    });
+                }
+                if phase == 1 && drift == 9 {
+                    h.now = op.deadline;
+                }
+                let result = h
+                    .run(&mut op)
+                    .unwrap_or_else(|| panic!("phase {phase}, drift {drift}"));
+                check_result(
+                    result,
+                    if phase == 2 {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    },
+                    phase == 2,
+                );
+                assert_eq!(h.count("desktop"), usize::from(phase > 0));
+                assert_eq!(h.count("correct"), 0);
+                assert_eq!(h.count("shape"), 0);
+            }
+        }
+    }
+    #[test]
+    fn target_membership_survives_same_read_invalid_layout_or_layer_as_history_only() {
+        for drift in 0..3 {
+            let mut h = Fake::new(true, false, L::Normal);
+            let mut op = h.operation();
+            assert!(h.run(&mut op).is_none());
+            h.target();
+            match drift {
+                0 => h.layout = Err(DestinationError::Changed),
+                1 => h.current.layer = L::Above,
+                _ => h.current.minimized = true,
+            }
+            check_result(h.run(&mut op).unwrap(), Status::Partial, true);
+        }
+    }
+    #[test]
+    fn correction_failure_or_mismatch_never_sends_twice_or_claims_geometry() {
+        for remote in [false, true] {
+            for native_error in [false, true] {
+                let mut h = Fake::new(remote, false, L::Normal);
+                h.actual = Rect::new(-30, 999, 160, 160);
+                h.refuse_correction = true;
+                let mut op = h.operation();
+                if remote {
+                    assert!(h.run(&mut op).is_none());
+                    h.target();
+                }
+                if native_error {
+                    h.faults.push(("correct", 1));
+                }
+                if native_error {
+                    assert!(service_bring_here_with(&mut op, &mut h).is_err());
+                } else {
+                    assert!(h.run(&mut op).is_none());
+                    assert!(!remote_service_due(&op, h.now) || op.placement.observation_due());
+                    assert!(h.run(&mut op).is_none());
+                    assert!(!remote_service_due(&op, h.now));
+                    h.now = op.placement.correction().unwrap().1;
+                    check_result(
+                        h.run(&mut op).unwrap(),
+                        if remote {
+                            Status::Partial
+                        } else {
+                            Status::Failed
+                        },
+                        remote,
+                    );
+                }
+                assert_eq!(h.count("correct"), 1);
+                assert_eq!(h.count("shape"), 0);
+                assert!(h.runtime.input_fence.automatic_correction_blocked);
+            }
+        }
+    }
+    #[test]
+    fn fixed_size_and_full_correction_interval_are_required() {
+        for invalid_size in [false, true] {
+            let mut h = Fake::new(true, false, L::Normal);
+            let mut op = h.operation();
+            assert!(h.run(&mut op).is_none());
+            h.target();
+            h.actual = Rect::new(999, 999, if invalid_size { 159 } else { 160 }, 160);
+            if !invalid_size {
+                h.now = op.deadline - Duration::from_millis(149);
+            }
+            let result = h.run(&mut op).unwrap();
+            check_result(result, Status::Partial, true);
+            assert_eq!(h.count("correct"), 0);
+            assert_eq!(h.count("shape"), 0);
+        }
+    }
+    #[test]
+    fn crossing_each_read_boundary_never_starts_an_expired_mutation() {
+        for step in ["owner", "layout", "observe", "geometry", "empty"] {
+            let mut h = Fake::new(false, false, L::Normal);
+            h.runtime.input_fence.enabled_after = None;
+            let mut op = h.operation();
+            h.advances.push_back((step, op.deadline - h.now));
+            let result = h.run(&mut op).unwrap();
+            check_result(result, Status::Failed, false);
+            assert_eq!(h.count("desktop"), 0);
+            assert_eq!(h.count("correct"), 0);
+            assert_eq!(h.count("shape"), 0);
+        }
+    }
+    #[test]
+    fn deadline_final_read_distinguishes_complete_minimized_and_incomplete_without_notifications() {
+        for minimized in [false, true] {
+            for target in [false, true] {
+                let mut h = Fake::new(true, minimized, L::Above);
+                let mut op = h.operation();
+                assert!(h.run(&mut op).is_none());
+                h.now = op.deadline;
+                if target {
+                    h.target();
+                }
+                let result = h.run(&mut op).unwrap();
+                check_result(
+                    result,
+                    if target && minimized {
+                        Status::Success
+                    } else if target {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    },
+                    target,
+                );
+                assert_eq!(h.count("desktop"), 1);
+                assert_eq!(h.count("shape"), 0);
+                assert_eq!(h.count("correct"), 0);
+            }
+        }
+    }
+    #[test]
+    fn ownership_loss_and_body_destruction_stop_all_mutation_and_keep_history() {
+        for history in [false, true] {
+            for destroyed in [false, true] {
+                let mut h = Fake::new(true, false, L::Normal);
+                let mut op = h.operation();
+                assert!(h.run(&mut op).is_none());
+                if history {
+                    h.target();
+                    h.current.transitional = true;
+                    assert!(h.run(&mut op).is_none());
+                }
+                if destroyed {
+                    h.window.window_resource.externally_destroyed();
+                    h.runtime.unavailable(true);
+                } else {
+                    h.owned = false;
+                }
+                let before = h.log.len();
+                let result = h.run(&mut op).unwrap();
+                check_result(
+                    result,
+                    if history {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    },
+                    history,
+                );
+                assert_eq!(
+                    result.detail().reason,
+                    if destroyed {
+                        Reason::BodyDestroyed
+                    } else {
+                        Reason::OwnershipLost
+                    }
+                );
+                assert!(!h.log[before..]
+                    .iter()
+                    .any(|s| ["empty", "desktop", "correct", "shape"].contains(s)));
+            }
+        }
+    }
+    #[test]
+    fn caller_disappearance_and_failed_terminal_send_clear_once_without_undoing_host_progress() {
+        for fail_reply in [false, true] {
+            let mut h = Fake::new(true, false, L::Below);
+            let mut active = Some(h.operation());
+            service_here_owner_with(&mut active, &mut h, |_| panic!("pending")).unwrap();
+            h.target();
+            mark_remote_observation(active.as_mut().unwrap(), false);
+            let mut replies = vec![];
+            let done = service_here_owner_with(&mut active, &mut h, |r| {
+                replies.push(r);
+                if fail_reply {
+                    Err("caller gone".into())
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(done.is_err(), fail_reply);
+            assert!(active.is_none());
+            assert_eq!(replies.len(), 1);
+            check_result(replies[0], Status::Success, true);
+            assert!(h.visible_ready());
+            service_here_owner_with(&mut active, &mut h, |_| panic!("second reply")).unwrap();
+            assert_eq!(h.count("desktop"), 1);
+            assert_eq!(h.count("shape"), 1);
+        }
+    }
+    #[test]
+    fn restricted_fence_survives_completion_and_every_ordinary_placement_path() {
+        let mut h = Fake::new(false, false, L::Normal);
+        h.actual = Rect::new(999, 999, 160, 160);
+        h.refuse_correction = true;
+        let mut op = h.operation();
+        assert!(h.run(&mut op).is_none());
+        h.now = op.placement.correction().unwrap().1;
+        check_result(h.run(&mut op).unwrap(), Status::Failed, false);
+        for _ in 0..4 {
+            h.runtime.body = BodyAvailability::Validating;
+            h.runtime
+                .placement_with(&mut h.window, h.actual, &layout().valid_origins, |_, _| {
+                    panic!("automatic second correction")
+                })
+                .unwrap();
+            assert_ne!(h.runtime.body, BodyAvailability::Ready);
+            assert!(h.runtime.correction.is_none());
+            assert!(h.runtime.input_fence.automatic_correction_blocked);
+        }
+        h.actual = Rect::new(100, 100, 160, 160);
+        h.runtime
+            .placement_with(
+                &mut h.window,
+                h.actual,
+                &layout().valid_origins,
+                |_, _| panic!(),
+            )
+            .unwrap();
+        assert_eq!(h.runtime.body, BodyAvailability::Ready);
+        let evidence = h.evidence(2).unwrap();
+        assert!(h
+            .enable(&evidence, h.actual, h.now + Duration::from_secs(1))
+            .unwrap());
+        assert!(!h.runtime.input_fence.automatic_correction_blocked);
+    }
+    #[test]
+    fn restricted_fence_does_not_take_a_new_here_commands_correction_authority() {
+        let mut h = Fake::new(false, false, L::Normal);
+        h.fence().unwrap();
+        h.restrict_automatic_correction();
+        let mut op = h.operation();
+        h.actual = Rect::new(999, 999, 160, 160);
+        assert!(h.run(&mut op).is_none());
+        assert_eq!(h.count("correct"), 1);
+        check_result(h.run(&mut op).unwrap(), Status::Success, false);
+    }
+    #[test]
+    fn minimized_deferral_leaves_ordinary_future_correction_available() {
+        let mut h = Fake::new(false, true, L::Normal);
+        let mut op = h.operation();
+        check_result(h.run(&mut op).unwrap(), Status::Success, false);
+        h.current.minimized = false;
+        h.runtime.body = BodyAvailability::Validating;
+        let mut requests = 0;
+        h.runtime
+            .placement_with(
+                &mut h.window,
+                Rect::new(999, 999, 160, 160),
+                &layout().valid_origins,
+                |_, _| {
+                    requests += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(requests, 1);
+    }
+    fn atoms() -> (x11::visibility::VisibilityAtoms, x11::monitors::LayoutAtoms) {
+        (
+            x11::visibility::VisibilityAtoms {
+                change_state: 11,
+                state: 12,
+                hidden: 13,
+                above: 14,
+                below: 15,
+                desktop: 16,
+                current_desktop: 17,
+                supported: 18,
+                wm_state: 19,
+                user_time: 20,
+            },
+            x11::monitors::LayoutAtoms {
+                current_desktop: 17,
+                workarea: 21,
+                wm_desktop: 16,
+                number_of_desktops: 22,
+                desktop_viewport: 23,
+            },
+        )
+    }
+    fn property(window: u32, atom: u32) -> Event {
+        Event::PropertyNotify(x11rb::protocol::xproto::PropertyNotifyEvent {
+            window,
+            atom,
+            ..Default::default()
+        })
+    }
+    fn event(kind: usize) -> Event {
+        use x11rb::protocol::xproto::*;
+        match kind {
+            0 => property(100, 16),
+            1 => property(100, 12),
+            2 => property(100, 19),
+            3 => Event::MapNotify(MapNotifyEvent {
+                window: 100,
+                event: 100,
+                ..Default::default()
+            }),
+            4 => Event::UnmapNotify(UnmapNotifyEvent {
+                window: 100,
+                event: 100,
+                ..Default::default()
+            }),
+            5 => Event::ConfigureNotify(ConfigureNotifyEvent {
+                window: 100,
+                x: 999,
+                y: 999,
+                width: 160,
+                height: 160,
+                ..Default::default()
+            }),
+            6 => property(1, 17),
+            7 => property(1, 22),
+            8 => property(1, 21),
+            9 => property(1, 23),
+            10 => property(1, 18),
+            11 => Event::ConfigureNotify(ConfigureNotifyEvent {
+                window: 1,
+                ..Default::default()
+            }),
+            12 => Event::DestroyNotify(DestroyNotifyEvent {
+                window: 100,
+                event: 100,
+                ..Default::default()
+            }),
+            _ => Event::RandrScreenChangeNotify(Default::default()),
+        }
+    }
+    #[test]
+    fn every_here_evidence_event_is_consumed_before_legacy_placement_and_map_paths() {
+        let (visibility, layout) = atoms();
+        let mut h = Fake::new(true, false, L::Normal);
+        let mut op = h.operation();
+        assert!(h.run(&mut op).is_none());
+        let history = op.placement.proof.history;
+        for kind in 0..14 {
+            let e = event(kind);
+            assert!(route_here_evidence_event(
+                Some(&mut op),
+                &e,
+                1,
+                100,
+                &visibility,
+                &layout
+            ));
+            assert!(op.placement.observation_due());
+            assert_eq!(op.placement.proof.history, history);
+        }
+        assert!(!route_here_evidence_event(
+            Some(&mut op),
+            &property(999, 22),
+            1,
+            100,
+            &visibility,
+            &layout
+        ));
+        assert!(!route_here_evidence_event(
+            None,
+            &event(0),
+            1,
+            100,
+            &visibility,
+            &layout
+        ));
+        assert!(!local_layer_service_allowed(Some(&op)));
+    }
+    #[test]
+    fn desktop_map_state_event_permutations_duplicates_delays_converge_only_through_reads() {
+        let (visibility, layout) = atoms();
+        for order in [
+            [0, 3, 2],
+            [0, 2, 3],
+            [3, 0, 2],
+            [3, 2, 0],
+            [2, 0, 3],
+            [2, 3, 0],
+        ] {
+            let mut h = Fake::new(true, false, L::Below);
+            let mut op = h.operation();
+            assert!(h.run(&mut op).is_none());
+            for &kind in &order {
+                assert!(route_here_evidence_event(
+                    Some(&mut op),
+                    &event(kind),
+                    1,
+                    100,
+                    &visibility,
+                    &layout
+                ));
+                assert!(h.run(&mut op).is_none()); // notifications alone cannot prove membership
+                assert!(!remote_service_due(&op, h.now));
+            }
+            h.target();
+            h.current.transitional = true;
+            route_here_evidence_event(Some(&mut op), &event(4), 1, 100, &visibility, &layout);
+            assert!(h.run(&mut op).is_none());
+            assert!(op.placement.proof.history.relocation_confirmed);
+            assert_eq!(h.count("shape"), 0);
+            assert_eq!(h.count("geometry"), 0);
+            h.current.transitional = false;
+            route_here_evidence_event(
+                Some(&mut op),
+                &event(order[2]),
+                1,
+                100,
+                &visibility,
+                &layout,
+            );
+            check_result(h.run(&mut op).unwrap(), Status::Success, true);
+            let mut active = None;
+            for &kind in &order {
+                assert!(!route_here_evidence_event(
+                    active.as_mut(),
+                    &event(kind),
+                    1,
+                    100,
+                    &visibility,
+                    &layout
+                ));
+            }
+            assert_eq!(h.count("desktop"), 1);
+            assert_eq!(h.count("correct"), 0);
+            assert_eq!(h.count("shape"), 1);
+            // A late map has no new silhouette synchronization allowance.
+            let Event::MapNotify(map) = event(3) else {
+                unreachable!()
+            };
+            h.runtime
+                .synchronize_map_input_with(&map, 100, 9999, || {
+                    panic!("late map must not reassert shape")
+                })
+                .unwrap();
+        }
+    }
+    fn owner_tick(
+        active: &mut Option<ActiveOperation>,
+        h: &mut Fake,
+        replies: &mut Vec<control::OperationResult>,
+    ) {
+        service_here_owner_with(active, h, |r| {
+            replies.push(r);
+            Ok(())
+        })
+        .unwrap();
+    }
+    #[test]
+    fn sustained_traffic_over_64_events_cannot_starve_total_or_correction_deadline() {
+        for correction in [false, true] {
+            let (visibility, layout) = atoms();
+            let mut h = Fake::new(!correction, false, L::Normal);
+            if correction {
+                h.actual = Rect::new(999, 999, 160, 160);
+                h.refuse_correction = true;
+            }
+            let mut active = Some(h.operation());
+            let immutable = active.unwrap().deadline;
+            let mut replies = vec![];
+            owner_tick(&mut active, &mut h, &mut replies);
+            owner_tick(&mut active, &mut h, &mut replies); // consumes correction's immediate observation
+            let expected = remote_operation_deadline(active.as_ref().unwrap());
+            assert_eq!(
+                expected,
+                if correction {
+                    h.now + CONFIRMATION_TIMEOUT
+                } else {
+                    immutable
+                }
+            );
+            let mut queue = VecDeque::from(vec![property(999, 99); 5000]);
+            let mut processed = 0;
+            while active.is_some() {
+                let batch: Vec<_> =
+                    drain_events_bounded(&mut None, 64, || Ok::<_, HostError>(queue.pop_front()))
+                        .unwrap();
+                for e in batch {
+                    h.now += Duration::from_millis(1);
+                    processed += 1;
+                    if active
+                        .as_ref()
+                        .is_some_and(|op| h.now >= remote_operation_deadline(op))
+                    {
+                        owner_tick(&mut active, &mut h, &mut replies);
+                        if active.is_none() {
+                            assert_eq!(h.now, expected);
+                        }
+                    }
+                    route_here_evidence_event(active.as_mut(), &e, 1, 100, &visibility, &layout);
+                }
+                owner_tick(&mut active, &mut h, &mut replies);
+                if queue.is_empty() {
+                    // no notifications: wait advances to the fixed deadline, no sleep
+                    if let Some(op) = active {
+                        h.now = remote_operation_deadline(&op);
+                    }
+                    owner_tick(&mut active, &mut h, &mut replies);
+                }
+            }
+            assert!(processed > 64);
+            assert_eq!(replies.len(), 1);
+            check_result(replies[0], Status::Failed, false);
+            assert!(h.now >= expected);
+            assert_eq!(h.count("correct"), usize::from(correction));
+            assert_eq!(h.count("desktop"), usize::from(!correction));
+            assert!(
+                h.count("observe") < 12,
+                "irrelevant traffic must not cause polling"
+            );
+        }
+    }
+    #[test]
+    fn correction_deadline_also_finishes_transitional_readiness_without_spinning() {
+        let mut h = Fake::new(false, false, L::Normal);
+        h.actual = Rect::new(999, 999, 160, 160);
+        let mut op = h.operation();
+        assert!(h.run(&mut op).is_none());
+        h.current.transitional = true;
+        h.now = op.placement.correction().unwrap().1;
+        check_result(h.run(&mut op).unwrap(), Status::Failed, false);
+        assert_eq!(h.count("correct"), 1);
+        assert_eq!(h.count("shape"), 0);
+    }
+    #[test]
+    fn both_consumed_request_sites_and_end_of_batch_progress_before_wait() {
+        for site in ["batch", "lookahead"] {
+            let mut h = Fake::new(true, false, L::Normal);
+            let mut active = None;
+            route_owner_request_with(
+                &mut active,
+                &mut h,
+                |active, h| {
+                    h.log.push(site);
+                    *active = Some(h.operation());
+                    Ok(true)
+                },
+                |active, h| service_here_owner_with(active, h, |_| panic!("pending")),
+            )
+            .unwrap();
+            assert_eq!(h.count("desktop"), 1);
+            assert!(active.is_some());
+            let reads = h.count("observe");
+            let mut replies = vec![];
+            owner_tick(&mut active, &mut h, &mut replies); // one immediate post-send observation
+            assert!(!remote_service_due(active.as_ref().unwrap(), h.now));
+            let settled = h.count("observe");
+            owner_tick(&mut active, &mut h, &mut replies);
+            assert_eq!(h.count("observe"), settled);
+            assert_eq!(settled, reads + 1);
+            h.target();
+            mark_remote_observation(active.as_mut().unwrap(), false);
+            owner_tick(&mut active, &mut h, &mut replies);
+            assert!(active.is_none());
+            assert_eq!(replies.len(), 1);
+        }
+    }
+    #[test]
+    fn sticky_is_unsupported_and_cannot_be_converted_to_an_ordinary_desktop() {
+        let mut h = Fake::new(false, false, L::Normal);
+        h.current.desktop = u32::MAX;
+        let mut op = h.operation();
+        let result = h.run(&mut op).unwrap();
+        assert_eq!(result.detail().reason, Reason::Unsupported);
+        h.assert_no_mutation();
+    }
+    #[test]
+    fn final_native_error_after_enable_has_one_safety_refence_and_never_success() {
+        let mut h = Fake::new(true, false, L::Normal);
+        let mut op = h.operation();
+        assert!(h.run(&mut op).is_none());
+        h.target();
+        // arrival read, geometry bracket, then the final proof's first layout read
+        let at = h.count("layout") + 5;
+        h.faults.push(("layout", at));
+        h.faults.push(("empty", 2));
+        let err = service_bring_here_with(&mut op, &mut h).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<NativeFault>(),
+            Some(&NativeFault("layout", at))
+        );
+        assert_eq!(h.count("shape"), 1);
+        assert_eq!(h.count("fence"), 2);
+        assert!(h.runtime.input_fence.blocked);
+        assert_eq!(op.detail.stage, Stage::Shutdown);
+        check_result(
+            op.placement
+                .here_result(op.detail, control::Confirmation::default())
+                .unwrap(),
+            Status::Partial,
+            true,
+        );
+    }
+    pub(super) fn lifecycle_snapshots() -> Vec<(&'static str, ActiveOperation)> {
+        let mut result = vec![];
+        let mut h = Fake::new(true, false, L::Normal);
+        let op = h.operation();
+        result.push(("observe", op));
+        let mut fenced = op;
+        h.reads = VecDeque::from([
+            h.current,
+            Reading {
+                transitional: true,
+                desktop: 2,
+                ..h.current
+            },
+        ]);
+        // Use independent unreadable layer evidence after the fence; baseline remains original.
+        h.reads[1] = Reading {
+            layer: L::Unknown,
+            ..h.current
+        };
+        assert!(h.run(&mut fenced).is_none());
+        assert_eq!(fenced.placement.here_phase(), HerePhase::Fenced);
+        result.push(("fenced", fenced));
+        let mut h = Fake::new(true, false, L::Normal);
+        let mut op = h.operation();
+        assert!(h.run(&mut op).is_none());
+        result.push(("await", op));
+        h.target();
+        h.current.transitional = true;
+        assert!(h.run(&mut op).is_none());
+        result.push(("membership", op));
+        h.current.transitional = false;
+        h.actual = Rect::new(999, 999, 160, 160);
+        assert!(h.run(&mut op).is_none());
+        result.push(("correction", op));
+        h.faults.push(("shape", 1));
+        assert!(service_bring_here_with(&mut op, &mut h).is_err());
+        result.push(("enable-failed", op));
+        let mut h = Fake::new(true, false, L::Normal);
+        let mut op = h.operation();
+        h.faults.push(("desktop", 1));
+        assert!(service_bring_here_with(&mut op, &mut h).is_err());
+        result.push(("desktop-attempted", op));
+        let mut h = Fake::new(true, false, L::Normal);
+        let mut op = h.operation();
+        assert!(h.run(&mut op).is_none());
+        h.target();
+        let mut changed = h.current;
+        changed.layer = L::Below;
+        h.changes.push_back(("shape", changed));
+        h.run(&mut op).unwrap();
+        result.push(("input-restored", op));
+        result
+    }
+    #[test]
+    fn final_ownership_loss_cannot_report_success_in_visible_or_minimized_branches() {
+        for (remote, minimized, lost_at) in [(false, false, 6), (true, false, 12), (true, true, 8)]
+        {
+            let mut h = Fake::new(remote, minimized, L::Above);
+            let mut op = h.operation();
+            if remote {
+                assert!(h.run(&mut op).is_none());
+                h.target();
+            }
+            h.lose_at = Some(("layout", lost_at));
+            let result = h.run(&mut op).unwrap();
+            check_result(
+                result,
+                if remote {
+                    Status::Partial
+                } else {
+                    Status::Failed
+                },
+                remote,
+            );
+            assert_eq!(result.detail().reason, Reason::OwnershipLost);
+            assert_eq!(result.detail().stage, Stage::Shutdown);
+            assert_eq!(h.count("fence"), usize::from(remote));
+        }
+    }
+    #[test]
+    fn ownership_loss_ends_owner_service_after_one_reply_even_if_reply_fails() {
+        for fail_reply in [false, true] {
+            let mut h = Fake::new(true, false, L::Normal);
+            let mut active = Some(h.operation());
+            service_here_owner_with(&mut active, &mut h, |_| panic!("pending")).unwrap();
+            h.owned = false;
+            mark_remote_observation(active.as_mut().unwrap(), false);
+            let mut replies = vec![];
+            let error = service_here_owner_with(&mut active, &mut h, |result| {
+                replies.push(result);
+                if fail_reply {
+                    Err("reply lost".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Control selection ownership lost during Bring Here"
+            );
+            assert!(active.is_none());
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0].detail().reason, Reason::OwnershipLost);
+            assert_eq!(h.count("desktop"), 1);
+            assert_eq!(h.count("fence"), 1);
+            assert_eq!(h.count("shape"), 0);
+        }
+    }
+    #[test]
+    fn withdrawn_and_destroyed_observations_clear_current_proof_and_keep_real_history() {
+        for history in [false, true] {
+            for terminal in [
+                control::Visibility::Withdrawn,
+                control::Visibility::Destroyed,
+            ] {
+                let mut h = Fake::new(true, false, L::Normal);
+                let mut op = h.operation();
+                if history {
+                    assert!(h.run(&mut op).is_none());
+                    h.target();
+                    h.current.transitional = true;
+                    assert!(h.run(&mut op).is_none());
+                }
+                h.terminal = Some(terminal);
+                let mutations = (h.count("desktop"), h.count("correct"), h.count("shape"));
+                let result = h.run(&mut op).unwrap();
+                check_result(
+                    result,
+                    if history {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    },
+                    history,
+                );
+                assert_eq!(
+                    result.detail().reason,
+                    if terminal == control::Visibility::Destroyed {
+                        Reason::BodyDestroyed
+                    } else {
+                        Reason::Withdrawn
+                    }
+                );
+                assert_eq!(
+                    (h.count("desktop"), h.count("correct"), h.count("shape")),
+                    mutations
+                );
+                if terminal == control::Visibility::Destroyed {
+                    assert!(!h.live());
+                }
+            }
+        }
+    }
+    #[test]
+    fn original_native_error_survives_cleanup_final_native_read_and_reply_all_failing() {
+        let mut h = Fake::new(true, false, L::Normal);
+        let mut active = Some(h.operation());
+        service_here_owner_with(&mut active, &mut h, |_| panic!("pending")).unwrap();
+        h.target();
+        h.faults = vec![("shape", 1), ("empty", 2), ("layout", 9)];
+        let mut replies = vec![];
+        let error = service_here_owner_with(&mut active, &mut h, |result| {
+            replies.push(result);
+            Err("reply also failed".into())
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<NativeFault>(),
+            Some(&NativeFault("shape", 1))
+        );
+        assert_eq!(h.count("fence"), 2);
+        assert_eq!(h.count("shape"), 1);
+        assert_eq!(h.count("layout"), 9);
+        assert!(active.is_none());
+        assert_eq!(replies.len(), 1);
+        check_result(replies[0], Status::Partial, true);
+        assert_eq!(replies[0].detail().reason, Reason::X11Failure);
+    }
+    #[test]
+    fn all_service_phase_snapshots_have_truthful_shutdown_and_monotonic_history() {
+        for (_, mut op) in lifecycle_snapshots() {
+            let history = op.placement.proof.history.relocation_confirmed;
+            let result = op.here_shutdown(Reason::Closing).unwrap();
+            check_result(
+                result,
+                if history {
+                    Status::Partial
+                } else {
+                    Status::Failed
+                },
+                history,
+            );
+            assert_eq!(result.detail().stage, Stage::Shutdown);
+            assert_eq!(result.detail().reason, Reason::Closing);
         }
     }
 }
