@@ -116,6 +116,191 @@ fn assert_unverifiable(result: Result<DestinationLayout, DestinationError>) {
     );
 }
 
+fn caller_pair(
+    before: (GetPropertyReply, GetPropertyReply),
+    after: (GetPropertyReply, GetPropertyReply),
+) -> Result<CallerDesktop, DestinationError> {
+    let mut reads = [before, after].into_iter();
+    let result = capture_caller_with(|| Ok(reads.next().expect("No third read or retry")));
+    assert!(reads.next().is_none(), "Exactly two complete snapshots");
+    result
+}
+
+#[test]
+fn caller_capture_is_exact_two_read_identity_with_no_desktop_count_cap() {
+    for (count, current) in [(1, 0), (7, 6), (u32::MAX, u32::MAX - 1)] {
+        let pair = (property(&[count]), property(&[current]));
+        let captured = caller_pair(pair.clone(), pair).unwrap();
+        assert_eq!(captured.desktop_count, count);
+        assert_eq!(captured.frozen_destination(), current);
+    }
+}
+
+#[test]
+fn caller_rejects_all_bad_count_or_current_metadata_in_either_complete_snapshot() {
+    for bad_count in [true, false] {
+        let bad = malformed_replies(property(&[2])).into_iter().chain([
+            absent(),
+            property(&[]),
+            property(&[1, 2]),
+        ]);
+        for property in bad {
+            for bad_first in [true, false] {
+                let good = (self::property(&[3]), self::property(&[2]));
+                let mut malformed = good.clone();
+                if bad_count {
+                    malformed.0 = property.clone();
+                } else {
+                    malformed.1 = property.clone();
+                }
+                let result = if bad_first {
+                    caller_pair(malformed, good)
+                } else {
+                    caller_pair(good, malformed)
+                };
+                assert!(matches!(result, Err(DestinationError::Unverifiable(_))));
+            }
+        }
+    }
+}
+
+#[test]
+fn caller_rejects_zero_count_sticky_and_out_of_range_current_without_fallback() {
+    for (count, current) in [(0, 0), (2, u32::MAX), (2, 2), (2, 3)] {
+        let pair = (property(&[count]), property(&[current]));
+        assert!(matches!(
+            caller_pair(pair.clone(), pair),
+            Err(DestinationError::Unverifiable(_))
+        ));
+    }
+}
+
+#[test]
+fn caller_two_read_disagreement_rejects_without_a_repair_read() {
+    for (count, current) in [(4, 2), (3, 1)] {
+        assert_eq!(
+            caller_pair(
+                (property(&[3]), property(&[2])),
+                (property(&[count]), property(&[current]))
+            ),
+            Err(DestinationError::Changed)
+        );
+    }
+}
+
+#[test]
+fn caller_transport_failure_stops_immediately_and_never_retries() {
+    for fail_on in [1, 2] {
+        let mut reads = 0;
+        let result = capture_caller_with(|| {
+            reads += 1;
+            if reads == fail_on {
+                Err(unverifiable("read failed"))
+            } else {
+                Ok((property(&[3]), property(&[2])))
+            }
+        });
+        assert_eq!(result, Err(unverifiable("read failed")));
+        assert_eq!(reads, fail_on);
+    }
+}
+
+#[test]
+fn caller_pre_send_revalidation_requires_the_identical_frozen_count_and_current() {
+    let mut snapshots = 0;
+    let captured = capture_caller_with(|| {
+        snapshots += 1;
+        Ok((property(&[3]), property(&[2])))
+    })
+    .unwrap();
+    for (count, current, valid) in [(3, 2, true), (4, 2, false), (3, 1, false)] {
+        let before = snapshots;
+        let fresh = capture_caller_with(|| {
+            snapshots += 1;
+            Ok((property(&[count]), property(&[current])))
+        })
+        .unwrap();
+        assert_eq!(snapshots - before, 2);
+        assert_eq!(captured.revalidate(fresh).is_ok(), valid);
+        assert_eq!(captured.desktop_count, 3);
+        assert_eq!(captured.frozen_destination(), 2);
+    }
+}
+
+#[test]
+fn projection_preserves_every_equality_field_workarea_and_viewport_presence() {
+    for workarea_present in [true, false] {
+        for viewport_present in [true, false] {
+            let mut raw = snapshot();
+            let retained_atom = 0xf123_4567;
+            raw.monitors[0].name_atom = retained_atom;
+            if !workarea_present {
+                raw.workarea = absent();
+            }
+            if !viewport_present {
+                raw.viewport = absent();
+            }
+            let layout = validate_snapshot(&raw, retained_atom, TARGET, BODY).unwrap();
+            let identity = DestinationIdentity::from(&layout);
+            assert_eq!(identity.desktop_count, 2);
+            assert_eq!(identity.destination_desktop, TARGET);
+            assert_eq!(identity.current_desktop, TARGET);
+            assert_eq!(identity.monitor_name, retained_atom);
+            assert_eq!(identity.monitor_bounds, Rect::new(-1920, -100, 1920, 1080));
+            assert_eq!(
+                identity.target_workarea,
+                workarea_present.then_some(Rect::new(-1900, -80, 1800, 900))
+            );
+            assert_eq!(
+                identity.viewport,
+                if viewport_present {
+                    DestinationViewport::AllZero
+                } else {
+                    DestinationViewport::Absent
+                }
+            );
+            assert_eq!(
+                identity.usable_area,
+                if workarea_present {
+                    Rect::new(-1900, -80, 1800, 900)
+                } else {
+                    identity.monitor_bounds
+                }
+            );
+            assert_eq!(identity.body_size, BODY);
+            assert_eq!(
+                identity.valid_origins,
+                if workarea_present {
+                    ValidOriginBounds::new(-1900, -260, -80, 660)
+                } else {
+                    ValidOriginBounds::new(-1920, -160, -100, 820)
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn projection_preserves_representable_signed_boundary_bounds_and_fixed_size() {
+    for origin in [i16::MIN, i16::MAX - 160] {
+        let mut raw = snapshot();
+        raw.monitors[0].x = origin;
+        raw.monitors[0].y = origin;
+        raw.monitors[0].width = 160;
+        raw.monitors[0].height = 160;
+        workarea(&mut raw, Rect::new(origin.into(), origin.into(), 160, 160));
+        let layout = validate(&raw).unwrap();
+        let projected = DestinationIdentity::from(&layout);
+        assert_eq!(projected.monitor_bounds.x, i32::from(origin));
+        assert_eq!(projected.target_workarea, Some(projected.monitor_bounds));
+        assert_eq!(projected.body_size, BODY);
+        assert_eq!(
+            projected.valid_origins,
+            ValidOriginBounds::new(origin.into(), origin.into(), origin.into(), origin.into())
+        );
+    }
+}
+
 #[test]
 fn count_is_exactly_one_positive_cardinal_without_an_arbitrary_maximum() {
     for count in [1, 2, 100_000, u32::MAX] {

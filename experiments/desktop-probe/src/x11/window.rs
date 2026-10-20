@@ -317,22 +317,54 @@ impl ManagedProbeWindow {
         deadline: std::time::Instant,
         dispatched: &mut bool,
     ) -> Result<Option<std::time::Instant>, Box<dyn std::error::Error>> {
+        self.correct_position(conn, target, deadline, dispatched)
+    }
+
+    /// Shared checked position-only seam. Attempt authority belongs to the
+    /// operation; this sends once and confirms only X transport, never WM geometry.
+    pub fn correct_position(
+        &mut self,
+        conn: &impl Connection,
+        target: Point,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+    ) -> Result<Option<std::time::Instant>, Box<dyn std::error::Error>> {
+        self.correct_position_with(
+            target,
+            deadline,
+            dispatched,
+            std::time::Instant::now,
+            |body, aux| Ok(conn.configure_window(body, &aux)?),
+            |cookie| Ok(cookie.check()?),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn correct_position_with<T>(
+        &mut self,
+        target: Point,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+        now: impl FnOnce() -> std::time::Instant,
+        send: impl FnOnce(Window, ConfigureWindowAux) -> Result<T, Box<dyn std::error::Error>>,
+        check: impl FnOnce(T) -> Result<(), Box<dyn std::error::Error>>,
+    ) -> Result<Option<std::time::Instant>, Box<dyn std::error::Error>> {
         i16::try_from(target.x).map_err(|_| "Unsupported X11 movement x coordinate")?;
         i16::try_from(target.y).map_err(|_| "Unsupported X11 movement y coordinate")?;
         if !self.in_flight_moves.is_empty() {
             return Err("Show correction conflicts with pending movement".into());
         }
-        let now = std::time::Instant::now();
+        let now = now();
         let confirmation = now + crate::CONFIRMATION_TIMEOUT;
         if confirmation > deadline {
             return Ok(None);
         }
-        let cookie = conn.configure_window(
+        let cookie = send(
             self.window,
-            &ConfigureWindowAux::new().x(target.x).y(target.y),
+            ConfigureWindowAux::new().x(target.x).y(target.y),
         )?;
         *dispatched = true;
-        cookie.check()?;
+        check(cookie)?;
         self.requested_origin = target;
         self.in_flight_moves.push_back(target);
         Ok(Some(confirmation))
@@ -701,6 +733,193 @@ impl ManagedProbeWindow {
 mod tests {
     use super::*;
     use crate::geometry::Size;
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    fn correction_window() -> ManagedProbeWindow {
+        ManagedProbeWindow {
+            window_resource: OwnedResource::default(),
+            colormap_resource: OwnedResource::default(),
+            window: 0x2345_6789,
+            colormap: 1,
+            wm_delete_window: 2,
+            wm_protocols: 3,
+            requested_origin: Point::new(80, 80),
+            confirmed_origin: Point::new(80, 80),
+            in_flight_moves: VecDeque::new(),
+            superseded_moves: VecDeque::new(),
+            width: 160,
+            height: 160,
+        }
+    }
+
+    #[test]
+    fn checked_position_correction_is_exact_position_only_and_fixed_150_ms() {
+        let now = Instant::now();
+        assert_eq!(crate::CONFIRMATION_TIMEOUT, Duration::from_millis(150));
+        for target in [
+            Point::new(-1900, -80),
+            Point::new(i16::MIN.into(), i16::MAX.into()),
+        ] {
+            let mut window = correction_window();
+            let mut dispatched = false;
+            let trace = RefCell::new(vec![]);
+            let result = window
+                .correct_position_with(
+                    target,
+                    now + Duration::from_millis(3500),
+                    &mut dispatched,
+                    || {
+                        trace.borrow_mut().push("now");
+                        now
+                    },
+                    |body, aux| {
+                        trace.borrow_mut().push("send");
+                        assert_eq!(body, 0x2345_6789);
+                        assert_eq!((aux.x, aux.y), (Some(target.x), Some(target.y)));
+                        assert_eq!(
+                            (
+                                aux.width,
+                                aux.height,
+                                aux.border_width,
+                                aux.sibling,
+                                aux.stack_mode
+                            ),
+                            (None, None, None, None, None)
+                        );
+                        Ok(77)
+                    },
+                    |cookie| {
+                        trace.borrow_mut().push("check");
+                        assert_eq!(cookie, 77);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(result, Some(now + Duration::from_millis(150)));
+            assert!(dispatched);
+            assert_eq!(*trace.borrow(), ["now", "send", "check"]);
+            assert_eq!(window.requested_origin, target);
+            assert_eq!(window.in_flight_moves, [target]);
+            assert_eq!(
+                window.confirmed_origin,
+                Point::new(80, 80),
+                "transport never confirms WM geometry"
+            );
+            assert_eq!((window.width, window.height), (160, 160));
+        }
+    }
+
+    #[test]
+    fn correction_reserves_full_interval_inside_supplied_deadline_before_any_mutation() {
+        let now = Instant::now();
+        for remaining in [-1, 0, 149, 150, 151] {
+            let mut window = correction_window();
+            let mut dispatched = false;
+            let mut sends = 0;
+            let deadline = if remaining < 0 {
+                now - Duration::from_millis(1)
+            } else {
+                now + Duration::from_millis(remaining as u64)
+            };
+            let result = window
+                .correct_position_with(
+                    Point::new(-1900, -80),
+                    deadline,
+                    &mut dispatched,
+                    || now,
+                    |_, _| {
+                        sends += 1;
+                        Ok(())
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(sends, usize::from(remaining >= 150));
+            assert_eq!(dispatched, remaining >= 150);
+            assert_eq!(
+                result,
+                (remaining >= 150).then_some(now + Duration::from_millis(150))
+            );
+            if remaining < 150 {
+                assert_eq!(window.requested_origin, Point::new(80, 80));
+                assert!(window.in_flight_moves.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn correction_send_and_checked_errors_retain_dispatch_distinction_without_retry() {
+        let now = Instant::now();
+        for fail_check in [false, true] {
+            for prior_dispatch in [false, true] {
+                let mut window = correction_window();
+                let mut dispatched = prior_dispatch;
+                let mut sends = 0;
+                let mut checks = 0;
+                let result = window.correct_position_with(
+                    Point::new(-1900, -80),
+                    now + Duration::from_millis(3500),
+                    &mut dispatched,
+                    || now,
+                    |_, _| {
+                        sends += 1;
+                        if fail_check {
+                            Ok(())
+                        } else {
+                            Err("send failure".into())
+                        }
+                    },
+                    |()| {
+                        checks += 1;
+                        Err("checked failure".into())
+                    },
+                );
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    if fail_check {
+                        "checked failure"
+                    } else {
+                        "send failure"
+                    }
+                );
+                assert_eq!(sends, 1);
+                assert_eq!(checks, usize::from(fail_check));
+                assert_eq!(dispatched, prior_dispatch || fail_check);
+                assert_eq!(window.requested_origin, Point::new(80, 80));
+                assert_eq!(window.confirmed_origin, Point::new(80, 80));
+                assert!(window.in_flight_moves.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn shared_show_here_correction_rejects_pending_moves_and_unrepresentable_targets() {
+        let now = Instant::now();
+        for case in 0..3 {
+            let mut window = correction_window();
+            let target = match case {
+                0 => {
+                    window.in_flight_moves.push_back(Point::new(1, 1));
+                    Point::new(2, 2)
+                }
+                1 => Point::new(i32::from(i16::MIN) - 1, 0),
+                _ => Point::new(0, i32::from(i16::MAX) + 1),
+            };
+            let mut dispatched = false;
+            let result = window.correct_position_with::<()>(
+                target,
+                now + Duration::from_secs(1),
+                &mut dispatched,
+                || now,
+                |_, _| panic!("invalid correction must never send"),
+                |_| panic!("no cookie"),
+            );
+            assert!(result.is_err());
+            assert!(!dispatched);
+            assert_eq!(window.requested_origin, Point::new(80, 80));
+        }
+    }
 
     #[test]
     fn test_evaluate_configure_event_synthetic() {

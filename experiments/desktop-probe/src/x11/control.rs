@@ -1325,6 +1325,23 @@ fn caller_budget(command: Command) -> Duration {
     command.caller_budget()
 }
 
+/// D2 preparation only: D4 will write this immutable v2 marker once, after
+/// capture and before strict pre-send revalidation. No production caller uses it.
+#[allow(dead_code)]
+fn here_caller_marker(
+    captured: super::monitors::destination::CallerDesktop,
+    owner: OwnerDescriptor,
+    request_id: u64,
+) -> CallerMarker {
+    CallerMarker {
+        control_xid: owner.control_xid,
+        epoch: owner.epoch,
+        request_id,
+        command: Command::BringHere,
+        destination_desktop: captured.frozen_destination(),
+    }
+}
+
 fn caller_with(
     host: &mut impl CallerHost,
     root: u32,
@@ -4617,6 +4634,84 @@ mod transport_tests {
             (Command::Recover, 9000),
         ] {
             assert_eq!(caller_budget(command), Duration::from_millis(millis));
+        }
+    }
+
+    #[test]
+    fn prepared_here_marker_freezes_only_the_validated_destination_in_existing_v2_shape() {
+        use super::super::monitors::destination::capture_caller_with;
+        let cardinal = |word: u32| GetPropertyReply {
+            format: 32,
+            type_: AtomEnum::CARDINAL.into(),
+            length: 1,
+            value_len: 1,
+            value: word.to_ne_bytes().to_vec(),
+            ..Default::default()
+        };
+        let mut reads = 0;
+        let captured = capture_caller_with(|| {
+            reads += 1;
+            Ok((cardinal(9_u32), cardinal(7_u32)))
+        })
+        .unwrap();
+        assert_eq!(reads, 2);
+        let marker = here_caller_marker(captured, owner(), ID);
+        assert_eq!(marker, self::marker(Command::BringHere));
+        let words = marker.encode().unwrap();
+        assert_eq!(words.len(), 8);
+        assert_eq!(words[1], control::VERSION);
+        assert_eq!(words[7], 7);
+        assert_eq!(CallerMarker::decode(&words).unwrap(), marker);
+        let mut host = Fake::new();
+        host.create_reply(marker).unwrap();
+        assert_eq!(host.log, ["create reply"]);
+        assert!(host.sent.is_empty(), "preparation does not dispatch");
+    }
+
+    #[test]
+    fn pre_send_capture_failure_or_drift_cannot_rewrite_the_marker_or_choose_another_target() {
+        use super::super::monitors::destination::{capture_caller_with, DestinationError};
+        let cardinal = |word: u32| GetPropertyReply {
+            format: 32,
+            type_: AtomEnum::CARDINAL.into(),
+            length: 1,
+            value_len: 1,
+            value: word.to_ne_bytes().to_vec(),
+            ..Default::default()
+        };
+        let captured = capture_caller_with(|| Ok((cardinal(9), cardinal(7)))).unwrap();
+        // D2 exercises the preparation/revalidation seams directly. Production
+        // caller_with still never chooses this path or writes a Here marker.
+        for case in 0..9 {
+            let mut host = Fake::new();
+            let original = here_caller_marker(captured, owner(), ID);
+            host.create_reply(original).unwrap();
+            let mut reads = 0;
+            let fresh = capture_caller_with(|| {
+                reads += 1;
+                let mut count = cardinal(9);
+                let mut current = cardinal(7);
+                match case {
+                    0 => count = cardinal(10),
+                    1 => current = cardinal(6),
+                    2 => current = cardinal(u32::MAX),
+                    3 => current = cardinal(9),
+                    4 => current = GetPropertyReply::default(),
+                    5 => count.format = 8,
+                    6 => return Err(DestinationError::Unverifiable("read failed".into())),
+                    7 if reads == 2 => current = cardinal(6),
+                    _ => {}
+                }
+                Ok((count, current))
+            });
+            let validated = fresh.and_then(|fresh| captured.revalidate(fresh));
+            assert_eq!(validated.is_ok(), case == 8);
+            assert_eq!(reads, if case == 6 { 1 } else { 2 });
+            assert_eq!(host.marker, Some(original));
+            assert_eq!(host.log, ["create reply"]);
+            assert!(host.sent.is_empty());
+            assert_eq!(captured.frozen_destination(), 7);
+            assert_eq!(here_caller_marker(captured, owner(), ID), original);
         }
     }
 }
