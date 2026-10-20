@@ -1,8 +1,8 @@
 # Openbox host integration — user-managed setup
 
-**Acceptance status update, 2026-10-18:** the owner formally accepted **A00-M03.2 at H-A** following H-D publication. This supersedes any earlier *current* H-A pending status below while preserving historically dated F/G decisions. H23 conditional/not exercised, H14 unobserved and H28 optional/not exercised remain the exact native limits. M03.3 has not been implemented.
+**Acceptance status update, 2026-10-20:** M03.2 remains final-accepted at frozen H. M03.3 standalone public `--bring-here` is now owner-accepted at D4.1 executable `4c67da0b09ffe7b69605ac4a415d256acf8abd23`, [CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762), **677 tests**. [Stage-D native evidence](../../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md) records N08/N09 qualifications and N10–N13 natively unexercised conditions. Recover remains Unsupported; no host configuration change is authorized by this record.
 
-**Status (updated 2026-10-18):** M03.2 is formally accepted at frozen H `a46e432c1f97b03c576737b1fc0ac35d7f90c158` / CI 39098551853 (453 tests), preserving H23 conditional/unexercised, H14 unobserved and H28 optional/unexercised. M03.3 Stages A/B are accepted and [H0 native Openbox feasibility](../../experiments/desktop-probe/M03.3-H0-OPENBOX.md) is now owner-accepted. Stage C remains separately gated; this guide authorizes no host-config or executable changes.
+**Historical 2026-10-18 snapshot:** M03.2 H and M03.3 A/B/H0/C were the then-accepted foundation, before public Bring Here. Current status is the D4.1 acceptance above; dated F/G/H evidence stays tied to original tested revisions.
 
 DesktopRoomie should own safe same-instance control, WM-state verification, input cleanup and keyboard-focus isolation. Openbox should be reused for *optional* user conveniences such as keyboard shortcuts, application menus and session autostart. The application must be recoverable from its CLI without optional Openbox bindings; no global key-grabbing daemon, tray framework or automatic dotfile rewriting is required.
 
@@ -255,10 +255,16 @@ After deliberately editing the active `rc.xml`, `openbox --reconfigure` requests
 | `--show` | Restore hidden/iconified body; no implicit workspace/layer change | M03.2 |
 | `--hide` | Hide safely while leaving the same instance controllable | M03.2 |
 | `--bring-top` | Show if hidden and place Above on the **existing body workspace** | M03.2 |
-| `--bring-here` | Move the **same instance** to the current workspace, preserving its layer; hidden-state handling to be designed | M03.3 |
-| `--recover` | Explicitly compose Bring Here and Bring Top, with truthful partial-failure reporting | M03.3 |
+| `--bring-here` | **Accepted standalone Stage D**: move same body to frozen caller workspace; preserve layer and genuine minimization without focus/user-desktop switching; minimized geometry/input deferred | M03.3-D |
+| `--recover` | **Not public / Unsupported**; intended composition Bring Here then Bring Top | M03.3-E (future) |
 
-M03.2 command spellings and transport are implemented and final-accepted at its frozen H executable. M03.3 Stage A/B foundations are accepted and H0 native feasibility passed on the exercised Openbox host, but public Bring Here/Recover and repository `_NET_WM_DESKTOP` transport still do not exist. Stage C is the next separately authorized gate. Optional bindings stay user-managed; only accepted operations should be recommended as working shortcuts.
+M03.2 Hide/Show/Bring Top are final-accepted at H. M03.3 A/B/H0/C/D are separately accepted, including public Bring Here at D4.1. Recover remains unsupported. Optional keyboard bindings are user-managed and were not smoke-tested for Here; Stage E requires separate authorization.
+
+## Stage-D owner-native Bring Here acceptance (2026-10-20)
+
+Frozen executable `4c67da0b09ffe7b69605ac4a415d256acf8abd23`, [CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762), 677 tests. Unlike H0's manually instrumented Stage-B feasibility experiment, D4.1 exercised the public `--bring-here` command with real owner/reply routing. Normal/Above/Below and genuine minimized relocation were confirmed, as were uninterrupted typing/focus, same body identity, transparent-padding interaction, already-local gesture cancellation, independent covered/minimized control, repeated successful relocation, duplicate refusal, clean Quit/relaunch and passive state stability. The owner's N08 delayed tests captured an **already-local** workspace at execution time, not remote relocation during a drag; N09 was manual with retained-monitor geometry corroboration. Real malformed-property/monitor-loss/WM-refusal tests N10–N13 were not fully exercised, nor were concurrent/kill/duration native regressions repeated at D4.1. Full [acceptance record](../../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md).
+
+Bring Here captures the **current workspace when the caller executes**; scheduling a command before switching back does not freeze the earlier workspace. It is not an Openbox keybinding or continuous-follow feature, and does not target the physical monitor containing the caller's terminal. Recover remains unavailable.
 
 ## Official reference material
 
@@ -267,4 +273,4 @@ M03.2 command spellings and transport are implemented and final-accepted at its 
 - [Openbox autostart](https://openbox.org/help/Autostart) — user startup scripts and `openbox-session` distinction.
 - [Openbox configuration](https://openbox.org/help/Configuration) — user/system configuration locations.
 
-Hide, Show and original-workspace Bring Top are accepted on the exercised Openbox host; optional binding changes and shortcut smoke tests remain owner-managed and are not claimed by this record. M03.2 final H-A acceptance is complete. M03.3 H0 separately establishes relocation feasibility, while Bring Here and Recover remain unimplemented pending Stage C/D/E.
+Hide, Show, original-workspace Bring Top and standalone Bring Here are accepted on the exercised Openbox host. Optional bindings are owner-managed/not tested here; Recover is still unsupported. M03.2 H-A, M03.3 H0, and Stage-D evidence retain distinct executable identities. [Stage-D acceptance](../../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md).

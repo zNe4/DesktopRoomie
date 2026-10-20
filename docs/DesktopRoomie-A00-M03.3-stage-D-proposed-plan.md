@@ -1,6 +1,8 @@
 # DesktopRoomie — A00-M03.3 Stage D proposed implementation plan
 
-**Status: PROPOSED — not owner-approved, implemented, or accepted.**
+**Historical D-P status: PROPOSED — not then owner-approved, implemented, or accepted.**
+
+**Lifecycle update — 2026-10-20:** Stage D was subsequently implemented and owner-accepted at final D4.1 executable `4c67da0b09ffe7b69605ac4a415d256acf8abd23`, [CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762), **677 passing tests**, after a D4 source-review blocker required correction. [Stage-D acceptance](../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md) is the current evidence/decision; original future-tense plan requirements below are preserved historically. Recover remains Unsupported; Stage E is separately gated.
 
 **Planning assignment:** A00-M03.3 D-P, 2026-10-18.
 

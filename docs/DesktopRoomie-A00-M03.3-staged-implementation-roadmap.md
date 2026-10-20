@@ -4,6 +4,7 @@
 **Repository/branch at approval:** `zNe4/DesktopRoomie` / `m03`.  
 **Planning base:** `46adda6a6dc1e25930c9656e7c84d125296c8691` (documentation-only handoff HEAD).  
 **Accepted executable foundation:** M03.2 `a46e432c1f97b03c576737b1fc0ac35d7f90c158`, matching CI 39098551853, 453 tests.  
+**Lifecycle update — 2026-10-20:** Stages A/B/H0/C/D have separately passed review/owner acceptance. Public standalone Bring Here is accepted on Openbox at `4c67da0b09ffe7b69605ac4a415d256acf8abd23`, [CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762), **677 tests**; see [Stage-D acceptance](../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md) for source history and native qualifications. Recover remains Unsupported. **Next gate: Stage E only under new authorization.** Future tense below preserves the original approved contract.
 **Authority:** this document freezes design and stage boundaries. It does **not** authorize implementation, commits, pushes, host configuration edits, or advancement between stages. Each mission remains separately owner-authorized and independently reviewed.
 
 ## 1. Objective
@@ -174,6 +175,8 @@ It must check its logical deadline before mutation, mark possible dispatch befor
 
 ## 9. Stage D — standalone Bring Here
 
+**Status — ACCEPTED 2026-10-20:** final code `4c67da0b09ffe7b69605ac4a415d256acf8abd23`, [matching CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762), **677 passed, 0 failed**, independently reviewed after D4.1 fatal-path correction and owner-tested on the documented Openbox host. N01–N09/N14–N16 exercised with explicit qualifications; N10–N13 not fully reproduced natively. [Acceptance record](../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md). No Stage-E authorization is implied.
+
 **Purpose:** enable `--bring-here` through the accepted same-instance event loop.
 
 Recommended phase order:
@@ -293,5 +296,5 @@ Record executable code SHA separately from later documentation-only commits. Pre
 
 ## 16. Immediate next gate
 
-**A00-M03.3 Stage D — standalone Bring Here.** Stages A, B, H0 and C are accepted; Stage C provides only a checked, unconsumed `_NET_WM_DESKTOP` transport seam. Stage D must separately integrate frozen caller destination capture, admission/evidence, one-shot relocation, local/minimized/layer/geometry/input confirmation and truthful terminal results under the approved gate in §9. `--bring-here` is not yet exposed and Recover stays Unsupported. No Stage-D implementation or native acceptance is authorized by this documentation closure.
+**A00-M03.3 Stage E — composed Recover, only under a separate approved assignment.** Stages A, B, H0, C and D are accepted at their distinct code identities. Public standalone Bring Here is available and native-accepted on the exercised Openbox host, while Recover remains CLI-unavailable and private-service Unsupported. Stage E must compose the accepted Here and Bring Top with one operation and no silent retargeting. This documentation record does not authorize Stage E or further implementation.
 
