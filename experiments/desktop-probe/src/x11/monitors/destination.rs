@@ -7,7 +7,9 @@ use std::fmt;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{Atom, AtomEnum, ConnectionExt, GetPropertyReply, Window};
 
-use super::{cardinal_values, intersect_workarea, query_monitors, LayoutAtoms, MonitorGeometry};
+use super::{
+    cardinal_values, intersect_workarea, query_monitors, HostError, LayoutAtoms, MonitorGeometry,
+};
 use crate::control::{DestinationIdentity, DestinationViewport};
 use crate::geometry::{compute_valid_origin_bounds, Rect, Size, ValidOriginBounds};
 
@@ -199,29 +201,89 @@ pub fn query_destination_layout(
     frozen_destination: u32,
     body_size: Size,
 ) -> Result<DestinationLayout, DestinationError> {
-    query_with(selected, frozen_destination, body_size, || {
-        let property = |atom, words| -> Result<GetPropertyReply, DestinationError> {
-            conn.get_property(false, root, atom, AtomEnum::ANY, 0, words)
-                .map_err(unverifiable)?
-                .reply()
-                .map_err(unverifiable)
-        };
-        let count = property(atoms.number_of_desktops, 1)?;
-        // Exact count-derived read bounds, without an arbitrary maximum desktop count.
-        // Oversized/incomplete replies are rejected, never paged or retried.
-        let desktop_count = parse_count(&count)?;
-        let workarea_words = array_words(desktop_count, 4)?;
-        let viewport_words = array_words(desktop_count, 2)?;
-        Ok(DestinationSnapshot {
-            count,
-            current: property(atoms.current_desktop, 1)?,
-            workarea: property(atoms.workarea, workarea_words)?,
-            viewport: property(atoms.desktop_viewport, viewport_words)?,
-            monitors: query_monitors(conn, root).map_err(unverifiable)?,
-        })
+    // Preserve the accepted Stage-B API's native-error classification. Here uses
+    // the separate outer channel below to retain the original fatal error.
+    query_destination_layout_preserving_native(
+        conn,
+        root,
+        atoms,
+        selected,
+        frozen_destination,
+        body_size,
+    )
+    .map_err(unverifiable)?
+}
+
+/// Here-only read seam: outer errors retain native acquisition failures;
+/// successfully acquired but invalid evidence remains in the inner result.
+pub fn query_destination_layout_preserving_native(
+    conn: &impl Connection,
+    root: Window,
+    atoms: &LayoutAtoms,
+    selected: Atom,
+    frozen_destination: u32,
+    body_size: Size,
+) -> Result<Result<DestinationLayout, DestinationError>, HostError> {
+    query_preserving_native_with(selected, frozen_destination, body_size, || {
+        read_destination_with(
+            atoms,
+            |atom, words| {
+                Ok(conn
+                    .get_property(false, root, atom, AtomEnum::ANY, 0, words)?
+                    .reply()?)
+            },
+            || query_monitors(conn, root),
+        )
     })
 }
 
+fn read_destination_with(
+    atoms: &LayoutAtoms,
+    mut property: impl FnMut(Atom, u32) -> Result<GetPropertyReply, HostError>,
+    monitors: impl FnOnce() -> Result<Vec<MonitorGeometry>, HostError>,
+) -> Result<Result<DestinationSnapshot, DestinationError>, HostError> {
+    let count = property(atoms.number_of_desktops, 1)?;
+    // Preserve prerequisite early stops: no subsequent read is possible without
+    // a strict count and representable count-derived property lengths.
+    let lengths =
+        parse_count(&count).and_then(|count| Ok((array_words(count, 4)?, array_words(count, 2)?)));
+    let (workarea_words, viewport_words) = match lengths {
+        Ok(lengths) => lengths,
+        Err(error) => return Ok(Err(error)),
+    };
+    Ok(Ok(DestinationSnapshot {
+        count,
+        current: property(atoms.current_desktop, 1)?,
+        workarea: property(atoms.workarea, workarea_words)?,
+        viewport: property(atoms.desktop_viewport, viewport_words)?,
+        monitors: monitors()?,
+    }))
+}
+
+fn query_preserving_native_with(
+    selected: Atom,
+    frozen_destination: u32,
+    body_size: Size,
+    mut read: impl FnMut() -> Result<Result<DestinationSnapshot, DestinationError>, HostError>,
+) -> Result<Result<DestinationLayout, DestinationError>, HostError> {
+    let before = match read()? {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Ok(Err(error)),
+    };
+    let after = match read()? {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Ok(Err(error)),
+    };
+    Ok(validate_pair(
+        &before,
+        &after,
+        selected,
+        frozen_destination,
+        body_size,
+    ))
+}
+
+#[cfg(test)]
 fn query_with(
     selected: Atom,
     frozen_destination: u32,
@@ -230,8 +292,18 @@ fn query_with(
 ) -> Result<DestinationLayout, DestinationError> {
     let before = read()?;
     let after = read()?;
-    let before = validate_snapshot(&before, selected, frozen_destination, body_size)?;
-    let after = validate_snapshot(&after, selected, frozen_destination, body_size)?;
+    validate_pair(&before, &after, selected, frozen_destination, body_size)
+}
+
+fn validate_pair(
+    before: &DestinationSnapshot,
+    after: &DestinationSnapshot,
+    selected: Atom,
+    frozen_destination: u32,
+    body_size: Size,
+) -> Result<DestinationLayout, DestinationError> {
+    let before = validate_snapshot(before, selected, frozen_destination, body_size)?;
+    let after = validate_snapshot(after, selected, frozen_destination, body_size)?;
     if before != after {
         return Err(DestinationError::Changed);
     }

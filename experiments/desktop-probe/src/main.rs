@@ -3331,15 +3331,15 @@ fn here_observation(snapshot: &x11::visibility::VisibilitySnapshot) -> control::
 
 fn here_evidence_with(
     mut layout: impl FnMut() -> Result<
-        control::DestinationIdentity,
-        x11::monitors::destination::DestinationError,
+        Result<control::DestinationIdentity, x11::monitors::destination::DestinationError>,
+        HostError,
     >,
     observe: impl FnOnce() -> Result<x11::visibility::VisibilitySnapshot, HostError>,
 ) -> Result<HereEvidence, HostError> {
     use x11::monitors::destination::DestinationError;
-    let before = layout();
+    let before = layout()?;
     let snapshot = observe()?;
-    let after = layout();
+    let after = layout()?;
     let layout = match (before, after) {
         (Ok(before), Ok(after)) if before == after => Ok(after),
         (Ok(_), Ok(_)) => Err(DestinationError::Changed),
@@ -3355,7 +3355,7 @@ fn here_evidence_with(
 impl<C: Connection> NativeVisibility<'_, C> {
     #[allow(dead_code)] // D2 only; both production guards remain closed until D4.
     fn here_observe(&mut self, frozen_destination: u32) -> Result<HereEvidence, HostError> {
-        use x11::monitors::destination::{query_destination_layout, DestinationError};
+        use x11::monitors::destination::query_destination_layout_preserving_native;
         let (conn, root, atoms, selected) = (
             self.conn,
             self.root,
@@ -3364,7 +3364,7 @@ impl<C: Connection> NativeVisibility<'_, C> {
         );
         here_evidence_with(
             || {
-                let layout = query_destination_layout(
+                let layout = query_destination_layout_preserving_native(
                     conn,
                     root,
                     atoms,
@@ -3372,11 +3372,7 @@ impl<C: Connection> NativeVisibility<'_, C> {
                     frozen_destination,
                     Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()),
                 )?;
-                // Stage B proves capacity; retain the existing signed native
-                // coordinate limit too, without changing Stage-B policy.
-                checked_probe_bounds(layout.usable_area)
-                    .map_err(|error| DestinationError::Unverifiable(error.to_string()))?;
-                Ok((&layout).into())
+                Ok(layout.and_then(here_destination_identity))
             },
             || self.observe(),
         )
@@ -3400,6 +3396,17 @@ impl<C: Connection> NativeVisibility<'_, C> {
             },
         )
     }
+}
+
+fn here_destination_identity(
+    layout: x11::monitors::destination::DestinationLayout,
+) -> Result<control::DestinationIdentity, x11::monitors::destination::DestinationError> {
+    // Stage B proves capacity; signed native coordinate limits remain evidence
+    // validation, never an outer native acquisition failure.
+    checked_probe_bounds(layout.usable_area).map_err(|error| {
+        x11::monitors::destination::DestinationError::Unverifiable(error.to_string())
+    })?;
+    Ok((&layout).into())
 }
 
 fn here_correct_with(
@@ -3477,15 +3484,15 @@ mod here_adapter_tests {
     use control::{
         Capability, Evidence, LayerObservation, MapState, Visibility, WmState, Workspace,
     };
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use x11::monitors::destination::{
         DestinationError, DestinationLayout, RetainedMonitor, ViewportEvidence,
     };
     use x11::visibility::{Observation, VisibilitySnapshot};
 
-    fn layout() -> control::DestinationIdentity {
+    fn destination_layout() -> DestinationLayout {
         let area = geometry::Rect::new(-1920, -100, 1800, 1000);
-        (&DestinationLayout {
+        DestinationLayout {
             desktop_count: 5,
             destination_desktop: 2,
             current_desktop: 2,
@@ -3498,8 +3505,11 @@ mod here_adapter_tests {
             usable_area: area,
             body_size: Size::new(160, 160),
             valid_origins: checked_probe_bounds(area).unwrap(),
-        })
-            .into()
+        }
+    }
+
+    fn layout() -> control::DestinationIdentity {
+        (&destination_layout()).into()
     }
 
     fn snapshot(
@@ -3692,7 +3702,7 @@ mod here_adapter_tests {
         let evidence = here_evidence_with(
             || {
                 trace.borrow_mut().push("layout");
-                Ok(layout())
+                Ok(Ok(layout()))
             },
             || {
                 trace.borrow_mut().push("visibility");
@@ -3715,7 +3725,7 @@ mod here_adapter_tests {
                 || {
                     reads += 1;
                     if (case == 0 && reads == 1) || (case == 1 && reads == 2) {
-                        return Err(DestinationError::Unverifiable("bad layout".into()));
+                        return Ok(Err(DestinationError::Unverifiable("bad layout".into())));
                     }
                     let mut l = layout();
                     if reads == 2 && case == 2 {
@@ -3724,29 +3734,76 @@ mod here_adapter_tests {
                     if reads == 2 && case == 3 {
                         l.viewport = control::DestinationViewport::Absent;
                     }
-                    Ok(l)
+                    Ok(Ok(l))
                 },
                 || Ok(local()),
             )
             .unwrap();
             assert_eq!(reads, 2);
-            assert!(evidence.layout.is_err());
+            if case < 2 {
+                assert_eq!(
+                    evidence.layout,
+                    Err(DestinationError::Unverifiable("bad layout".into()))
+                );
+            } else {
+                assert_eq!(evidence.layout, Err(DestinationError::Changed));
+            }
             assert_eq!(evidence.observation.membership, Some((2, 2)));
         }
     }
 
+    #[derive(Debug)]
+    struct NativeEvidenceFailure(u32);
+
+    impl std::fmt::Display for NativeEvidenceFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "injected native evidence failure {}", self.0)
+        }
+    }
+
+    impl std::error::Error for NativeEvidenceFailure {}
+
     #[test]
-    fn visibility_read_failure_stops_the_round_without_repair_or_mutation() {
-        let reads = Cell::new(0);
-        let result = here_evidence_with(
-            || {
-                reads.set(reads.get() + 1);
-                Ok(layout())
-            },
-            || Err("visibility read failed".into()),
-        );
-        assert_eq!(result.err().unwrap().to_string(), "visibility read failed");
-        assert_eq!(reads.get(), 1);
+    fn native_failure_at_each_here_read_preserves_original_error_and_stops_immediately() {
+        for (failed_step, invalid_first) in
+            [(0, false), (1, false), (2, false), (1, true), (2, true)]
+        {
+            let original = Box::new(NativeEvidenceFailure(17));
+            let original_address = std::ptr::from_ref(original.as_ref());
+            let error = RefCell::new(Some(original));
+            let trace = RefCell::new(vec![]);
+            let result = here_evidence_with(
+                || {
+                    let step = trace.borrow().len();
+                    trace.borrow_mut().push("layout");
+                    if step == failed_step {
+                        Err(error.borrow_mut().take().unwrap())
+                    } else if step == 0 && invalid_first {
+                        Ok(Err(DestinationError::Unverifiable("bad layout".into())))
+                    } else {
+                        Ok(Ok(layout()))
+                    }
+                },
+                || {
+                    let step = trace.borrow().len();
+                    trace.borrow_mut().push("visibility");
+                    if step == failed_step {
+                        Err(error.borrow_mut().take().unwrap())
+                    } else {
+                        Ok(local())
+                    }
+                },
+            );
+            let native = result.err().expect("Native failure must escape the round");
+            assert!(std::ptr::eq(
+                native.downcast_ref::<NativeEvidenceFailure>().unwrap(),
+                original_address
+            ));
+            assert_eq!(
+                *trace.borrow(),
+                ["layout", "visibility", "layout"][..=failed_step]
+            );
+        }
     }
 
     #[test]
@@ -3763,6 +3820,31 @@ mod here_adapter_tests {
         assert!(
             checked_probe_bounds(geometry::Rect::new(i32::from(i16::MIN) - 1, 0, 160, 160))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn here_native_fit_failure_remains_inner_evidence_with_independent_membership() {
+        let mut bad = destination_layout();
+        bad.usable_area = geometry::Rect::new(i32::from(i16::MAX), 0, 161, 160);
+        let mut reads = 0;
+        let evidence = here_evidence_with(
+            || {
+                reads += 1;
+                Ok(here_destination_identity(bad.clone()))
+            },
+            || Ok(local()),
+        )
+        .unwrap();
+        assert_eq!(reads, 2);
+        assert!(matches!(
+            evidence.layout,
+            Err(DestinationError::Unverifiable(_))
+        ));
+        assert_eq!(evidence.observation.membership, Some((2, 2)));
+        assert_eq!(
+            here_destination_identity(destination_layout()),
+            Ok(layout())
         );
     }
 

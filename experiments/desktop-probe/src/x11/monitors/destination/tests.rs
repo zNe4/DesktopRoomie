@@ -852,3 +852,221 @@ fn property_sequence_numbers_do_not_define_layout_freshness() {
     }
     assert_eq!(pair(before.clone(), after), validate(&before));
 }
+
+fn layout_atoms() -> LayoutAtoms {
+    LayoutAtoms {
+        number_of_desktops: 1,
+        current_desktop: 2,
+        workarea: 3,
+        desktop_viewport: 4,
+        wm_desktop: 5,
+    }
+}
+
+fn snapshot_property(raw: &DestinationSnapshot, atom: Atom) -> GetPropertyReply {
+    match atom {
+        1 => raw.count.clone(),
+        2 => raw.current.clone(),
+        3 => raw.workarea.clone(),
+        4 => raw.viewport.clone(),
+        _ => panic!("Unexpected property read"),
+    }
+}
+
+fn preserving_pair(
+    before: DestinationSnapshot,
+    after: DestinationSnapshot,
+) -> Result<Result<DestinationLayout, DestinationError>, HostError> {
+    let mut reads = [before, after].into_iter();
+    query_preserving_native_with(SELECTED, TARGET, BODY, || {
+        let raw = reads.next().expect("No third read or retry");
+        read_destination_with(
+            &layout_atoms(),
+            |atom, _| Ok(snapshot_property(&raw, atom)),
+            || Ok(raw.monitors.clone()),
+        )
+    })
+}
+
+#[derive(Debug)]
+struct NativeQueryFailure(u32);
+
+impl fmt::Display for NativeQueryFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "injected native query failure {}", self.0)
+    }
+}
+
+impl std::error::Error for NativeQueryFailure {}
+
+#[test]
+fn preserving_query_returns_original_native_error_at_every_acquisition_without_retry() {
+    use std::cell::RefCell;
+
+    // Four property acquisitions followed by RandR/monitor acquisition per read.
+    let expected = [(1, 1), (2, 1), (3, 8), (4, 4), (0, 0)];
+    for failed_round in 1..=2 {
+        for failed_atom in 0..=4 {
+            let original = Box::new(NativeQueryFailure(23));
+            let original_address = std::ptr::from_ref(original.as_ref());
+            let error = RefCell::new(Some(original as HostError));
+            let calls = RefCell::new(vec![]);
+            let mut round = 0;
+            let result = query_preserving_native_with(SELECTED, TARGET, BODY, || {
+                round += 1;
+                let raw = snapshot();
+                read_destination_with(
+                    &layout_atoms(),
+                    |atom, words| {
+                        calls.borrow_mut().push((round, atom, words));
+                        if round == failed_round && atom == failed_atom {
+                            Err(error.borrow_mut().take().expect("No retry"))
+                        } else {
+                            Ok(snapshot_property(&raw, atom))
+                        }
+                    },
+                    || {
+                        calls.borrow_mut().push((round, 0, 0));
+                        if round == failed_round && failed_atom == 0 {
+                            Err(error.borrow_mut().take().expect("No RandR retry"))
+                        } else {
+                            Ok(raw.monitors.clone())
+                        }
+                    },
+                )
+            });
+            let native = result.expect_err("Native error must use the outer channel");
+            assert!(std::ptr::eq(
+                native.downcast_ref::<NativeQueryFailure>().unwrap(),
+                original_address
+            ));
+            assert_eq!(round, failed_round);
+            let complete_order: Vec<_> = (1..=2)
+                .flat_map(|round| expected.map(|(atom, words)| (round, atom, words)))
+                .collect();
+            let stop = complete_order
+                .iter()
+                .position(|&(round, atom, _)| round == failed_round && atom == failed_atom)
+                .unwrap();
+            assert_eq!(*calls.borrow(), complete_order[..=stop]);
+        }
+    }
+}
+
+#[test]
+fn preserving_acquisition_keeps_successful_order_and_count_prerequisite_early_stops() {
+    use std::cell::RefCell;
+
+    for count in [
+        property(&[2]),
+        property(&[0]),
+        property(&[]),
+        property(&[u32::MAX]),
+    ] {
+        let raw = DestinationSnapshot {
+            count,
+            ..snapshot()
+        };
+        let calls = RefCell::new(vec![]);
+        let result = read_destination_with(
+            &layout_atoms(),
+            |atom, words| {
+                calls.borrow_mut().push((atom, words));
+                Ok(snapshot_property(&raw, atom))
+            },
+            || {
+                calls.borrow_mut().push((0, 0));
+                Ok(raw.monitors.clone())
+            },
+        )
+        .unwrap();
+        if parse_count(&raw.count) == Ok(2) {
+            assert!(result.is_ok());
+            assert_eq!(*calls.borrow(), [(1, 1), (2, 1), (3, 8), (4, 4), (0, 0)]);
+        } else {
+            assert!(matches!(result, Err(DestinationError::Unverifiable(_))));
+            assert_eq!(*calls.borrow(), [(1, 1)]);
+        }
+    }
+}
+
+#[test]
+fn preserving_query_stops_pair_after_prerequisite_evidence_failure() {
+    for failed_round in 1..=2 {
+        let mut calls = 0;
+        let result = query_preserving_native_with(SELECTED, TARGET, BODY, || {
+            calls += 1;
+            let mut raw = snapshot();
+            if calls == failed_round {
+                raw.count.format = 16;
+            }
+            read_destination_with(
+                &layout_atoms(),
+                |atom, _| Ok(snapshot_property(&raw, atom)),
+                || Ok(raw.monitors.clone()),
+            )
+        })
+        .unwrap();
+        assert_unverifiable(result);
+        assert_eq!(
+            calls, failed_round,
+            "No second or repair read after bad count"
+        );
+    }
+}
+
+#[test]
+fn preserving_query_keeps_malformed_count_current_and_workarea_in_evidence_channel() {
+    for field in 0..3 {
+        for bad_first in [true, false] {
+            let valid = snapshot();
+            let mut bad = valid.clone();
+            match field {
+                0 => bad.count.format = 16,
+                1 => bad.current.bytes_after = 4,
+                _ => {
+                    bad.workarea.value.pop();
+                }
+            }
+            let result = if bad_first {
+                preserving_pair(bad, valid)
+            } else {
+                preserving_pair(valid, bad)
+            };
+            assert_unverifiable(result.expect("Malformed evidence is not a native error"));
+        }
+    }
+}
+
+#[test]
+fn preserving_query_keeps_unsupported_viewport_and_disagreement_in_evidence_channel() {
+    let valid = snapshot();
+    let mut unsupported = valid.clone();
+    unsupported.viewport = property(&[0, 0, 1, 0]);
+    assert_eq!(
+        preserving_pair(valid.clone(), unsupported).unwrap(),
+        Err(DestinationError::UnsupportedViewport)
+    );
+    let mut changed = valid.clone();
+    workarea(&mut changed, Rect::new(-1899, -80, 1799, 900));
+    assert_eq!(
+        preserving_pair(valid, changed).unwrap(),
+        Err(DestinationError::Changed)
+    );
+}
+
+#[test]
+fn preserving_valid_pair_matches_accepted_stage_b_values() {
+    for absence in 0..3 {
+        let mut raw = snapshot();
+        if absence == 1 {
+            raw.workarea = absent();
+        } else if absence == 2 {
+            raw.viewport = absent();
+        }
+        assert_eq!(
+            preserving_pair(raw.clone(), raw.clone()).unwrap(),
+            pair(raw.clone(), raw)
+        );
+    }
+}
