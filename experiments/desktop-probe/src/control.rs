@@ -506,7 +506,7 @@ pub struct PlacementProgress {
     pub destination_desktop: u32,
     pub baseline: Option<PlacementBaseline>,
     pub proof: PlacementProof,
-    // D1 is pure and unwired. Both production Bring Here guards remain closed.
+    // Recover composition is pure and unwired; standalone Here is accepted.
     here_phase: HerePhase,
     layout: Option<DestinationIdentity>,
     observe: bool,
@@ -861,9 +861,25 @@ impl PlacementProgress {
 }
 
 impl ActiveOperation {
-    fn here_mutation_eligible(&self, now: Instant) -> bool {
+    /// Derive Recover's Here partition from its immutable owner deadline,
+    /// rather than retaining a second admission timestamp.
+    pub fn here_cutoff(&self) -> Option<Instant> {
+        match self.request.command {
+            Command::BringHere => Some(self.deadline),
+            Command::Recover => self.deadline.checked_sub(Duration::from_millis(3500)),
+            _ => None,
+        }
+    }
+
+    fn owns_here(&self) -> bool {
         self.request.command == Command::BringHere
-            && now < self.deadline
+            || (self.request.command == Command::Recover
+                && self.recover_phase == RecoverPhase::Here)
+    }
+
+    pub fn here_mutation_eligible(&self, now: Instant) -> bool {
+        self.owns_here()
+            && self.here_cutoff().is_some_and(|cutoff| now < cutoff)
             && self.placement.invalidated.is_none()
             && !self.placement.observe
     }
@@ -892,7 +908,8 @@ impl ActiveOperation {
         let Some(deadline) = now.checked_add(Duration::from_millis(150)) else {
             return false;
         };
-        let eligible = self.here_mutation_eligible(now) && deadline <= self.deadline;
+        let eligible = self.here_mutation_eligible(now)
+            && self.here_cutoff().is_some_and(|cutoff| deadline <= cutoff);
         let p = &mut self.placement;
         if !eligible
             || p.here_phase != HerePhase::Geometry
@@ -926,7 +943,8 @@ impl ActiveOperation {
     /// Checked native restoration is historical bookkeeping, not input readiness
     /// proof. Final fresh observation and runtime safety still decide Success.
     pub fn here_input_restored(&mut self) -> bool {
-        if self.placement.here_phase != HerePhase::EnablingInput
+        if !self.owns_here()
+            || self.placement.here_phase != HerePhase::EnablingInput
             || self.placement.invalidated.is_some()
         {
             return false;
@@ -937,6 +955,9 @@ impl ActiveOperation {
     }
 
     pub fn here_shutdown(&mut self, reason: Reason) -> Result<OperationResult, ResultError> {
+        if self.request.command == Command::Recover {
+            return self.recover_shutdown(reason);
+        }
         self.placement.invalidate_here(reason);
         let dispatched = self.detail.progress.host_mutation_dispatched;
         self.stage = Stage::Shutdown;
@@ -945,6 +966,360 @@ impl ActiveOperation {
         self.detail.placement = self.placement.proof;
         self.placement
             .here_result(self.detail, Confirmation::default())
+    }
+
+    /// Recover Here uses the accepted preservation algorithm. The adapter must
+    /// supply fresh coherent observations of the same owned body, as for Here.
+    pub fn observe_recover_here(
+        &mut self,
+        layout: Result<DestinationIdentity, Reason>,
+        observation: HereObservation,
+    ) -> HereDecision {
+        if self.request.command != Command::Recover || self.recover_phase != RecoverPhase::Here {
+            return HereDecision::Invalid(Reason::Unverifiable);
+        }
+        self.record_recover_restoration(observation);
+        let stage = if self.stage == Stage::Shutdown {
+            Stage::Shutdown
+        } else {
+            Stage::Placement
+        };
+        self.clear_recover_current(self.detail.reason, stage);
+        let decision = self.placement.observe_here(layout, observation);
+        self.bring_top.minimized_at_start = self.placement.baseline.is_some_and(|b| b.minimized);
+        if matches!(decision, HereDecision::Destination | HereDecision::Original) {
+            self.detail.visibility = observation.visibility;
+            self.detail.layer = observation.layer;
+            self.detail.workspace = if decision == HereDecision::Destination {
+                Workspace::Current
+            } else {
+                Workspace::Other
+            };
+            self.detail.progress.not_minimized_confirmed = matches!(
+                observation.visibility,
+                Visibility::NotMinimizedHere | Visibility::NotMinimizedElsewhere
+            );
+        }
+        if let Some(reason) = self.placement.invalidated {
+            self.detail.reason = reason;
+        }
+        self.detail.placement = self.placement.proof;
+        decision
+    }
+
+    /// Historical visibility is independent of destination/layer readiness.
+    /// Membership and visibility must agree; a dispatch or geometry read cannot
+    /// establish restoration. Membership is independently supported by the host
+    /// adapter; a changed layout must not hide a demonstrated visibility change.
+    fn record_recover_restoration(&mut self, observation: HereObservation) {
+        let coherent = observation.membership.is_some_and(|(body, current)| {
+            body != NO_DESTINATION
+                && current != NO_DESTINATION
+                && matches!(
+                    (observation.visibility, body == current),
+                    (Visibility::NotMinimizedHere, true)
+                        | (Visibility::NotMinimizedElsewhere, false)
+                )
+        });
+        if self.placement.baseline.is_some_and(|b| b.minimized) && coherent {
+            self.placement.proof.history.restoration_confirmed = true;
+        }
+        self.bring_top.minimized_at_start = self.placement.baseline.is_some_and(|b| b.minimized);
+        self.bring_top.restoration_confirmed = self.placement.proof.history.restoration_confirmed;
+    }
+
+    /// The supplied detail/confirmation must come from final fresh Here
+    /// verification, including the settled fence or safe visible no-op. Use the
+    /// existing Here validator, without publishing its intermediate Success.
+    pub fn handoff_recover_top(
+        &mut self,
+        now: Instant,
+        mut detail: Detail,
+        confirmed: Confirmation,
+    ) -> bool {
+        if self.request.command != Command::Recover
+            || self.recover_phase != RecoverPhase::Here
+            || !self.here_mutation_eligible(now)
+            || self.placement.layout.is_none()
+            || detail.reason != Reason::None
+        {
+            return false;
+        }
+        detail.placement = self.placement.proof;
+        if OperationResult::placement(
+            Command::BringHere,
+            Status::Success,
+            detail,
+            confirmed,
+            &self.placement,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        self.recover_phase = RecoverPhase::Top;
+        self.bring_top.visibility_cutoff = (now + Duration::from_millis(2500)).min(self.deadline);
+        self.bring_top.minimized_at_start = self.placement.baseline.unwrap().minimized;
+        self.bring_top.restoration_confirmed = self.placement.proof.history.restoration_confirmed;
+        // Here never owns layer work. Do not reset any attempted/dispatched facts.
+        self.show = ShowProgress {
+            observe: true,
+            correction_sent: self.placement.correction.is_some(),
+            ..ShowProgress::default()
+        };
+        self.detail.progress.host_mutation_dispatched |= detail.progress.host_mutation_dispatched;
+        self.clear_recover_current(Reason::None, Stage::Show);
+        true
+    }
+
+    /// Clear *all* current assertions, preserving original identity, consumed
+    /// attempts, historical transitions and aggregate possible dispatch.
+    fn clear_recover_current(&mut self, reason: Reason, stage: Stage) {
+        let dispatched = self.detail.progress.host_mutation_dispatched
+            || self.placement.desktop_dispatched
+            || self.bring_top.layer_dispatched;
+        self.placement.request_here_observation();
+        self.stage = stage;
+        self.detail = preflight_detail(reason, stage);
+        self.detail.progress.host_mutation_dispatched = dispatched;
+        self.detail.placement = self.placement.proof;
+    }
+
+    /// Rebuild Top proof without Here's preservation requirements. No timestamp
+    /// changes here: even expiry/fatal history reads grant no mutation authority.
+    pub fn observe_recover_top(
+        &mut self,
+        layout: Result<DestinationIdentity, Reason>,
+        observation: HereObservation,
+    ) -> HereDecision {
+        if self.request.command != Command::Recover || self.recover_phase != RecoverPhase::Top {
+            return HereDecision::Invalid(Reason::Unverifiable);
+        }
+        self.record_recover_restoration(observation);
+        let stage = self.stage;
+        self.clear_recover_current(self.detail.reason, stage);
+        let p = &mut self.placement;
+        p.observe = false;
+        // History can advance on a bounded fatal read, but current proof cannot.
+        if let Some(reason) = p.invalidated {
+            return HereDecision::Invalid(reason);
+        }
+        let reason = match layout {
+            Err(reason) => Some(reason),
+            Ok(layout) if p.layout != Some(layout) || p.baseline.is_none() => {
+                Some(Reason::LayoutChanged)
+            }
+            Ok(_) => match observation.visibility {
+                Visibility::Destroyed => Some(Reason::BodyDestroyed),
+                Visibility::Withdrawn => Some(Reason::Withdrawn),
+                _ if observation.layer == LayerObservation::Conflict => Some(Reason::LayerChanged),
+                _ if observation.membership.is_some_and(|(body, current)| {
+                    body != p.destination_desktop || current != p.destination_desktop
+                }) =>
+                {
+                    Some(Reason::LayoutChanged)
+                }
+                _ => None,
+            },
+        };
+        if let Some(reason) = reason {
+            let decision = p.invalidate_here(reason);
+            self.detail.reason = reason;
+            self.detail.placement = p.proof;
+            return decision;
+        }
+        let local = observation.visibility == Visibility::NotMinimizedHere;
+        let coherent = observation.membership
+            == Some((p.destination_desktop, p.destination_desktop))
+            && matches!(
+                observation.visibility,
+                Visibility::Minimized | Visibility::NotMinimizedHere
+            );
+        let known_layer = matches!(
+            observation.layer,
+            LayerObservation::Normal | LayerObservation::Above | LayerObservation::Below
+        );
+        if !coherent || !known_layer {
+            return HereDecision::Pending;
+        }
+        p.proof.current.destination = true;
+        p.proof.current.layer_preserved = p.baseline.is_some_and(|b| b.layer == observation.layer);
+        // Top intentionally permits restoration; never assert preserved HIDDEN.
+        p.local_geometry_eligible = local;
+        self.detail.visibility = observation.visibility;
+        self.detail.layer = observation.layer;
+        self.detail.workspace = Workspace::Current;
+        self.detail.progress.not_minimized_confirmed = local;
+        self.detail.progress.above_confirmed =
+            local && observation.layer == LayerObservation::Above;
+        self.detail.placement = p.proof;
+        HereDecision::Destination
+    }
+
+    /// Fresh fixed-size root geometry and runtime-validated exact input safety.
+    /// Neither a correction request nor SHAPE acknowledgement supplies these.
+    pub fn confirm_recover_top_readiness(
+        &mut self,
+        origin: Point,
+        size: Size,
+        input_ready: bool,
+    ) -> bool {
+        if self.request.command != Command::Recover || self.recover_phase != RecoverPhase::Top {
+            return false;
+        }
+        let p = &mut self.placement;
+        let valid = p.invalidated.is_none()
+            && !p.observe
+            && p.local_geometry_eligible
+            && p.proof.current.destination
+            && p.layout
+                .is_some_and(|l| l.body_size == size && l.valid_origins.contains(origin))
+            // A consumed Here correction is history, not current Top geometry.
+            // Only a pending Top correction imposes its confirmation target.
+            && self.show.correction.is_none_or(|(target, _)| target == origin);
+        p.proof.current.geometry = if valid {
+            GeometryProof::Verified
+        } else {
+            GeometryProof::Unknown
+        };
+        self.detail.progress.input_ready = valid && input_ready;
+        self.detail.placement = p.proof;
+        valid
+    }
+
+    pub fn recover_visibility_mutation_eligible(&self, now: Instant) -> bool {
+        self.request.command == Command::Recover
+            && self.recover_phase == RecoverPhase::Top
+            && self.placement.invalidated.is_none()
+            && !self.placement.observe
+            && self.placement.proof.current.destination
+            && now < self.bring_top.visibility_cutoff
+            && now < self.deadline
+            && self.bring_top.layer_admitted.is_none()
+    }
+
+    /// PlacementProgress is the sole Recover-wide consumed-correction record.
+    /// Show fields are only a projection for reuse of its existing mechanism.
+    pub fn consume_recover_top_correction(&mut self, target: Point, now: Instant) -> bool {
+        let Some(deadline) = now.checked_add(Duration::from_millis(150)) else {
+            return false;
+        };
+        if !self.recover_visibility_mutation_eligible(now)
+            || deadline > self.bring_top.visibility_cutoff
+            || self.placement.correction.is_some()
+            || !self.placement.local_geometry_eligible
+            || !self
+                .placement
+                .layout
+                .is_some_and(|l| l.valid_origins.contains(target))
+        {
+            return false;
+        }
+        self.placement.correction = Some((target, deadline));
+        self.show.correction = Some((target, deadline));
+        self.show.correction_sent = true;
+        self.clear_recover_current(Reason::None, Stage::Geometry);
+        true
+    }
+
+    pub fn admit_recover_layer(&mut self, now: Instant) -> bool {
+        if !self.recover_visibility_mutation_eligible(now)
+            || !self.detail.progress.not_minimized_confirmed
+            || !self.detail.progress.input_ready
+            || self.placement.proof.current.geometry != GeometryProof::Verified
+        {
+            return false;
+        }
+        self.bring_top.layer_admitted = Some(now);
+        self.bring_top.layer_observe = true;
+        self.stage = Stage::Layer;
+        self.detail.stage = Stage::Layer;
+        true
+    }
+
+    pub fn recover_layer_cutoff(&self) -> Option<Instant> {
+        (self.request.command == Command::Recover && self.recover_phase == RecoverPhase::Top)
+            .then_some(self.bring_top.layer_admitted)
+            .flatten()
+            .map(|admitted| (admitted + Duration::from_millis(1000)).min(self.deadline))
+    }
+
+    pub fn recover_layer_mutation_eligible(&self, now: Instant) -> bool {
+        self.recover_layer_cutoff()
+            .is_some_and(|cutoff| now < cutoff)
+            && self.placement.invalidated.is_none()
+            && !self.placement.observe
+            && self.placement.proof.current.geometry == GeometryProof::Verified
+            && self.detail.progress.input_ready
+            && self.detail.progress.not_minimized_confirmed
+            && !self.bring_top.layer_finished
+    }
+
+    /// Only the existing placement validator decides complete/partial/failed.
+    pub fn recover_result(
+        &self,
+        reason: Reason,
+        stage: Stage,
+    ) -> Result<OperationResult, ResultError> {
+        if self.request.command != Command::Recover {
+            return Err(ResultError::InconsistentStatus);
+        }
+        let mut detail = self.detail;
+        detail.reason = self.placement.invalidated.unwrap_or(reason);
+        detail.stage = stage;
+        detail.placement = self.placement.proof;
+        detail.progress.placement_deferred =
+            self.placement.proof.current.geometry == GeometryProof::Deferred;
+        detail.progress.host_mutation_dispatched |=
+            self.placement.desktop_dispatched || self.bring_top.layer_dispatched;
+        let confirmed = Confirmation {
+            visibility: match detail.visibility {
+                Visibility::Minimized => Some(ConfirmedVisibility::Minimized),
+                Visibility::NotMinimizedHere if detail.progress.not_minimized_confirmed => {
+                    Some(ConfirmedVisibility::NotMinimizedHere)
+                }
+                Visibility::NotMinimizedElsewhere if detail.progress.not_minimized_confirmed => {
+                    Some(ConfirmedVisibility::NotMinimizedElsewhere)
+                }
+                _ => None,
+            },
+            above: detail.progress.above_confirmed,
+        };
+        if let Ok(result) = OperationResult::placement(
+            Command::Recover,
+            Status::Success,
+            detail,
+            confirmed,
+            &self.placement,
+        ) {
+            return Ok(result);
+        }
+        OperationResult::placement(
+            Command::Recover,
+            if self.placement.proof.history.relocation_confirmed
+                || self.placement.proof.history.restoration_confirmed
+            {
+                Status::Partial
+            } else {
+                Status::Failed
+            },
+            detail,
+            confirmed,
+            &self.placement,
+        )
+    }
+
+    pub fn recover_shutdown(&mut self, reason: Reason) -> Result<OperationResult, ResultError> {
+        if self.request.command != Command::Recover {
+            return Err(ResultError::InconsistentStatus);
+        }
+        self.placement.invalidate_here(reason);
+        let reason = self.placement.invalidated.unwrap();
+        self.clear_recover_current(reason, Stage::Shutdown);
+        self.show.observe = false;
+        self.bring_top.layer_observe = false;
+        self.bring_top.layer_finished = false;
+        self.recover_result(reason, Stage::Shutdown)
     }
 }
 
@@ -3051,13 +3426,17 @@ mod here_progression_tests {
     }
 
     fn operation() -> (ActiveOperation, Instant) {
+        operation_for(Command::BringHere)
+    }
+
+    fn operation_for(command: Command) -> (ActiveOperation, Instant) {
         let now = Instant::now();
         let mut active = None;
         assert_eq!(
             admit(
                 &mut active,
                 Request {
-                    command: Command::BringHere,
+                    command,
                     request_id: 1,
                     reply_xid: 2,
                     epoch: 3
@@ -3905,6 +4284,613 @@ mod here_progression_tests {
             assert_eq!(incomplete(&op).status(), Status::Partial);
             assert!(!op.consume_here_desktop_attempt(now));
         }
+    }
+
+    fn recover_ready(
+        body: u32,
+        minimized: bool,
+        layer: LayerObservation,
+    ) -> (ActiveOperation, Instant, Detail, Confirmation) {
+        let (mut op, now) = operation_for(Command::Recover);
+        let sample = observation(body, minimized, layer);
+        op.observe_recover_here(Ok(layout()), sample);
+        if body != TARGET || minimized {
+            assert!(op.placement.here_fenced());
+            op.observe_recover_here(Ok(layout()), sample);
+        }
+        if body != TARGET {
+            assert!(op.consume_here_desktop_attempt(now));
+            assert!(op.placement.record_here_desktop_transport(true, true));
+            assert_eq!(
+                op.observe_recover_here(Ok(layout()), observation(TARGET, minimized, layer)),
+                HereDecision::Destination
+            );
+        }
+        let (mut detail, confirmed) = if minimized {
+            assert!(op.placement.defer_here_geometry());
+            (
+                Detail {
+                    visibility: Visibility::Minimized,
+                    workspace: Workspace::Current,
+                    layer,
+                    progress: Progress {
+                        placement_deferred: true,
+                        ..Progress::default()
+                    },
+                    ..preflight_detail(Reason::None, Stage::Placement)
+                },
+                Confirmation {
+                    visibility: Some(ConfirmedVisibility::Minimized),
+                    above: false,
+                },
+            )
+        } else {
+            assert!(op.placement.confirm_here_geometry(ORIGIN, SIZE));
+            visible_detail(layer, true)
+        };
+        detail.reason = Reason::None;
+        detail.placement = op.placement.proof;
+        (op, now, detail, confirmed)
+    }
+
+    fn recover_top(
+        body: u32,
+        minimized: bool,
+        layer: LayerObservation,
+        delay: u64,
+    ) -> (ActiveOperation, Instant) {
+        let (mut op, now, detail, confirmed) = recover_ready(body, minimized, layer);
+        assert!(op.handoff_recover_top(now + Duration::from_millis(delay), detail, confirmed));
+        (op, now)
+    }
+
+    fn top_ready(op: &mut ActiveOperation, layer: LayerObservation) {
+        assert_eq!(
+            op.observe_recover_top(Ok(layout()), observation(TARGET, false, layer)),
+            HereDecision::Destination
+        );
+        assert!(op.confirm_recover_top_readiness(ORIGIN, SIZE, true));
+    }
+
+    #[test]
+    fn recover_handoff_is_one_way_and_retains_identity_history_and_consumption() {
+        for minimized in [false, true] {
+            for body in [ORIGINAL, TARGET] {
+                let (mut op, now, mut d, c) =
+                    recover_ready(body, minimized, LayerObservation::Below);
+                let before = op.placement;
+                let request = op.request;
+                let deadline = op.deadline;
+                d.progress.host_mutation_dispatched = true; // possible host dispatch, not confirmation
+                assert!(op.handoff_recover_top(now + Duration::from_millis(2000), d, c));
+                assert_eq!(op.request, request);
+                assert_eq!(op.deadline, deadline);
+                assert_eq!(op.placement.baseline, before.baseline);
+                assert_eq!(op.placement.layout, before.layout);
+                assert_eq!(op.placement.destination_desktop, TARGET);
+                assert_eq!(op.placement.desktop_attempted, before.desktop_attempted);
+                assert_eq!(op.placement.desktop_dispatched, before.desktop_dispatched);
+                assert_eq!(op.placement.desktop_checked, before.desktop_checked);
+                assert_eq!(op.placement.here_phase, before.here_phase);
+                assert_eq!(op.placement.correction(), before.correction());
+                assert_eq!(op.placement.proof.history, before.proof.history);
+                assert_eq!(op.placement.proof.current, PlacementConfirmation::default());
+                assert_eq!(op.detail.visibility, Visibility::Unknown);
+                assert_eq!(op.detail.layer, LayerObservation::Unknown);
+                assert_eq!(op.detail.workspace, Workspace::Unknown);
+                assert_eq!(
+                    op.detail.progress,
+                    Progress {
+                        host_mutation_dispatched: true,
+                        ..Progress::default()
+                    }
+                );
+                assert_eq!(op.recover_phase, RecoverPhase::Top);
+                assert!(!op.here_mutation_eligible(now));
+                let after = op;
+                assert!(!op.handoff_recover_top(now + Duration::from_millis(3000), d, c));
+                assert_eq!(op, after);
+                assert!(!op.consume_here_desktop_attempt(now));
+                assert!(!op.consume_here_correction(ORIGIN, now));
+                assert!(!op.consume_here_input_enable(now));
+                assert!(!op.here_input_restored());
+                assert_eq!(
+                    op.observe_recover_here(
+                        Ok(layout()),
+                        observation(TARGET, minimized, LayerObservation::Below)
+                    ),
+                    HereDecision::Invalid(Reason::Unverifiable)
+                );
+                assert_eq!(op, after);
+            }
+        }
+        // A visible Above Here result can already contain current Above/input
+        // assertions. They must be re-established independently during Top.
+        let (mut op, now, mut d, mut c) = recover_ready(TARGET, false, LayerObservation::Above);
+        d.progress.above_confirmed = true;
+        c.above = true;
+        op.detail = d;
+        assert!(op.handoff_recover_top(now, d, c));
+        assert_eq!(op.detail.progress, Progress::default());
+        assert_eq!(op.placement.proof.current, PlacementConfirmation::default());
+    }
+
+    #[test]
+    fn recover_handoff_rejects_incomplete_stale_failed_and_foreign_here() {
+        for minimized in [false, true] {
+            for defect in 0..10 {
+                let (mut op, now, mut d, mut c) =
+                    recover_ready(ORIGINAL, minimized, LayerObservation::Normal);
+                match defect {
+                    0 => op.placement.proof.current.destination = false,
+                    1 => op.placement.proof.current.geometry = GeometryProof::Unknown,
+                    2 => op.placement.proof.current.layer_preserved = false,
+                    3 => op.placement.request_here_observation(),
+                    4 => {
+                        op.placement.invalidate_here(Reason::LayoutChanged);
+                    }
+                    5 => c = Confirmation::default(),
+                    6 => d.reason = Reason::Unverifiable,
+                    7 => {
+                        if minimized {
+                            op.placement.proof.current.minimization_preserved = false;
+                        } else {
+                            d.progress.input_ready = false;
+                        }
+                    }
+                    8 => {
+                        if minimized {
+                            d.progress.placement_deferred = false;
+                        } else {
+                            d.progress.not_minimized_confirmed = false;
+                        }
+                    }
+                    _ => d.progress.above_confirmed = true,
+                }
+                let before = op;
+                assert!(
+                    !op.handoff_recover_top(now, d, c),
+                    "minimized={minimized} defect={defect}"
+                );
+                assert_eq!(op, before);
+            }
+        }
+        let (mut here, now) = arrived(false, LayerObservation::Normal);
+        assert!(here.placement.confirm_here_geometry(ORIGIN, SIZE));
+        let (mut d, c) = visible_detail(LayerObservation::Normal, true);
+        d.reason = Reason::None;
+        assert!(!here.handoff_recover_top(now, d, c));
+    }
+
+    #[test]
+    fn recover_here_partition_expires_exactly_and_never_renews_admission() {
+        let (mut op, now) = operation_for(Command::Recover);
+        assert_eq!(op.deadline, now + Duration::from_millis(7000));
+        assert_eq!(op.here_cutoff(), Some(now + Duration::from_millis(3500)));
+        let sample = observation(ORIGINAL, false, LayerObservation::Normal);
+        op.observe_recover_here(Ok(layout()), sample);
+        assert!(op.placement.here_fenced());
+        op.observe_recover_here(Ok(layout()), sample);
+        let cutoff = op.here_cutoff().unwrap();
+        let before = op;
+        for late in [cutoff, cutoff + Duration::from_millis(1), op.deadline] {
+            assert!(!op.consume_here_desktop_attempt(late));
+            assert_eq!(op, before);
+        }
+        assert!(op.consume_here_desktop_attempt(cutoff - Duration::from_nanos(1)));
+        assert_eq!(op.deadline, before.deadline);
+        let mut active = Some(op);
+        assert_eq!(
+            admit(
+                &mut active,
+                op.request,
+                TARGET,
+                Lifecycle::Ready,
+                false,
+                now + Duration::from_secs(9)
+            ),
+            Admission::Duplicate
+        );
+        assert_eq!(active, Some(op));
+        let mut other = op.request;
+        other.request_id += 1;
+        assert_eq!(
+            admit(&mut active, other, TARGET, Lifecycle::Ready, false, now),
+            Admission::Reply(Status::Busy, Reason::Busy, Stage::Preflight)
+        );
+        assert_eq!(active, Some(op));
+    }
+
+    #[test]
+    fn recover_handoff_expiry_and_top_cutoffs_use_actual_handoff_once() {
+        for delay in [0, 1900, 3499] {
+            let (mut op, now, d, c) = recover_ready(TARGET, false, LayerObservation::Normal);
+            let total = op.deadline;
+            let t = now + Duration::from_millis(delay);
+            assert!(op.handoff_recover_top(t, d, c));
+            let v = (t + Duration::from_millis(2500)).min(total);
+            assert_eq!(op.bring_top.visibility_cutoff, v);
+            top_ready(&mut op, LayerObservation::Normal);
+            assert!(op.recover_visibility_mutation_eligible(v - Duration::from_nanos(1)));
+            assert!(!op.recover_visibility_mutation_eligible(v));
+            assert!(!op.admit_recover_layer(v));
+            assert!(op.admit_recover_layer(v - Duration::from_nanos(1)));
+            let b = (v - Duration::from_nanos(1) + Duration::from_millis(1000)).min(total);
+            assert_eq!(op.recover_layer_cutoff(), Some(b));
+            assert!(op.recover_layer_mutation_eligible(b - Duration::from_nanos(1)));
+            assert!(!op.recover_layer_mutation_eligible(b));
+            assert!(!op.recover_layer_mutation_eligible(total));
+            assert!(!op.recover_visibility_mutation_eligible(t)); // layer owns progression now
+            for time in [t, v, b, total] {
+                assert!(!op.admit_recover_layer(time));
+                assert!(!op.handoff_recover_top(time, d, c));
+                top_ready(&mut op, LayerObservation::Normal);
+                assert_eq!(op.bring_top.visibility_cutoff, v);
+                assert_eq!(op.recover_layer_cutoff(), Some(b));
+                assert_eq!(op.deadline, total);
+            }
+        }
+        let (mut op, _, d, c) = recover_ready(TARGET, false, LayerObservation::Above);
+        assert!(!op.handoff_recover_top(op.here_cutoff().unwrap(), d, c));
+    }
+
+    #[test]
+    fn recover_here_and_top_correction_require_full_interval() {
+        let (mut here, now, _, _) = recover_ready(TARGET, false, LayerObservation::Normal);
+        assert!(here.placement.here_fenced());
+        here.observe_recover_here(
+            Ok(layout()),
+            observation(TARGET, false, LayerObservation::Normal),
+        );
+        assert!(here.placement.begin_here_geometry());
+        let h = here.here_cutoff().unwrap();
+        assert!(!here.consume_here_correction(ORIGIN, h - Duration::from_millis(149)));
+        assert!(here.consume_here_correction(ORIGIN, h - Duration::from_millis(150)));
+        assert_eq!(here.placement.correction(), Some((ORIGIN, h)));
+        assert_eq!(here.deadline, now + Duration::from_millis(7000));
+        let (mut top, _) = recover_top(TARGET, true, LayerObservation::Normal, 2000);
+        top_ready(&mut top, LayerObservation::Normal);
+        let v = top.bring_top.visibility_cutoff;
+        for time in [v - Duration::from_millis(149), v, top.deadline] {
+            assert!(!top.consume_recover_top_correction(ORIGIN, time));
+            assert!(top.placement.correction().is_none());
+        }
+        assert!(top.consume_recover_top_correction(ORIGIN, v - Duration::from_millis(150)));
+        top_ready(&mut top, LayerObservation::Normal);
+        assert!(!top.consume_recover_top_correction(ORIGIN, v - Duration::from_millis(150)));
+    }
+
+    #[test]
+    fn recover_here_consumed_correction_survives_success_uncertainty_and_top_initialization() {
+        for confirmed in [false, true] {
+            let (mut op, now) = operation_for(Command::Recover);
+            let sample = observation(TARGET, false, LayerObservation::Normal);
+            op.observe_recover_here(Ok(layout()), sample);
+            assert!(op.placement.here_fenced());
+            op.observe_recover_here(Ok(layout()), sample);
+            assert!(op.placement.begin_here_geometry());
+            assert!(op.consume_here_correction(ORIGIN, now));
+            assert!(!op.consume_here_correction(ORIGIN, now));
+            if !confirmed {
+                // An uncertain/failed send stays consumed even if an external
+                // actor later supplies the required actual geometry.
+                op.detail.progress.host_mutation_dispatched = true;
+            }
+            op.observe_recover_here(Ok(layout()), sample);
+            assert!(op.placement.confirm_here_geometry(ORIGIN, SIZE));
+            let (mut d, c) = visible_detail(LayerObservation::Normal, true);
+            d.reason = Reason::None;
+            assert!(op.handoff_recover_top(now + Duration::from_millis(200), d, c));
+            assert!(op.show.correction_sent);
+            let consumed = op.placement.correction();
+            top_ready(&mut op, LayerObservation::Normal);
+            assert!(op.confirm_recover_top_readiness(Point::new(0, 50), SIZE, true));
+            // Even replacing the Show projection cannot replenish authority.
+            op.show = ShowProgress::default();
+            assert!(!op.consume_recover_top_correction(ORIGIN, now + Duration::from_millis(300)));
+            assert_eq!(op.placement.correction(), consumed);
+        }
+    }
+
+    #[test]
+    fn recover_minimized_here_defers_unused_correction_to_top_once() {
+        let (mut op, now) = recover_top(ORIGINAL, true, LayerObservation::Below, 1000);
+        assert!(op.placement.correction().is_none());
+        assert!(!op.consume_recover_top_correction(ORIGIN, now + Duration::from_millis(1000))); // no fresh evidence
+        top_ready(&mut op, LayerObservation::Below);
+        assert!(op.consume_recover_top_correction(ORIGIN, now + Duration::from_millis(1000)));
+        assert_eq!(op.placement.proof.current, PlacementConfirmation::default());
+        assert_eq!(
+            op.observe_recover_top(
+                Ok(layout()),
+                observation(TARGET, false, LayerObservation::Below)
+            ),
+            HereDecision::Destination
+        );
+        assert!(!op.confirm_recover_top_readiness(Point::new(0, 50), SIZE, true));
+        top_ready(&mut op, LayerObservation::Below);
+        assert!(!op.consume_recover_top_correction(ORIGIN, now + Duration::from_millis(1200)));
+    }
+
+    #[test]
+    fn recover_top_rebuilds_current_without_preservation_or_dispatch_inference() {
+        let (mut op, now) = recover_top(ORIGINAL, true, LayerObservation::Below, 1000);
+        assert_eq!(
+            op.placement.proof.history,
+            RecoveryHistory {
+                relocation_confirmed: true,
+                restoration_confirmed: false
+            }
+        );
+        op.detail.progress.host_mutation_dispatched = true;
+        op.show.phase = ShowPhase::RestoreRequested;
+        op.bring_top.layer_dispatched = true;
+        assert!(!op.placement.proof.history.restoration_confirmed);
+        assert_eq!(
+            op.recover_result(Reason::ConfirmationTimeout, Stage::Show)
+                .unwrap()
+                .status(),
+            Status::Partial
+        );
+        top_ready(&mut op, LayerObservation::Above);
+        assert!(op.placement.proof.history.restoration_confirmed);
+        assert!(op.bring_top.minimized_at_start && op.bring_top.restoration_confirmed);
+        assert!(!op.placement.proof.current.minimization_preserved);
+        assert!(!op.placement.proof.current.layer_preserved);
+        let result = op.recover_result(Reason::None, Stage::Layer).unwrap();
+        assert_eq!(result.status(), Status::Success);
+        assert_wire(result);
+        // Expiry may recognize this completed postcondition, never mutate.
+        assert!(!op.recover_visibility_mutation_eligible(op.deadline));
+        assert!(!op.consume_recover_top_correction(ORIGIN, op.deadline));
+        assert!(!op.admit_recover_layer(op.deadline));
+        assert_eq!(op.deadline, now + Duration::from_millis(7000));
+        op.observe_recover_top(
+            Ok(layout()),
+            HereObservation {
+                membership: None,
+                visibility: Visibility::Transitional,
+                layer: LayerObservation::Unknown,
+            },
+        );
+        assert!(!op.detail.progress.above_confirmed);
+        assert!(!op.detail.progress.input_ready);
+        assert_eq!(
+            op.recover_result(Reason::ConfirmationTimeout, Stage::Layer)
+                .unwrap()
+                .status(),
+            Status::Partial
+        );
+    }
+
+    #[test]
+    fn recover_restoration_history_precedes_layout_layer_and_here_preservation_failures() {
+        for failure in [Reason::LayoutChanged, Reason::LayerChanged] {
+            let (mut op, now, d, c) = recover_ready(ORIGINAL, true, LayerObservation::Below);
+            assert!(op.handoff_recover_top(now, d, c));
+            let (layout, sample) = if failure == Reason::LayoutChanged {
+                (
+                    Err(failure),
+                    observation(TARGET, false, LayerObservation::Above),
+                )
+            } else {
+                (
+                    Ok(layout()),
+                    observation(TARGET, false, LayerObservation::Conflict),
+                )
+            };
+            assert_eq!(
+                op.observe_recover_top(layout, sample),
+                HereDecision::Invalid(failure)
+            );
+            assert!(op.placement.proof.history.restoration_confirmed);
+            assert_eq!(op.placement.proof.current, PlacementConfirmation::default());
+            assert_eq!(
+                op.recover_shutdown(Reason::Closing)
+                    .unwrap()
+                    .detail()
+                    .reason,
+                failure
+            );
+        }
+        let (mut here, now, d, c) = recover_ready(TARGET, true, LayerObservation::Normal);
+        assert_eq!(
+            here.observe_recover_here(
+                Ok(layout()),
+                observation(TARGET, false, LayerObservation::Normal)
+            ),
+            HereDecision::Invalid(Reason::Unverifiable)
+        );
+        assert!(here.placement.proof.history.restoration_confirmed);
+        assert!(!here.handoff_recover_top(now, d, c));
+        assert_eq!(
+            here.recover_shutdown(Reason::Closing).unwrap().status(),
+            Status::Partial
+        );
+        // Independently supported new desktop membership still proves the
+        // visibility transition even when the frozen desktop count has drifted.
+        let (mut op, _) = recover_top(TARGET, true, LayerObservation::Normal, 0);
+        let sample = observation(layout().desktop_count, false, LayerObservation::Normal);
+        assert_eq!(
+            op.observe_recover_top(Err(Reason::LayoutChanged), sample),
+            HereDecision::Invalid(Reason::LayoutChanged)
+        );
+        assert!(op.placement.proof.history.restoration_confirmed);
+    }
+
+    #[test]
+    fn recover_incoherent_missing_or_transitional_visibility_never_proves_restoration() {
+        for sample in [
+            HereObservation {
+                membership: None,
+                visibility: Visibility::NotMinimizedHere,
+                layer: LayerObservation::Above,
+            },
+            HereObservation {
+                membership: Some((TARGET, TARGET)),
+                visibility: Visibility::NotMinimizedElsewhere,
+                layer: LayerObservation::Above,
+            },
+            HereObservation {
+                membership: Some((TARGET, THIRD)),
+                visibility: Visibility::NotMinimizedHere,
+                layer: LayerObservation::Above,
+            },
+            HereObservation {
+                membership: Some((NO_DESTINATION, TARGET)),
+                visibility: Visibility::NotMinimizedElsewhere,
+                layer: LayerObservation::Above,
+            },
+            HereObservation {
+                membership: Some((TARGET, TARGET)),
+                visibility: Visibility::Transitional,
+                layer: LayerObservation::Above,
+            },
+            observation(TARGET, true, LayerObservation::Above),
+        ] {
+            let (mut op, _) = recover_top(TARGET, true, LayerObservation::Normal, 0);
+            op.observe_recover_top(Ok(layout()), sample);
+            assert!(
+                !op.placement.proof.history.restoration_confirmed,
+                "{sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recover_results_cover_all_history_combinations_current_success_and_shutdown() {
+        for body in [TARGET, ORIGINAL] {
+            for minimized in [false, true] {
+                let (mut op, _) = recover_top(body, minimized, LayerObservation::Above, 1000);
+                top_ready(&mut op, LayerObservation::Above);
+                let history = RecoveryHistory {
+                    relocation_confirmed: body == ORIGINAL,
+                    restoration_confirmed: minimized,
+                };
+                assert_eq!(op.placement.proof.history, history);
+                let success = op.recover_result(Reason::None, Stage::Layer).unwrap();
+                assert_eq!(success.status(), Status::Success);
+                assert_wire(success);
+                assert!(op.confirm_recover_top_readiness(ORIGIN, SIZE, false));
+                assert_eq!(
+                    op.recover_result(Reason::ConfirmationTimeout, Stage::Layer)
+                        .unwrap()
+                        .status(),
+                    if body == ORIGINAL || minimized {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    }
+                );
+                top_ready(&mut op, LayerObservation::Above);
+                assert!(op.recover_result(Reason::None, Stage::Show).is_err());
+                for reason in [Reason::Closing, Reason::X11Failure, Reason::OwnershipLost] {
+                    let mut failed = op;
+                    failed.bring_top.layer_dispatched = true;
+                    let result = failed.here_shutdown(reason).unwrap();
+                    assert_eq!(
+                        result.status(),
+                        if body == ORIGINAL || minimized {
+                            Status::Partial
+                        } else {
+                            Status::Failed
+                        }
+                    );
+                    assert_eq!(result.detail().reason, reason);
+                    assert_eq!(result.detail().stage, Stage::Shutdown);
+                    assert_eq!(result.detail().placement.history, history);
+                    assert_eq!(
+                        result.detail().placement.current,
+                        PlacementConfirmation::default()
+                    );
+                    assert_eq!(
+                        result.detail().progress,
+                        Progress {
+                            host_mutation_dispatched: true,
+                            ..Progress::default()
+                        }
+                    );
+                    assert_wire(result);
+                    // A late coherent history read cannot rebuild current success.
+                    assert!(matches!(
+                        failed.observe_recover_top(
+                            Ok(layout()),
+                            observation(TARGET, false, LayerObservation::Above)
+                        ),
+                        HereDecision::Invalid(_)
+                    ));
+                    assert!(!failed.confirm_recover_top_readiness(ORIGIN, SIZE, true));
+                    assert_eq!(
+                        failed
+                            .recover_shutdown(Reason::Unverifiable)
+                            .unwrap()
+                            .detail()
+                            .reason,
+                        reason
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recover_minimized_here_is_incomplete_and_local_visible_correction_is_not_history() {
+        let (op, _, _, _) = recover_ready(ORIGINAL, true, LayerObservation::Above);
+        assert_eq!(
+            op.recover_result(Reason::ConfirmationTimeout, Stage::Placement)
+                .unwrap()
+                .status(),
+            Status::Partial
+        );
+        assert!(op.recover_result(Reason::None, Stage::Layer).is_err());
+        let (mut local, now) = recover_top(TARGET, false, LayerObservation::Normal, 0);
+        top_ready(&mut local, LayerObservation::Normal);
+        assert!(local.consume_recover_top_correction(ORIGIN, now));
+        assert_eq!(local.placement.proof.history, RecoveryHistory::default());
+        assert_eq!(
+            local.recover_shutdown(Reason::X11Failure).unwrap().status(),
+            Status::Failed
+        );
+    }
+
+    #[test]
+    fn recover_fatal_history_read_can_add_restoration_without_current_success() {
+        let (mut op, _) = recover_top(ORIGINAL, true, LayerObservation::Normal, 1000);
+        assert_eq!(
+            op.recover_shutdown(Reason::X11Failure).unwrap().status(),
+            Status::Partial
+        );
+        op.observe_recover_top(
+            Ok(layout()),
+            observation(TARGET, false, LayerObservation::Above),
+        );
+        let result = op.recover_result(Reason::Closing, Stage::Shutdown).unwrap();
+        assert_eq!(result.detail().reason, Reason::X11Failure);
+        assert_eq!(
+            result.detail().placement.history,
+            RecoveryHistory {
+                relocation_confirmed: true,
+                restoration_confirmed: true
+            }
+        );
+        assert_eq!(
+            result.detail().placement.current,
+            PlacementConfirmation::default()
+        );
+        assert_wire(result);
+        let (mut here, _, _, _) = recover_ready(TARGET, true, LayerObservation::Normal);
+        here.recover_shutdown(Reason::X11Failure).unwrap();
+        here.observe_recover_here(
+            Ok(layout()),
+            observation(TARGET, false, LayerObservation::Above),
+        );
+        assert_eq!(here.stage, Stage::Shutdown);
+        let late = here
+            .recover_result(Reason::Closing, Stage::Shutdown)
+            .unwrap();
+        assert_eq!(late.status(), Status::Partial);
+        assert_eq!(late.detail().reason, Reason::X11Failure);
+        assert_wire(late);
     }
 }
 
