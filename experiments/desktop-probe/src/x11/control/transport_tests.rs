@@ -3113,6 +3113,92 @@ fn late_event_turnover_terminal_correlation_and_completed_replay_keep_existing_p
     }
 }
 
+#[test]
+fn genuine_local_layer_pending_blocks_placement_route_until_shared_controller_confirms() {
+    use crate::layer::{Layer, LayerController, ObservedLayer};
+
+    for command in [Command::BringHere, Command::Recover] {
+        let now = Instant::now();
+        let mut runtime = crate::ProbeRuntime::new();
+        runtime.body = crate::BodyAvailability::Ready;
+        crate::layer_runtime_tests::pending_above(&mut runtime.layers, now);
+        let controller = &runtime.layers as *const LayerController;
+        let before = (
+            runtime.layers.desired,
+            runtime.layers.observed,
+            runtime.layers.pending(),
+        );
+        assert_eq!(before.0, Some(Layer::Above));
+        assert_eq!(
+            runtime.layers.deadline(),
+            Some(now + crate::layer::CONFIRMATION_TIMEOUT)
+        );
+        let mut endpoint = ControlWindow::candidate(0, CONTROL, 77, 50, 51, 52);
+        endpoint.descriptor = owner();
+        endpoint.root = ROOT;
+        endpoint.transport = atoms();
+        endpoint.owns_selection = true;
+        let mut peer = Fake::new();
+        peer.now = now;
+        let mut endpoint = HereOwner { endpoint, peer };
+        endpoint.request_placement(command, ID, 2, runtime.layers.pending().is_some());
+        assert!(endpoint.active().is_none());
+        let busy = endpoint.replies()[0];
+        assert_eq!(busy.status, Status::Busy);
+        assert_eq!(busy.request_id, ID);
+        assert_eq!(busy.detail.progress, control::Progress::default());
+        assert_eq!(busy.detail.placement, control::PlacementProof::default());
+        assert_eq!(
+            (
+                runtime.layers.desired,
+                runtime.layers.observed,
+                runtime.layers.pending()
+            ),
+            before
+        );
+        assert_eq!(&runtime.layers as *const LayerController, controller);
+        assert!(!endpoint
+            .service(|_, _, _, _| panic!("Busy creates no terminal obligation"))
+            .unwrap());
+        assert_eq!(endpoint.replies(), [busy]);
+
+        // The same controller consumes fresh WM truth and clears its pending
+        // removal/addition transition; admission gets a new fixed owner budget.
+        let mut reads = VecDeque::from([ObservedLayer::Normal, ObservedLayer::Above]);
+        assert_eq!(
+            crate::service_layer_with(
+                &mut runtime.layers,
+                None,
+                || Ok(Ok(reads.pop_front().unwrap())),
+                || Ok(Ok(crate::LayerSupport {
+                    state: true,
+                    above: true,
+                    below: true
+                })),
+                |mutation| {
+                    assert_eq!(mutation, crate::Mutation::AddAbove);
+                    Ok(())
+                },
+                || now + Duration::from_millis(20),
+            )
+            .unwrap(),
+            crate::LayerOutcome::Confirmed
+        );
+        assert!(runtime.layers.pending().is_none());
+        assert_eq!(&runtime.layers as *const LayerController, controller);
+        endpoint.advance_peer(Duration::from_millis(20));
+        endpoint.request_placement(command, ID + 1, 2, runtime.layers.pending().is_some());
+        let active = *endpoint.active().unwrap();
+        assert_eq!(active.request.request_id, ID + 1);
+        assert_eq!(
+            active.deadline,
+            now + Duration::from_millis(20) + command.owner_budget()
+        );
+        assert_eq!(active.placement, control::PlacementProgress::new(2));
+        assert_eq!(endpoint.replies(), [busy]);
+    }
+}
+
 use crate::here_service_tests::recover_tests::PublicFault;
 
 struct PublicPlacementCaller {

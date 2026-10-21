@@ -3157,6 +3157,238 @@ pub(crate) mod recover_tests {
             .collect()
     }
 
+    #[test]
+    fn local_layer_exclusion_preserves_here_and_every_recover_phase_authority() {
+        for phase in 0..9 {
+            let (mut h, owner) = if phase < 8 {
+                checkpoint(phase)
+            } else {
+                let mut h = Host::new(true, false, L::Below);
+                let mut owner = HereOwner::new(h.here.now, 2);
+                turnover_tick(&mut owner, &mut h).unwrap();
+                (h, owner)
+            };
+            let original = *owner.active().unwrap();
+            let layer_phase = (5..8).contains(&phase);
+            assert_eq!(remote_owns_placement(&original), !layer_phase);
+            assert_eq!(remote_owns_layer(&original), layer_phase);
+            assert!(!local_layer_service_allowed(owner.active()));
+            assert_eq!(
+                h.here.runtime.input_fence.blocked,
+                (1..5).contains(&phase) || phase == 8
+            );
+            assert_eq!(h.here.runtime.layers.pending().is_some(), layer_phase);
+            if phase == 4 {
+                assert!(original.show.correction.is_some());
+            }
+            if (3..8).contains(&phase) {
+                assert!(original.placement.proof.history.relocation_confirmed);
+            }
+            let layers = &mut h.here.runtime.layers;
+            let controller = layers as *const LayerController;
+            let before = (layers.desired, layers.observed, layers.pending());
+            let log = h.here.log.clone();
+            let mutations = h.mutations.clone();
+            for target in [Layer::Above, Layer::Normal, Layer::Below] {
+                // Dispatch exclusion is broader than ordinary service exclusion:
+                // ANY active remote slot rejects a menu's local request.
+                local_layer_after_menu_with(owner.active().is_some(), target, || {
+                    panic!("remote Busy must reject before local reads or mutation")
+                })
+                .unwrap();
+                // Fenced Here/Top visibility phases cannot produce a live menu;
+                // the admission snapshot's native body is still elsewhere too.
+                // Exercise their service gate, never seed an impossible popup.
+                if local_layer_service_allowed(owner.active()) {
+                    service_layer_with(
+                        layers,
+                        None,
+                        || panic!("remote owns ordinary local layer service"),
+                        || panic!("no local support read"),
+                        |_| panic!("no competing local mutation"),
+                        || h.here.now,
+                    )
+                    .unwrap();
+                }
+                assert_eq!(layers as *const LayerController, controller);
+                assert_eq!((layers.desired, layers.observed, layers.pending()), before);
+                // Full equality includes identity, destination, deadlines, phase,
+                // confirmed history and all consumed correction authority.
+                assert_eq!(owner.active(), Some(&original));
+                assert!(owner.replies().is_empty());
+                assert_eq!(h.here.log, log);
+                assert_eq!(h.mutations, mutations);
+                assert!(h.here.runtime.menu.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn reachable_recover_layer_menus_clean_before_busy_and_preserve_shared_controller() {
+        // Top has restored native input before layer admission. Removal, addition
+        // and Above-awaiting-final-validation can therefore host NEW gestures.
+        for phase in 5..8 {
+            for target in [Layer::Above, Layer::Normal, Layer::Below] {
+                let (mut h, owner) = checkpoint(phase);
+                let original = *owner.active().unwrap();
+                assert!(remote_owns_layer(&original));
+                assert!(h.here.runtime.accepts_input());
+                let controller = &h.here.runtime.layers as *const LayerController;
+                let layers = &h.here.runtime.layers;
+                let before = (layers.desired, layers.observed, layers.pending());
+                let log = h.here.log.clone();
+                let mutations = h.mutations.clone();
+                let outcome = layer_runtime_tests::select_layer(&mut h.here.runtime, target);
+                let trace = RefCell::new(vec![]);
+                assert!(!h
+                    .here
+                    .runtime
+                    .complete_menu_with(
+                        &mut h.here.window,
+                        outcome,
+                        |pointer| pointer
+                            .release_with(|| {
+                                trace.borrow_mut().push("release");
+                                Ok(())
+                            })
+                            .map(|_| ()),
+                        |_| {
+                            trace.borrow_mut().push("destroy");
+                            Ok(())
+                        },
+                        |layers, selected| {
+                            assert_eq!(*trace.borrow(), ["release", "destroy"]);
+                            trace.borrow_mut().push("dispatch");
+                            assert_eq!(layers as *const LayerController, controller);
+                            assert_eq!(selected, target);
+                            local_layer_after_menu_with(owner.active().is_some(), selected, || {
+                                panic!("Busy must prevent competing layer service")
+                            })
+                        },
+                    )
+                    .unwrap());
+                assert_eq!(*trace.borrow(), ["release", "destroy", "dispatch"]);
+                assert!(h.here.runtime.menu.is_none());
+                assert!(!h.here.runtime.pointer.is_grabbed());
+                assert!(h.here.runtime.interaction.is_idle());
+                let layers = &h.here.runtime.layers;
+                assert_eq!((layers.desired, layers.observed, layers.pending()), before);
+                assert_eq!(owner.active(), Some(&original));
+                assert!(owner.replies().is_empty());
+                assert_eq!(h.here.log, log);
+                assert_eq!(h.mutations, mutations);
+                assert_eq!(
+                    h.here
+                        .runtime
+                        .interaction
+                        .menu_release(1, geometry::MenuHit::Row(2), 302, 0,),
+                    HostAction::None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_admission_cancels_preexisting_popup_before_any_stale_selection() {
+        for command in [Command::BringHere, Command::Recover] {
+            // The body is local when this popup opens. A remote request arrives
+            // while its row is pressed; immediate owner service cancels it before
+            // a later release. There is no post-admission/pre-fence UI turn.
+            let mut h = Host::new(false, false, L::Below);
+            h.layer_changes = false;
+            h.here.runtime.menu_generation = 1;
+            h.here
+                .runtime
+                .acquire_menu_with(MenuPopup::test_popup(10, 1), Point::new(0, 0), || {
+                    Ok((GrabStatus::SUCCESS, 100))
+                })
+                .unwrap();
+            h.here
+                .runtime
+                .interaction
+                .menu_press(1, geometry::MenuHit::Row(0), 100, 0);
+            let mut owner = HereOwner::placement(h.here.now, command, 2);
+            let admitted = *owner.active().unwrap();
+            turnover_tick(&mut owner, &mut h).unwrap();
+            let release = h.here.log.iter().position(|&s| s == "release").unwrap();
+            let popup = h.here.log.iter().position(|&s| s == "popup").unwrap();
+            assert!(release < popup);
+            assert!(h.here.runtime.menu.is_none());
+            assert!(!h.here.runtime.pointer.is_grabbed());
+            assert_eq!(
+                h.here
+                    .runtime
+                    .interaction
+                    .menu_release(1, geometry::MenuHit::Row(0), 101, 0,),
+                HostAction::None
+            );
+            assert_eq!(h.here.count("desktop"), 0);
+            if let Some(active) = owner.active() {
+                assert_eq!(active.request, admitted.request);
+                assert_eq!(active.deadline, admitted.deadline);
+                assert_eq!(active.placement.destination_desktop, 2);
+                assert!(remote_owns_layer(active));
+                assert!(owner.replies().is_empty());
+            } else {
+                assert_eq!(command, Command::BringHere);
+                assert_eq!(owner.replies().len(), 1);
+                assert_eq!(owner.replies()[0].status, Status::Success);
+            }
+        }
+    }
+
+    #[test]
+    fn recover_layer_menu_cleanup_errors_precede_busy_and_preserve_remote_authority() {
+        for release_fails in [false, true] {
+            let (mut h, owner) = checkpoint(5);
+            let original = *owner.active().unwrap();
+            let before = h.here.runtime.layers.pending();
+            let outcome = layer_runtime_tests::select_layer(&mut h.here.runtime, Layer::Normal);
+            let trace = RefCell::new(vec![]);
+            let error = h
+                .here
+                .runtime
+                .complete_menu_with(
+                    &mut h.here.window,
+                    outcome,
+                    |pointer| {
+                        pointer
+                            .release_with(|| {
+                                trace.borrow_mut().push("release");
+                                if release_fails {
+                                    Err("release failure".into())
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                            .map(|_| ())
+                    },
+                    |_| {
+                        trace.borrow_mut().push("destroy");
+                        Err("destroy failure".into())
+                    },
+                    |_, _| panic!("cleanup failure must prevent even the Busy decision"),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                if release_fails {
+                    "release failure"
+                } else {
+                    "destroy failure"
+                }
+            );
+            assert_eq!(*trace.borrow(), ["release", "destroy"]);
+            assert_eq!(h.here.runtime.pointer.is_grabbed(), release_fails);
+            assert!(h.here.runtime.menu.is_some());
+            assert_eq!(h.here.runtime.layers.pending(), before);
+            assert_eq!(owner.active(), Some(&original));
+            assert!(owner.replies().is_empty());
+            // Cleanup errors end this trace; no new gesture is fabricated while
+            // an unconfirmed release or popup resource obligation remains.
+        }
+    }
+
     fn external(owner: &mut HereOwner, h: &mut Host, original: HostError) -> HostError {
         finish_probe_run_with(Err(original), |original| {
             let mut original = Some(original);
@@ -3925,6 +4157,243 @@ pub(crate) mod recover_tests {
             }
         );
         op
+    }
+
+    #[test]
+    fn terminal_placement_allows_fresh_local_menu_then_remote_only_after_local_confirmation() {
+        // Representative continuing-owner outcomes, not fatal run termination:
+        // Here success, Recover success, ordinary preflight failure, and an
+        // undelivered reply (PeerHost::send returns false, not OwnershipLost).
+        for case in 0..4 {
+            let command = if case == 0 {
+                Command::BringHere
+            } else {
+                Command::Recover
+            };
+            let mut h = Host::new(case != 2, false, L::Below);
+            let admitted_at = h.here.now;
+            if case == 2 {
+                h.here.layout = Err(DestinationError::Changed);
+            } else {
+                h.here.actual.x = -100; // consume genuine remote correction authority
+            }
+            let mut owner = HereOwner::placement(h.here.now, command, 2);
+            let original = *owner.active().unwrap();
+            if case == 3 {
+                owner.fail_reply(false);
+            }
+            turnover_tick(&mut owner, &mut h).unwrap();
+            if case != 2 {
+                h.here.target();
+                wake(&mut owner);
+                turnover_tick(&mut owner, &mut h).unwrap();
+                let (_, correction_deadline) =
+                    owner.active().unwrap().placement.correction().unwrap();
+                h.here.now = correction_deadline;
+                wake(&mut owner);
+                turnover_tick(&mut owner, &mut h).unwrap();
+            }
+            assert!(owner.active().is_none());
+            let predecessor = owner.replies()[0]; // a recorded attempt in case 3
+            assert_eq!(predecessor.request_id, original.request.request_id);
+            assert_eq!(
+                predecessor.status,
+                if case == 2 {
+                    Status::Failed
+                } else {
+                    Status::Success
+                }
+            );
+            assert_eq!(
+                predecessor.detail.reason,
+                if case == 2 {
+                    Reason::LayoutChanged
+                } else {
+                    Reason::None
+                }
+            );
+            assert_eq!(owner.descriptor().lifecycle, control::Lifecycle::Ready);
+            assert!(h.here.owned);
+            assert!(h.here.runtime.accepts_input());
+            assert!(here_runtime_ready(&h.here.runtime, &h.here.window));
+            assert!(h.here.runtime.menu.is_none());
+            assert!(!h.here.runtime.pointer.is_grabbed());
+            assert!(h.here.runtime.layers.pending().is_none());
+            assert!(local_layer_service_allowed(owner.active()));
+            assert_eq!(
+                h.here
+                    .runtime
+                    .interaction
+                    .menu_release(1, geometry::MenuHit::Row(0), 302, 0,),
+                HostAction::None
+            );
+            owner.advance_peer(h.here.now - admitted_at);
+            h.here.layout = Ok(layout());
+            let controller = &h.here.runtime.layers as *const LayerController;
+            let target = match case {
+                0 => Layer::Normal,
+                2 => Layer::Above,
+                _ => Layer::Below,
+            };
+            let observed = if case == 0 || case == 2 {
+                ObservedLayer::Below
+            } else {
+                ObservedLayer::Above
+            };
+            let outcome = layer_runtime_tests::select_layer(&mut h.here.runtime, target);
+            let trace = RefCell::new(vec![]);
+            let sends = RefCell::new(vec![]);
+            h.here
+                .runtime
+                .complete_menu_with(
+                    &mut h.here.window,
+                    outcome,
+                    |pointer| {
+                        pointer
+                            .release_with(|| {
+                                trace.borrow_mut().push("release");
+                                Ok(())
+                            })
+                            .map(|_| ())
+                    },
+                    |_| {
+                        trace.borrow_mut().push("destroy");
+                        Ok(())
+                    },
+                    |layers, selected| {
+                        assert_eq!(*trace.borrow(), ["release", "destroy"]);
+                        trace.borrow_mut().push("dispatch");
+                        assert_eq!(layers as *const LayerController, controller);
+                        local_layer_after_menu_with(owner.active().is_some(), selected, || {
+                            assert_eq!(
+                                service_layer_with(
+                                    layers,
+                                    Some(selected),
+                                    || Ok(Ok(observed)),
+                                    || Ok(Ok(LayerSupport {
+                                        state: true,
+                                        above: true,
+                                        below: true
+                                    })),
+                                    |mutation| {
+                                        sends.borrow_mut().push(mutation);
+                                        Ok(())
+                                    },
+                                    || h.here.now,
+                                )?,
+                                LayerOutcome::Waiting
+                            );
+                            Ok(())
+                        })
+                    },
+                )
+                .unwrap();
+            assert_eq!(*trace.borrow(), ["release", "destroy", "dispatch"]);
+            assert_eq!(sends.borrow().len(), 1);
+            let pending = h.here.runtime.layers.pending().unwrap();
+            assert_eq!(pending.deadline, h.here.now + layer::CONFIRMATION_TIMEOUT);
+            assert_ne!(pending.deadline, original.deadline);
+            assert_eq!(h.here.runtime.layers.desired, Some(target));
+            assert!(h.here.runtime.menu.is_none());
+            assert!(!h.here.runtime.pointer.is_grabbed());
+            assert_eq!(
+                h.here
+                    .runtime
+                    .interaction
+                    .menu_release(1, geometry::MenuHit::Row(0), 303, 0,),
+                HostAction::None
+            );
+            owner.request_placement(
+                Command::Recover,
+                owner.original_id() + 10,
+                2,
+                h.here.runtime.layers.pending().is_some(),
+            );
+            assert!(owner.active().is_none());
+            let busy = owner.replies()[1];
+            assert_eq!(busy.status, Status::Busy);
+            assert_eq!(h.here.runtime.layers.pending(), Some(pending));
+            assert_eq!(h.here.runtime.layers.desired, Some(target));
+            let final_layer = match target {
+                Layer::Above => ObservedLayer::Above,
+                Layer::Normal => ObservedLayer::Normal,
+                Layer::Below => ObservedLayer::Below,
+            };
+            let mut reads = VecDeque::from([ObservedLayer::Normal, final_layer]);
+            assert_eq!(
+                service_layer_with(
+                    &mut h.here.runtime.layers,
+                    None,
+                    || Ok(Ok(reads.pop_front().unwrap())),
+                    || Ok(Ok(LayerSupport {
+                        state: true,
+                        above: true,
+                        below: true
+                    })),
+                    |mutation| {
+                        sends.borrow_mut().push(mutation);
+                        Ok(())
+                    },
+                    || h.here.now,
+                )
+                .unwrap(),
+                LayerOutcome::Confirmed
+            );
+            assert_eq!(
+                sends.borrow().len(),
+                if target == Layer::Normal { 1 } else { 2 }
+            );
+            assert!(h.here.runtime.layers.pending().is_none());
+            h.here.current.layer = match target {
+                Layer::Above => L::Above,
+                Layer::Normal => L::Normal,
+                Layer::Below => L::Below,
+            };
+            let layers = (
+                h.here.runtime.layers.desired,
+                h.here.runtime.layers.observed,
+            );
+            let successor = fresh_successor(&mut owner, &mut h, Command::Recover);
+            assert_ne!(successor.request.request_id, original.request.request_id);
+            assert!(successor.deadline > original.deadline);
+            assert_eq!(successor.recover_phase, RecoverPhase::Here);
+            assert_eq!(
+                successor.bring_top,
+                control::BringTopProgress {
+                    visibility_cutoff: h.here.now + Duration::from_millis(2500),
+                    minimized_at_start: false,
+                    restoration_confirmed: false,
+                    layer_admitted: None,
+                    layer_observe: false,
+                    layer_attempted: false,
+                    layer_dispatched: false,
+                    layer_checked: false,
+                    layer_finished: false,
+                }
+            );
+            assert_eq!(owner.replies(), [predecessor, busy]);
+            assert_eq!(&h.here.runtime.layers as *const LayerController, controller);
+            assert_eq!(
+                (
+                    h.here.runtime.layers.desired,
+                    h.here.runtime.layers.observed
+                ),
+                layers
+            );
+            turnover_tick(&mut owner, &mut h).unwrap();
+            assert!(owner.active().is_none());
+            let replies = owner.replies();
+            assert_eq!(replies.len(), 3);
+            assert_eq!(replies[0..2], [predecessor, busy]);
+            assert_eq!(replies[2].request_id, successor.request.request_id);
+            assert_eq!(replies[2].status, Status::Success);
+            assert_eq!(
+                replies[2].detail.placement.history,
+                control::RecoveryHistory::default()
+            );
+            assert!(!turnover_tick(&mut owner, &mut h).unwrap());
+            assert_eq!(owner.replies(), replies);
+        }
     }
 
     #[test]

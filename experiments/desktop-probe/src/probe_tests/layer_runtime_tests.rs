@@ -311,7 +311,7 @@ fn captured_menu() -> ProbeRuntime {
     runtime
 }
 
-fn pending_above(layers: &mut LayerController, now: Instant) {
+pub(crate) fn pending_above(layers: &mut LayerController, now: Instant) {
     let reads = Cell::new(0);
     service_layer_with(
         layers,
@@ -336,6 +336,38 @@ fn pending_above(layers: &mut LayerController, now: Instant) {
     .unwrap();
     assert_eq!(reads.get(), 2); // preflight snapshot and fresh read after checked removal
     assert_eq!(layers.pending().unwrap().phase, Phase::AwaitRemoval);
+}
+
+/// A fresh selecting gesture, only after the caller proves native input ready.
+/// Acquisition and row matching use the existing runtime/interaction methods.
+pub(crate) fn select_layer(runtime: &mut ProbeRuntime, target: Layer) -> MenuOutcome {
+    assert!(runtime.accepts_input());
+    assert!(runtime.interaction.is_idle());
+    assert!(runtime.menu.is_none());
+    assert!(!runtime.pointer.is_grabbed());
+    runtime.menu_generation += 1;
+    runtime
+        .acquire_menu_with(
+            MenuPopup::test_popup(10, runtime.menu_generation),
+            Point::new(0, 0),
+            || Ok((GrabStatus::SUCCESS, 3000)),
+        )
+        .unwrap();
+    let row = match target {
+        Layer::Above => 0,
+        Layer::Normal => 1,
+        Layer::Below => 2,
+    };
+    runtime.interaction.menu_press(1, MenuHit::Row(row), 300, 0);
+    let HostAction::CloseMenu { outcome, .. } =
+        runtime
+            .interaction
+            .menu_release(1, MenuHit::Row(row), 301, 0)
+    else {
+        panic!("fresh layer selection missing")
+    };
+    assert_eq!(outcome, MenuOutcome::SetLayer(target));
+    outcome
 }
 
 #[test]
