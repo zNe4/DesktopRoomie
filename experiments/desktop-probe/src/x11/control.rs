@@ -28,6 +28,18 @@ type Result<T> = std::result::Result<T, HostError>;
 const PROBE_BUDGET: Duration = Duration::from_secs(1);
 const ACQUISITION_BUDGET: Duration = Duration::from_secs(2);
 
+/// A successful native lookup proved owner loss. Query errors remain their
+/// original HostError; the owner finalizer must not classify this as X11Failure.
+#[derive(Debug)]
+pub(crate) struct OwnershipLost(&'static str);
+
+impl std::fmt::Display for OwnershipLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for OwnershipLost {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Acquisition {
     Owned,
@@ -507,7 +519,7 @@ impl ControlWindow {
         self.active.as_mut()
     }
 
-    /// Borrow the sole Here slot directly into the reviewed owner finalizer.
+    /// Borrow the sole placement slot directly into the reviewed owner finalizer.
     /// Only that finalizer clears it; the reply closure owns correlation values,
     /// not a second operation, and cannot redirect the reply to another caller.
     pub fn service_here_with(
@@ -537,7 +549,10 @@ impl ControlWindow {
         let Some(operation) = self.active.as_ref() else {
             return Ok(false);
         };
-        if operation.request.command != Command::BringHere {
+        if !matches!(
+            operation.request.command,
+            Command::BringHere | Command::Recover
+        ) {
             return Ok(false);
         }
         let request = operation.request;
@@ -608,7 +623,10 @@ impl ControlWindow {
         let Some(operation) = self.active.as_mut() else {
             return Ok(());
         };
-        if operation.request.command == Command::BringHere {
+        if matches!(
+            operation.request.command,
+            Command::BringHere | Command::Recover
+        ) {
             let result = operation
                 .here_shutdown(if self.owns_selection {
                     Reason::Closing
@@ -1016,12 +1034,10 @@ fn finish_active(
     active: &mut Option<ActiveOperation>,
     response: TerminalResponse,
 ) -> Result<()> {
-    let operation = active.as_ref().ok_or("Missing admitted operation")?;
-    let result = reply_event(atoms, operation.request.reply_xid, response)
-        .and_then(|event| host.send(event).map(|_| ()));
-    // Clear after the one attempt, including BadWindow and unrelated failures.
-    *active = None;
-    result
+    let operation = active.take().ok_or("Missing admitted operation")?;
+    // The sole slot is already clear through encoding/send failure and cleanup.
+    reply_event(atoms, operation.request.reply_xid, response)
+        .and_then(|event| host.send(event).map(|_| ()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1046,7 +1062,9 @@ fn route_request_with(
         return Ok(true);
     }
     if host.owner()? != owner.control_xid {
-        return Err("Control selection ownership lost before admission".into());
+        return Err(Box::new(OwnershipLost(
+            "Control selection ownership lost before admission",
+        )));
     }
     let Some(evidence) = host.evidence(words[3], atoms.caller)? else {
         return Ok(true);
@@ -1059,7 +1077,9 @@ fn route_request_with(
     // Synchronous validation may have overlapped owner loss; admission requires
     // current ownership, not just the lookup before reading the caller marker.
     if host.owner()? != owner.control_xid {
-        return Err("Control selection ownership lost during validation".into());
+        return Err(Box::new(OwnershipLost(
+            "Control selection ownership lost during validation",
+        )));
     }
     let admission = match protocol_error {
         Some(reason) => Admission::Reply(Status::ProtocolError, reason, Stage::Preflight),
@@ -3425,24 +3445,89 @@ pub(crate) mod transport_tests {
     }
 
     #[test]
-    fn recover_shutdown_keeps_existing_generic_closing_semantics() {
-        let mut host = Fake::new();
-        let mut endpoint = ControlWindow::candidate(0, CONTROL, 11, 50, 51, 52);
-        endpoint.transport = atoms();
-        endpoint.descriptor = owner();
-        control::admit(
-            &mut endpoint.active,
-            request(Command::Recover),
-            7,
-            Lifecycle::Ready,
-            false,
-            host.now,
-        );
-        endpoint.finish_remote_with(&mut host).unwrap();
-        assert!(endpoint.active().is_none());
-        let reply = TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap();
-        assert_eq!(reply.status, Status::Closing);
-        assert_eq!(reply.detail.placement, control::PlacementProof::default());
+    fn recover_shutdown_preserves_every_history_partition_and_clears_current_proof() {
+        for owned in [false, true] {
+            for relocated in [false, true] {
+                for restored in [false, true] {
+                    for phase in [control::RecoverPhase::Here, control::RecoverPhase::Top] {
+                        let mut host = Fake::new();
+                        let mut endpoint = ControlWindow::candidate(0, CONTROL, 11, 50, 51, 52);
+                        endpoint.transport = atoms();
+                        endpoint.descriptor = owner();
+                        endpoint.owns_selection = owned;
+                        control::admit(
+                            &mut endpoint.active,
+                            request(Command::Recover),
+                            7,
+                            Lifecycle::Ready,
+                            false,
+                            host.now,
+                        );
+                        let op = endpoint.active.as_mut().unwrap();
+                        op.recover_phase = phase;
+                        op.placement.baseline = Some(control::PlacementBaseline {
+                            desktop: if relocated { 0 } else { 7 },
+                            minimized: restored,
+                            layer: control::LayerObservation::Below,
+                        });
+                        op.placement.proof.history = control::RecoveryHistory {
+                            relocation_confirmed: relocated,
+                            restoration_confirmed: restored,
+                        };
+                        op.detail.progress = control::Progress {
+                            host_mutation_dispatched: true,
+                            not_minimized_confirmed: true,
+                            above_confirmed: true,
+                            input_ready: true,
+                            placement_deferred: false,
+                        };
+                        op.placement.proof.current.destination = true;
+                        endpoint.finish_remote_with(&mut host).unwrap();
+                        assert!(endpoint.active().is_none());
+                        let reply =
+                            TerminalResponse::decode(&host.sent[0].data.as_data32()).unwrap();
+                        assert_eq!(
+                            reply.status,
+                            if relocated || restored {
+                                Status::Partial
+                            } else {
+                                Status::Failed
+                            }
+                        );
+                        assert_eq!(
+                            reply.detail.reason,
+                            if owned {
+                                Reason::Closing
+                            } else {
+                                Reason::OwnershipLost
+                            }
+                        );
+                        assert_eq!(reply.detail.stage, Stage::Shutdown);
+                        assert_eq!(reply.request_id, ID);
+                        assert_eq!(
+                            reply.detail.placement.history,
+                            control::RecoveryHistory {
+                                relocation_confirmed: relocated,
+                                restoration_confirmed: restored,
+                            }
+                        );
+                        assert_eq!(
+                            reply.detail.placement.current,
+                            control::PlacementConfirmation::default()
+                        );
+                        assert_eq!(
+                            reply.detail.progress,
+                            control::Progress {
+                                host_mutation_dispatched: true,
+                                ..Default::default()
+                            }
+                        );
+                        endpoint.finish_remote_with(&mut host).unwrap();
+                        assert_eq!(host.sent.len(), 1);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -4934,6 +5019,29 @@ pub(crate) mod transport_tests {
         peer: Fake,
     }
     impl HereOwner {
+        /// Internal pre-admission only: never calls the public request router.
+        pub(crate) fn recover(now: Instant, destination: u32) -> Self {
+            let mut endpoint = ControlWindow::candidate(0, CONTROL, 77, 50, 51, 52);
+            endpoint.descriptor = owner();
+            endpoint.root = ROOT;
+            endpoint.transport = atoms();
+            endpoint.owns_selection = true;
+            assert_eq!(
+                control::admit(
+                    &mut endpoint.active,
+                    request(Command::Recover),
+                    destination,
+                    Lifecycle::Ready,
+                    false,
+                    now,
+                ),
+                Admission::Admitted
+            );
+            Self {
+                endpoint,
+                peer: Fake::new(),
+            }
+        }
         pub(crate) fn new(now: Instant, destination: u32) -> Self {
             let mut endpoint = ControlWindow::candidate(0, CONTROL, 77, 50, 51, 52);
             endpoint.descriptor = owner();
@@ -5015,6 +5123,35 @@ pub(crate) mod transport_tests {
             } else {
                 self.peer.send_ok = false;
             }
+        }
+        pub(crate) fn request_ownership_failure(
+            &mut self,
+            during_validation: bool,
+            query_error: bool,
+        ) -> HostError {
+            if query_error {
+                self.peer.failure = Some("owner");
+            } else {
+                self.peer.owners.extend(if during_validation {
+                    vec![CONTROL, CONTROL + 1]
+                } else {
+                    vec![CONTROL + 1]
+                });
+            }
+            self.peer
+                .evidence
+                .push_back(Some(evidence(&marker(Command::Show).encode().unwrap())));
+            let error = self
+                .peer
+                .route(
+                    &mut self.endpoint.active,
+                    Lifecycle::Ready,
+                    false,
+                    &request_event(atoms(), CONTROL, request(Command::Show)).unwrap(),
+                )
+                .unwrap_err();
+            self.peer.failure = None;
+            error
         }
         pub(crate) fn shutdown(&mut self, owned: bool) {
             self.endpoint.owns_selection = owned;

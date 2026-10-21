@@ -2133,6 +2133,9 @@ trait VisibilityHost {
     fn recover_evidence(&mut self, _destination: u32) -> Result<HereEvidence, HostError> {
         Err("Recover requires the strict destination adapter".into())
     }
+    fn recover_owned(&mut self) -> Result<bool, HostError> {
+        Err("Recover requires fresh selection ownership".into())
+    }
     fn recover_geometry(
         &mut self,
         _layout: control::DestinationIdentity,
@@ -2355,7 +2358,19 @@ fn read_recover_top(
     operation: &mut control::ActiveOperation,
     host: &mut impl VisibilityHost,
 ) -> Result<(HereEvidence, control::HereDecision), HostError> {
+    if operation.placement.invalidation_reason() == Some(control::Reason::OwnershipLost)
+        || !host.recover_owned()?
+    {
+        reject_recover(operation, control::Reason::OwnershipLost);
+        return Ok((
+            unavailable_recover_evidence(),
+            control::HereDecision::Invalid(control::Reason::OwnershipLost),
+        ));
+    }
     let evidence = host.recover_evidence(operation.placement.destination_desktop)?;
+    if !host.recover_owned()? {
+        reject_recover(operation, control::Reason::OwnershipLost);
+    }
     let decision =
         operation.observe_recover_top(destination_evidence(&evidence), evidence.observation);
     if decision == control::HereDecision::Destination && operation.show.baseline.is_none() {
@@ -2366,6 +2381,34 @@ fn read_recover_top(
         });
     }
     Ok((evidence, decision))
+}
+
+/// No native evidence is acquired after proven owner loss. This unavailable
+/// snapshot only carries the already-latched lifecycle outcome to the borrower.
+fn unavailable_recover_evidence() -> HereEvidence {
+    let evidence = control::VisibilityEvidence {
+        destroyed: false,
+        wm_state: control::WmState::Malformed,
+        map_state: control::Evidence::Malformed,
+        hidden: control::Evidence::Malformed,
+        workspace: control::Workspace::Unknown,
+        capability: control::Capability::Unverifiable,
+        coherent: false,
+    };
+    HereEvidence {
+        layout: Err(x11::monitors::destination::DestinationError::Changed),
+        observation: control::HereObservation {
+            membership: None,
+            visibility: control::Visibility::Unknown,
+            layer: control::LayerObservation::Unknown,
+        },
+        snapshot: x11::visibility::VisibilitySnapshot {
+            observation: None,
+            evidence,
+            candidate: control::classify(evidence),
+            layer: control::LayerObservation::Unknown,
+        },
+    }
 }
 
 fn reject_recover(operation: &mut control::ActiveOperation, reason: control::Reason) {
@@ -3426,6 +3469,7 @@ fn service_bring_top_with(
             Err(_) | Ok(Some(VisibilityCompletion::Failed(_, _)))
         );
         if failed
+            && !recover_top(operation)
             && matches!(
                 operation.show.phase,
                 control::ShowPhase::EnablingInput | control::ShowPhase::InputRestored
@@ -3630,6 +3674,7 @@ struct NativeVisibility<'a, C> {
     runtime: &'a mut ProbeRuntime,
     bounds: &'a mut crate::geometry::ValidOriginBounds,
     area: &'a mut crate::geometry::Rect,
+    recover_owner: Option<(u32, u32)>, // borrowed selection / admitted control XID
 }
 
 /// Strict D2.1 evidence. Ordinary invalid evidence is deliberately separate
@@ -3651,6 +3696,7 @@ trait BringHereHost {
     fn visible_ready(&self) -> bool;
     fn fence_settled(&self) -> bool;
     fn fence(&mut self) -> Result<(), HostError>;
+    fn abort_recovery_layer(&mut self) {}
     fn desktop(
         &mut self,
         destination: u32,
@@ -3711,50 +3757,14 @@ fn incomplete_recover(
         .expect("Incomplete Recover retains only independently confirmed history")
 }
 
-/// E2 internal entry only. E3 owns production routing and cross-phase fatal
-/// finalization; neither production Unsupported guard calls this composition.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Production Recover routing is separately gated on E3/E4"
-    )
-)]
+/// Internal composition uses the same D4.1 safety/history policy as Here.
+/// Both production admission guards remain closed through E3.
 fn service_recover_with(
     operation: &mut control::ActiveOperation,
     host: &mut impl RecoverHost,
 ) -> Result<Option<control::OperationResult>, HostError> {
-    let mut outcome = step_recover_with(operation, host);
-    let failed = match &outcome {
-        Err(_) => true,
-        Ok(Some(result)) => !matches!(
-            result.status(),
-            control::Status::Success | control::Status::Busy
-        ),
-        Ok(None) => false,
-    };
-    // Borrowed mechanism safety only: no reply, slot clearing, shutdown result
-    // or fatal-history round here. E3 must integrate those owner obligations.
-    if failed
-        && host.live()
-        && operation.placement.baseline.is_some()
-        && (host.input_active() || !host.fence_settled())
-    {
-        if operation.placement.correction().is_some() {
-            host.restrict_automatic_correction();
-        }
-        let cleanup = host
-            .owned()
-            .and_then(|owned| if owned { host.fence() } else { Ok(()) });
-        if let Err(cleanup) = cleanup {
-            if outcome.is_ok() {
-                outcome = Err(cleanup);
-            } else {
-                eprintln!("[RECOVER] Input safety cleanup: {cleanup}");
-            }
-        }
-    }
-    outcome
+    let outcome = step_recover_with(operation, host);
+    finalize_bring_here_with(operation, host, outcome)
 }
 
 fn step_recover_with(
@@ -3768,6 +3778,12 @@ fn step_recover_with(
         match step_bring_here_with(operation, host)? {
             None => return Ok(None),
             Some(HereCompletion::Ready(confirmed)) => {
+                if !host.owned()? {
+                    return Ok(Some(incomplete_recover(
+                        operation,
+                        control::Reason::OwnershipLost,
+                    )));
+                }
                 if !operation.handoff_recover_top(host.now(), operation.detail, confirmed) {
                     return Ok(Some(incomplete_recover(
                         operation,
@@ -3869,6 +3885,12 @@ fn guard_recover_here(
         return Ok(None);
     }
     let (_, decision) = read_here(operation, host)?;
+    if !host.owned()? {
+        operation
+            .placement
+            .invalidate_here(control::Reason::OwnershipLost);
+        return Ok(Some(control::Reason::OwnershipLost));
+    }
     if decision != expected {
         return Ok(Some(match decision {
             control::HereDecision::Invalid(reason) => reason,
@@ -4256,8 +4278,8 @@ fn finalize_bring_here_with(
 ) -> Result<Option<control::OperationResult>, HostError> {
     if outcome.is_err() {
         operation
-            .placement
-            .invalidate_here(control::Reason::X11Failure);
+            .here_shutdown(control::Reason::X11Failure)
+            .unwrap();
     }
     let failed = match &outcome {
         Err(_) => true,
@@ -4267,14 +4289,25 @@ fn finalize_bring_here_with(
         ),
         Ok(None) => false,
     };
+    let recover = operation.request.command == control::Command::Recover;
+    let ownership_lost = recover
+        && operation.placement.invalidation_reason() == Some(control::Reason::OwnershipLost);
+    if failed && recover {
+        host.abort_recovery_layer();
+    }
     if failed
+        && !ownership_lost
         && host.live()
         && operation.placement.baseline.is_some()
         && (host.input_active()
-            || matches!(
-                operation.placement.here_phase(),
-                control::HerePhase::EnablingInput | control::HerePhase::InputRestored
-            ))
+            || if recover {
+                !host.fence_settled()
+            } else {
+                matches!(
+                    operation.placement.here_phase(),
+                    control::HerePhase::EnablingInput | control::HerePhase::InputRestored
+                )
+            })
     {
         if operation.placement.correction().is_some() {
             host.restrict_automatic_correction();
@@ -4293,12 +4326,25 @@ fn finalize_bring_here_with(
         operation
             .placement
             .invalidate_here(control::Reason::X11Failure);
-        if operation.detail.progress.host_mutation_dispatched
+        if (operation.detail.progress.host_mutation_dispatched
+            || (recover && operation.placement.baseline.is_some()))
+            && !ownership_lost
             && host.live()
             && host.owned().unwrap_or(false)
         {
-            if let Err(error) = read_here(operation, host) {
-                eprintln!("[HERE] Final history observation after native failure: {error}");
+            let history = if recover_top(operation) {
+                host.evidence(operation.placement.destination_desktop)
+                    .map(|evidence| {
+                        operation.observe_recover_top(
+                            destination_evidence(&evidence),
+                            evidence.observation,
+                        );
+                    })
+            } else {
+                read_here(operation, host).map(|_| ())
+            };
+            if let Err(error) = history {
+                eprintln!("[PLACEMENT] Final history observation after native failure: {error}");
             }
         }
         operation
@@ -4316,13 +4362,33 @@ fn service_here_owner_with(
     host: &mut impl BringHereHost,
     reply: impl FnOnce(control::OperationResult) -> Result<(), HostError>,
 ) -> Result<(), HostError> {
+    service_placement_owner_with(active, host, reply, service_bring_here_with)
+}
+
+fn service_recover_owner_with(
+    active: &mut Option<control::ActiveOperation>,
+    host: &mut impl RecoverHost,
+    reply: impl FnOnce(control::OperationResult) -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    service_placement_owner_with(active, host, reply, service_recover_with)
+}
+
+fn service_placement_owner_with<H: BringHereHost>(
+    active: &mut Option<control::ActiveOperation>,
+    host: &mut H,
+    reply: impl FnOnce(control::OperationResult) -> Result<(), HostError>,
+    service: impl FnOnce(
+        &mut control::ActiveOperation,
+        &mut H,
+    ) -> Result<Option<control::OperationResult>, HostError>,
+) -> Result<(), HostError> {
     let Some(operation) = active.as_mut() else {
         return Ok(());
     };
     if !remote_service_due(operation, host.now()) {
         return Ok(());
     }
-    let outcome = service_bring_here_with(operation, host);
+    let outcome = service(operation, host);
     complete_here_owner_with(active, outcome, reply)
 }
 
@@ -4334,12 +4400,27 @@ fn fail_here_owner_with(
     reply: impl FnOnce(control::OperationResult) -> Result<(), HostError>,
     original: HostError,
 ) -> Result<(), HostError> {
-    let Some(operation) = active
-        .as_mut()
-        .filter(|operation| operation.request.command == control::Command::BringHere)
-    else {
+    let Some(operation) = active.as_mut().filter(|operation| {
+        matches!(
+            operation.request.command,
+            control::Command::BringHere | control::Command::Recover
+        )
+    }) else {
         return Err(original);
     };
+    if operation.request.command == control::Command::Recover
+        && original.is::<x11::control::OwnershipLost>()
+    {
+        host.abort_recovery_layer();
+        let result = operation
+            .recover_shutdown(control::Reason::OwnershipLost)
+            .unwrap();
+        // Proven transport loss is the same ordinary lifecycle outcome as the
+        // scheduler's mismatch. Reuse terminal clearing, without native cleanup
+        // or a history acquisition against the replacement selection owner.
+        let _ = complete_here_owner_with(active, Ok(Some(result)), reply);
+        return Err(original);
+    }
     let outcome = finalize_bring_here_with(operation, host, Err(original));
     complete_here_owner_with(active, outcome, reply)
 }
@@ -4357,17 +4438,17 @@ fn complete_here_owner_with(
         Ok(Some(result)) => {
             // Losing the selection ends the owner run after its one reply;
             // ordinary local services must not resume against a replacement.
-            let primary: Option<HostError> = (result.detail().reason
-                == control::Reason::OwnershipLost)
-                .then(|| "Control selection ownership lost during Bring Here".into());
+            let primary: Option<HostError> =
+                (result.detail().reason == control::Reason::OwnershipLost).then(|| {
+                    if operation.request.command == control::Command::Recover {
+                        "Control selection ownership lost during Recover".into()
+                    } else {
+                        "Control selection ownership lost during Bring Here".into()
+                    }
+                });
             (result, primary)
         }
-        Err(error) => (
-            operation
-                .here_shutdown(control::Reason::X11Failure)
-                .unwrap(),
-            Some(error),
-        ),
+        Err(error) => (fatal_placement_result(operation), Some(error)),
     };
     *active = None;
     let sent = reply(result);
@@ -4380,6 +4461,28 @@ fn complete_here_owner_with(
         }
         None => sent,
     }
+}
+
+/// Fatal native failure has priority over an earlier ordinary invalidation.
+/// Preserve the pure record's failure latch; adapt only the terminal diagnostic.
+fn fatal_placement_result(operation: &mut control::ActiveOperation) -> control::OperationResult {
+    let shutdown = operation
+        .here_shutdown(control::Reason::X11Failure)
+        .unwrap();
+    if operation.request.command != control::Command::Recover {
+        return shutdown;
+    }
+    let mut detail = shutdown.detail();
+    detail.reason = control::Reason::X11Failure;
+    operation.detail = detail;
+    control::OperationResult::placement(
+        control::Command::Recover,
+        shutdown.status(),
+        detail,
+        control::Confirmation::default(),
+        &operation.placement,
+    )
+    .expect("Fatal Recover retains history with no current proof")
 }
 
 /// Borrows the existing runtime/resources; owns no request or controller.
@@ -4423,6 +4526,9 @@ impl<C: Connection> BringHereHost for NativeHere<'_, '_, C> {
     }
     fn fence(&mut self) -> Result<(), HostError> {
         self.visibility.fence()
+    }
+    fn abort_recovery_layer(&mut self) {
+        self.visibility.abort_above();
     }
     fn desktop(
         &mut self,
@@ -4487,6 +4593,7 @@ impl<C: Connection> BringHereHost for NativeHere<'_, '_, C> {
 impl<'b, C: Connection> RecoverHost for NativeHere<'_, 'b, C> {
     type Top = NativeVisibility<'b, C>;
     fn top(&mut self) -> &mut Self::Top {
+        self.visibility.recover_owner = Some((self.selection, self.control_xid));
         self.visibility
     }
 }
@@ -5440,6 +5547,13 @@ impl<C: Connection> VisibilityHost for NativeVisibility<'_, C> {
             .restore_visibility_input(self.conn, self.window, snapshot, placement)?;
         Ok(true)
     }
+    fn recover_owned(&mut self) -> Result<bool, HostError> {
+        use x11rb::protocol::xproto::ConnectionExt;
+        let (selection, control_xid) = self
+            .recover_owner
+            .ok_or("Recover Top requires its admitted owner identity")?;
+        Ok(self.conn.get_selection_owner(selection)?.reply()?.owner == control_xid)
+    }
     fn recover_evidence(&mut self, destination: u32) -> Result<HereEvidence, HostError> {
         self.here_observe(destination)
     }
@@ -5600,6 +5714,7 @@ fn here_evidence_event(
 
 fn remote_owns_placement(operation: &control::ActiveOperation) -> bool {
     operation.request.command == control::Command::BringHere
+        || (operation.request.command == control::Command::Recover && !remote_owns_layer(operation))
 }
 
 /// Consume before every legacy map/layout/geometry consumer. Notification
@@ -5612,10 +5727,10 @@ fn route_here_evidence_event(
     visibility: &x11::visibility::VisibilityAtoms,
     layout: &x11::monitors::LayoutAtoms,
 ) -> bool {
-    if let Some(operation) = operation.filter(|op| remote_owns_placement(op)) {
+    if let Some(operation) = operation.filter(|op| remote_owns_placement(op) || recover_top(op)) {
         if here_evidence_event(event, root, body, visibility, layout) {
             mark_remote_observation(operation, false);
-            return true;
+            return remote_consumes_visibility_event(operation, event, body);
         }
     }
     false
@@ -5626,11 +5741,12 @@ fn remote_deadline(owner: &ControlWindow) -> Option<Instant> {
 }
 
 fn remote_operation_deadline(operation: &control::ActiveOperation) -> Instant {
-    if remote_owns_placement(operation) {
+    if remote_owns_placement(operation) && !recover_top(operation) {
+        let cutoff = here_cutoff(operation);
         return operation
             .placement
             .correction()
-            .map_or(operation.deadline, |(_, dl)| dl.min(operation.deadline));
+            .map_or(cutoff, |(_, dl)| dl.min(cutoff));
     }
     if remote_owns_layer(operation) {
         return operation
@@ -5651,7 +5767,7 @@ fn remote_operation_deadline(operation: &control::ActiveOperation) -> Instant {
 }
 
 fn remote_owns_layer(operation: &control::ActiveOperation) -> bool {
-    operation.request.command == control::Command::BringTop
+    (operation.request.command == control::Command::BringTop || recover_top(operation))
         && operation.stage == control::Stage::Layer
 }
 
@@ -5678,7 +5794,13 @@ fn remote_service_due(operation: &control::ActiveOperation, now: Instant) -> boo
         }
         control::Command::BringTop => operation.show.observe,
         control::Command::BringHere => operation.placement.observation_due(),
-        control::Command::Recover => true,
+        control::Command::Recover if !recover_top(operation) => {
+            operation.placement.observation_due()
+        }
+        control::Command::Recover if remote_owns_layer(operation) => {
+            operation.bring_top.layer_observe
+        }
+        control::Command::Recover => operation.show.observe,
     };
     observe || now >= remote_operation_deadline(operation)
 }
@@ -5697,7 +5819,22 @@ fn mark_remote_observation(operation: &mut control::ActiveOperation, layout_inte
             operation.hide.layout_interrupted |= layout_interrupted;
         }
         control::Command::BringHere => operation.placement.request_here_observation(),
-        control::Command::Recover => {}
+        control::Command::Recover => {
+            // Notifications invalidate readiness, never the immutable identity,
+            // history, correction allowance or phase deadlines. Fresh strict
+            // reads distinguish equal layout evidence from confirmed drift.
+            operation.placement.request_here_observation();
+            let dispatched = operation.detail.progress.host_mutation_dispatched;
+            operation.detail = control::preflight_detail(control::Reason::None, operation.stage);
+            operation.detail.progress.host_mutation_dispatched = dispatched;
+            operation.detail.placement = operation.placement.proof;
+            if recover_top(operation) {
+                operation.show.observe = true;
+                if remote_owns_layer(operation) {
+                    operation.bring_top.layer_observe = true;
+                }
+            }
+        }
     }
 }
 
@@ -5782,15 +5919,22 @@ fn service_owner_operation<C: Connection>(
     {
         return Ok(());
     }
-    // Here's first NativeHere::owned() is the fresh pre-mutation check. Its
-    // native failure must enter D3 fatal handling; a mismatch is OwnershipLost.
+    // Placement borrows the one active slot before the legacy ownership check.
+    // Both phases validate ownership through the shared D4.1 failure policy.
     if owner.service_here_with(host.conn, |active, selection, control_xid, reply| {
         let mut here = NativeHere {
             visibility: host,
             selection,
             control_xid,
         };
-        service_here_owner_with(active, &mut here, reply)
+        if active
+            .as_ref()
+            .is_some_and(|op| op.request.command == control::Command::Recover)
+        {
+            service_recover_owner_with(active, &mut here, reply)
+        } else {
+            service_here_owner_with(active, &mut here, reply)
+        }
     })? {
         return Ok(());
     }
@@ -5811,8 +5955,9 @@ fn service_owner_operation<C: Connection>(
                 operation.detail.reason
             };
             let result = match operation.request.command {
-                control::Command::BringHere => unreachable!("Here uses its own owner finalizer"),
-                control::Command::Recover => unsupported_placement(operation),
+                control::Command::BringHere | control::Command::Recover => {
+                    unreachable!("Placement uses the shared owner finalizer")
+                }
                 control::Command::Hide => hide_result(operation, control::Status::Failed, reason),
                 control::Command::Show => {
                     show_result(operation, control::Status::Failed, reason, None)
@@ -5844,8 +5989,8 @@ fn service_owner_operation<C: Connection>(
     }
 }
 
-/// Finalize any still-active Here before ordinary owner cleanup can classify
-/// it as Closing. No Here slot means the exact legacy fatal error passes through.
+/// Finalize still-active placement before global cleanup can classify it as
+/// Closing. Legacy commands and cleared slots pass the exact error through.
 fn fail_owner_operation<C: Connection>(
     owner: &mut ControlWindow,
     host: &mut NativeVisibility<'_, C>,
@@ -5959,7 +6104,7 @@ fn run_probe(
     // Every native failure, including all Event::Error sites and poll/read/
     // dispatch failures, leaves through this boundary before global cleanup.
     // Intentional lifecycle exits use the existing ProbeTermination separately.
-    let outcome = (|| loop {
+    let mut outcome = (|| loop {
         let now = Instant::now();
         if duration_deadline.is_some_and(|dl| now >= dl) {
             // Ordered owner cleanup publishes Closing before layer/input teardown.
@@ -5971,6 +6116,7 @@ fn run_probe(
         service_owner_operation(
             owner,
             &mut NativeVisibility {
+                recover_owner: None,
                 conn,
                 root,
                 atoms: &visibility_atoms,
@@ -6074,6 +6220,7 @@ fn run_probe(
             && runtime.body == BodyAvailability::Ready
         {
             restore_deferred_input(&mut NativeVisibility {
+                recover_owner: None,
                 conn,
                 root,
                 atoms: &visibility_atoms,
@@ -6097,6 +6244,7 @@ fn run_probe(
                 owner,
                 &event,
                 &mut NativeVisibility {
+                    recover_owner: None,
                     conn,
                     root,
                     atoms: &visibility_atoms,
@@ -6120,6 +6268,7 @@ fn run_probe(
                 service_owner_operation(
                     owner,
                     &mut NativeVisibility {
+                        recover_owner: None,
                         conn,
                         root,
                         atoms: &visibility_atoms,
@@ -6147,6 +6296,29 @@ fn run_probe(
                     window.window_resource.externally_destroyed();
                     runtime.unavailable(true);
                 }
+                if owner
+                    .active()
+                    .is_some_and(|op| op.request.command == control::Command::Recover)
+                {
+                    service_owner_operation(
+                        owner,
+                        &mut NativeVisibility {
+                            recover_owner: None,
+                            conn,
+                            root,
+                            atoms: &visibility_atoms,
+                            layout_atoms: atoms,
+                            selected_monitor,
+                            window,
+                            runtime,
+                            bounds: &mut bounds,
+                            area: &mut usable_area,
+                        },
+                    )?;
+                    if runtime.body == BodyAvailability::Destroyed {
+                        return Ok(None);
+                    }
+                }
                 continue;
             }
             if visibility_event(&event, root, window.window, &visibility_atoms, atoms) {
@@ -6160,6 +6332,7 @@ fn run_probe(
                             service_owner_operation(
                                 owner,
                                 &mut NativeVisibility {
+                                    recover_owner: None,
                                     conn,
                                     root,
                                     atoms: &visibility_atoms,
@@ -6209,6 +6382,7 @@ fn run_probe(
                 }
                 if owner.active().is_none() && runtime.input_fence.blocked {
                     restore_deferred_input(&mut NativeVisibility {
+                        recover_owner: None,
                         conn,
                         root,
                         atoms: &visibility_atoms,
@@ -6655,6 +6829,7 @@ fn run_probe(
         service_owner_operation(
             owner,
             &mut NativeVisibility {
+                recover_owner: None,
                 conn,
                 root,
                 atoms: &visibility_atoms,
@@ -6683,6 +6858,7 @@ fn run_probe(
                 owner,
                 &event,
                 &mut NativeVisibility {
+                    recover_owner: None,
                     conn,
                     root,
                     atoms: &visibility_atoms,
@@ -6739,10 +6915,24 @@ fn run_probe(
             .min();
         wait_x11(conn, timeout)?;
     })();
+    // Settle an internal Recover while its borrowed host still exists. A failed
+    // shutdown ownership lookup/publication must enter the same fatal boundary,
+    // rather than letting later global cleanup emit a misleading Closing reply.
+    if outcome.is_ok()
+        && owner
+            .active()
+            .is_some_and(|op| op.request.command == control::Command::Recover)
+    {
+        outcome = owner
+            .closing(conn)
+            .and_then(|()| owner.finish_remote(conn))
+            .and(outcome);
+    }
     finish_probe_run_with(outcome, |original| {
         fail_owner_operation(
             owner,
             &mut NativeVisibility {
+                recover_owner: None,
                 conn,
                 root,
                 atoms: &visibility_atoms,
@@ -6759,7 +6949,7 @@ fn run_probe(
 }
 
 /// Intentional termination retains its existing classification. Only a fatal
-/// loop error invokes Here-aware teardown; every error object is moved intact.
+/// loop error invokes placement-aware teardown; every error object is moved intact.
 fn finish_probe_run_with(
     outcome: Result<Option<ProbeTermination>, HostError>,
     fatal: impl FnOnce(HostError) -> HostError,
@@ -17544,13 +17734,8 @@ mod here_service_tests {
         }
     }
     #[test]
-    fn external_fatal_policy_leaves_legacy_commands_and_recover_untouched() {
-        for command in [
-            Command::Hide,
-            Command::Show,
-            Command::BringTop,
-            Command::Recover,
-        ] {
+    fn external_fatal_policy_leaves_legacy_commands_untouched() {
+        for command in [Command::Hide, Command::Show, Command::BringTop] {
             let mut host = Fake::new(true, false, L::Normal);
             let mut active = None;
             let destination = if command == Command::Recover {
@@ -17600,7 +17785,7 @@ mod here_service_tests {
             .split("fn finish_probe_run_with(")
             .next()
             .unwrap();
-        let loop_start = probe.find("let outcome = (|| loop {").unwrap();
+        let loop_start = probe.find("let mut outcome = (|| loop {").unwrap();
         let loop_end = probe.rfind("    })();").unwrap();
         let sites: Vec<_> = probe.match_indices("Event::Error(error)").collect();
         assert_eq!(
@@ -17719,6 +17904,9 @@ mod here_service_tests {
             fn fence(&mut self) -> Result<(), HostError> {
                 self.here.fence()
             }
+            fn abort_recovery_layer(&mut self) {
+                self.here.runtime.layers.abort();
+            }
             fn desktop(
                 &mut self,
                 destination: u32,
@@ -17826,6 +18014,9 @@ mod here_service_tests {
                     || shape.map(|()| 2000),
                 )?;
                 Ok(true)
+            }
+            fn recover_owned(&mut self) -> Result<bool, HostError> {
+                self.here.owned()
             }
             fn recover_evidence(&mut self, destination: u32) -> Result<HereEvidence, HostError> {
                 self.here.evidence(destination)
@@ -17965,6 +18156,811 @@ mod here_service_tests {
             fn layer_deadline(&self) -> Option<Instant> {
                 self.here.runtime.layers.deadline()
             }
+        }
+
+        fn owner(h: &Host) -> HereOwner {
+            HereOwner::recover(h.here.now, 2)
+        }
+
+        fn tick(owner: &mut HereOwner, h: &mut Host) -> Result<(), HostError> {
+            owner.service(|active, _, _, reply| service_recover_owner_with(active, h, reply))?;
+            Ok(())
+        }
+
+        fn wake(owner: &mut HereOwner) {
+            mark_remote_observation(owner.active_mut().unwrap(), false);
+        }
+
+        fn finish_owner(owner: &mut HereOwner, h: &mut Host) -> Result<(), HostError> {
+            for _ in 0..8 {
+                if owner.active().is_none() {
+                    return Ok(());
+                }
+                tick(owner, h)?;
+                if let Some(op) = owner.active_mut() {
+                    if let Some((_, deadline)) = op.show.correction.or_else(|| {
+                        (op.recover_phase == RecoverPhase::Here)
+                            .then(|| op.placement.correction())
+                            .flatten()
+                    }) {
+                        h.here.now = h.here.now.max(deadline);
+                    }
+                    if op.recover_phase == RecoverPhase::Here && h.here.count("desktop") > 0 {
+                        h.here.target();
+                    } else if h.here.count("map") > 0 {
+                        h.restored();
+                    }
+                    mark_remote_observation(op, false);
+                }
+            }
+            panic!("Recover owner failed to terminate");
+        }
+
+        fn assert_terminal(
+            owner: &mut HereOwner,
+            h: &Host,
+            reason: Reason,
+        ) -> control::TerminalResponse {
+            assert!(owner.active().is_none());
+            let replies = owner.replies();
+            assert_eq!(replies.len(), 1);
+            let reply = replies[0];
+            assert_eq!(reply.detail.reason, reason);
+            if reply.status != Status::Success {
+                assert_eq!(
+                    reply.detail.placement.current,
+                    control::PlacementConfirmation::default()
+                );
+                assert!(!reply.detail.progress.input_ready);
+                assert!(!reply.detail.progress.above_confirmed);
+                assert!(!reply.detail.progress.not_minimized_confirmed);
+                let history = reply.detail.placement.history;
+                assert_eq!(
+                    reply.status,
+                    if history.relocation_confirmed || history.restoration_confirmed {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    }
+                );
+            }
+            assert!(h.here.runtime.layers.pending().is_none());
+            owner.shutdown(true);
+            owner.shutdown(false);
+            assert_eq!(
+                owner.replies(),
+                replies,
+                "global cleanup cannot reply twice"
+            );
+            reply
+        }
+
+        #[test]
+        fn actual_owner_handoff_progresses_before_sleep_and_then_waits_without_polling() {
+            let mut h = Host::new(true, true, L::Below);
+            let mut owner = owner(&h);
+            let total = owner.active().unwrap().deadline;
+            tick(&mut owner, &mut h).unwrap();
+            tick(&mut owner, &mut h).unwrap(); // settle possible-dispatch observation
+            assert!(!remote_service_due(owner.active().unwrap(), h.here.now));
+            let log = h.here.log.clone();
+            for _ in 0..8 {
+                tick(&mut owner, &mut h).unwrap();
+            }
+            assert_eq!(h.here.log, log);
+            h.here.target();
+            wake(&mut owner);
+            tick(&mut owner, &mut h).unwrap();
+            let op = owner.active().unwrap();
+            assert_eq!(op.recover_phase, RecoverPhase::Top);
+            assert_eq!(
+                h.here.count("map"),
+                1,
+                "handoff starts Top in the same service turn"
+            );
+            assert_eq!(op.deadline, total);
+            assert_eq!(
+                remote_operation_deadline(op),
+                op.bring_top.visibility_cutoff
+            );
+            assert!(!remote_service_due(op, h.here.now));
+            let log = h.here.log.clone();
+            tick(&mut owner, &mut h).unwrap();
+            assert_eq!(h.here.log, log);
+            h.restored();
+            wake(&mut owner);
+            finish_owner(&mut owner, &mut h).unwrap();
+            let reply = assert_terminal(&mut owner, &h, Reason::None);
+            assert_eq!(reply.status, Status::Success);
+            assert_eq!(
+                reply.detail.placement.history,
+                control::RecoveryHistory {
+                    relocation_confirmed: true,
+                    restoration_confirmed: true,
+                }
+            );
+            assert!(local_layer_service_allowed(owner.active()));
+        }
+
+        #[test]
+        fn actual_scheduler_honors_each_phase_and_correction_boundary_exactly() {
+            for top in [false, true] {
+                let mut h = Host::new(false, top, L::Normal);
+                h.here.refuse_correction = true;
+                let mut owner = owner(&h);
+                if top {
+                    tick(&mut owner, &mut h).unwrap();
+                    h.restored();
+                    wake(&mut owner);
+                }
+                h.here.actual.x = -100;
+                tick(&mut owner, &mut h).unwrap();
+                tick(&mut owner, &mut h).unwrap();
+                let op = owner.active().unwrap();
+                let cutoff = if top {
+                    op.bring_top.visibility_cutoff
+                } else {
+                    here_cutoff(op)
+                };
+                let correction = op.placement.correction().unwrap().1;
+                assert!(correction < cutoff);
+                assert_eq!(remote_operation_deadline(op), correction);
+                assert!(!remote_service_due(
+                    op,
+                    correction - Duration::from_nanos(1)
+                ));
+                assert!(remote_service_due(op, correction));
+                h.here.now = correction;
+                tick(&mut owner, &mut h).unwrap();
+                assert_terminal(&mut owner, &h, Reason::Unverifiable);
+                assert_eq!(h.here.count("correct"), 1);
+            }
+            for phase in 0..3 {
+                let mut h = Host::new(phase == 0, phase == 1, L::Normal);
+                h.layer_changes = false;
+                let mut owner = owner(&h);
+                tick(&mut owner, &mut h).unwrap();
+                tick(&mut owner, &mut h).unwrap();
+                let op = owner.active().unwrap();
+                let cutoff = match phase {
+                    0 => op.deadline - Duration::from_millis(3500),
+                    1 => op.bring_top.visibility_cutoff,
+                    _ => op.recover_layer_cutoff().unwrap(),
+                };
+                assert_eq!(remote_operation_deadline(op), cutoff);
+                assert!(!remote_service_due(op, cutoff - Duration::from_nanos(1)));
+                assert!(remote_service_due(op, cutoff));
+                h.here.now = cutoff;
+                tick(&mut owner, &mut h).unwrap();
+                assert_terminal(&mut owner, &h, Reason::ConfirmationTimeout);
+            }
+        }
+
+        #[test]
+        fn strict_event_families_are_phase_owned_and_layer_configure_reconciles_movement() {
+            let (visibility, layout_atoms) = atoms();
+            for phase in 0..3 {
+                let mut h = Host::new(phase == 0, phase == 1, L::Normal);
+                h.layer_changes = false;
+                let mut owner = owner(&h);
+                tick(&mut owner, &mut h).unwrap();
+                tick(&mut owner, &mut h).unwrap();
+                let original = *owner.active().unwrap();
+                assert!(!remote_service_due(&original, h.here.now));
+                assert!(!local_layer_service_allowed(Some(&original)));
+                assert_eq!(remote_owns_placement(&original), phase != 2);
+                assert_eq!(remote_owns_layer(&original), phase == 2);
+                for kind in 0..15 {
+                    let mut op = original;
+                    let e = if kind == 14 {
+                        Event::RandrNotify(x11rb::protocol::randr::NotifyEvent {
+                            response_type: 0,
+                            sub_code: x11rb::protocol::randr::Notify::RESOURCE_CHANGE,
+                            sequence: 0,
+                            u: x11rb::protocol::randr::ResourceChange {
+                                timestamp: 0,
+                                window: 1,
+                            }
+                            .into(),
+                        })
+                    } else {
+                        event(kind)
+                    };
+                    let consumed = route_here_evidence_event(
+                        Some(&mut op),
+                        &e,
+                        1,
+                        100,
+                        &visibility,
+                        &layout_atoms,
+                    );
+                    assert_eq!(
+                        consumed,
+                        !(phase == 2 && kind == 5),
+                        "phase={phase} kind={kind}"
+                    );
+                    assert!(remote_service_due(&op, h.here.now));
+                    assert_eq!(op.deadline, original.deadline);
+                    assert_eq!(
+                        op.bring_top.layer_admitted,
+                        original.bring_top.layer_admitted
+                    );
+                    assert_eq!(op.placement.proof.history, original.placement.proof.history);
+                    assert_eq!(
+                        op.placement.proof.current.geometry,
+                        control::GeometryProof::Unknown
+                    );
+                    assert!(!op.detail.progress.input_ready);
+                    assert!(
+                        !op.show.layout_interrupted,
+                        "equal strict layout must be re-read, not rejected"
+                    );
+                }
+                for e in [property(999, 22), property(1, 999)] {
+                    let mut op = original;
+                    assert!(!route_here_evidence_event(
+                        Some(&mut op),
+                        &e,
+                        1,
+                        100,
+                        &visibility,
+                        &layout_atoms
+                    ));
+                    assert!(!remote_service_due(&op, h.here.now));
+                }
+            }
+        }
+
+        #[test]
+        fn owner_native_fault_matrix_keeps_original_error_one_read_one_reply_and_no_retry() {
+            for corrected in [false, true] {
+                let mut reference = Host::new(!corrected, true, L::Below);
+                if corrected {
+                    reference.here.actual.x = -100;
+                }
+                let mut reference_owner = owner(&reference);
+                finish_owner(&mut reference_owner, &mut reference).unwrap();
+                let mut counts = std::collections::HashMap::new();
+                for &step in reference
+                    .here
+                    .log
+                    .iter()
+                    .filter(|&&s| !["fence", "restrict", "popup"].contains(&s))
+                {
+                    let nth = counts.entry(step).or_insert(0);
+                    *nth += 1;
+                    // Includes ownership at/after handoff, user-time/map, every
+                    // strict read, correction, SHAPE, removal/addition and final proof.
+                    let mut h = Host::new(!corrected, true, L::Below);
+                    if corrected {
+                        h.here.actual.x = -100;
+                    }
+                    h.here.faults.push((step, *nth));
+                    let mut owner = owner(&h);
+                    let error = finish_owner(&mut owner, &mut h)
+                        .err()
+                        .unwrap_or_else(|| panic!("fault not reached: {step}/{nth}"));
+                    assert_eq!(
+                        error.downcast_ref::<NativeFault>(),
+                        Some(&NativeFault(step, *nth))
+                    );
+                    let index = h
+                        .here
+                        .log
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| **s == step)
+                        .nth(*nth - 1)
+                        .unwrap()
+                        .0;
+                    let after = &h.here.log[index + 1..];
+                    assert!(
+                        !after.iter().any(|s| [
+                            "desktop", "zero", "map", "correct", "shape", "remove", "above"
+                        ]
+                        .contains(s)),
+                        "retry after {step}/{nth}: {after:?}"
+                    );
+                    assert!(
+                        after.iter().filter(|&&s| s == "observe").count() <= 1,
+                        "one history round"
+                    );
+                    assert!(after.iter().filter(|&&s| s == "layout").count() <= 2);
+                    assert!(
+                        after.iter().filter(|&&s| s == "fence").count() <= 1,
+                        "one safety cleanup"
+                    );
+                    let reply = assert_terminal(&mut owner, &h, Reason::X11Failure);
+                    assert_eq!(reply.detail.stage, Stage::Shutdown);
+                }
+            }
+        }
+
+        #[test]
+        fn every_owner_query_mismatch_stops_mutation_and_is_distinct_from_native_failure() {
+            let mut reference = Host::new(true, true, L::Below);
+            let mut reference_owner = owner(&reference);
+            finish_owner(&mut reference_owner, &mut reference).unwrap();
+            for nth in 1..=reference.here.count("owner") {
+                let mut h = Host::new(true, true, L::Below);
+                h.here.lose_at = Some(("owner", nth));
+                let mut owner = owner(&h);
+                assert!(finish_owner(&mut owner, &mut h).is_err());
+                assert_terminal(&mut owner, &h, Reason::OwnershipLost);
+                let index = h
+                    .here
+                    .log
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| **s == "owner")
+                    .nth(nth - 1)
+                    .unwrap()
+                    .0;
+                assert!(
+                    !h.here.log[index + 1..].iter().any(|s| [
+                        "empty", "desktop", "zero", "map", "correct", "shape", "remove", "above"
+                    ]
+                    .contains(s)),
+                    "mutation after ownership loss #{nth}"
+                );
+            }
+        }
+
+        /// Real owner turns prepare boundaries; no public request can seed them.
+        fn checkpoint(phase: usize) -> (Host, HereOwner) {
+            let mut h = Host::new(true, phase != 2, L::Below);
+            h.layer_changes = false;
+            let mut owner = owner(&h);
+            if phase == 0 {
+                return (h, owner);
+            }
+            tick(&mut owner, &mut h).unwrap();
+            if phase == 1 {
+                return (h, owner);
+            }
+            h.here.target();
+            if phase == 2 {
+                h.here.current.transitional = true;
+            }
+            wake(&mut owner);
+            tick(&mut owner, &mut h).unwrap();
+            if phase <= 3 {
+                return (h, owner);
+            }
+            h.restored();
+            if phase == 4 {
+                h.here.actual.x = -100;
+            }
+            wake(&mut owner);
+            tick(&mut owner, &mut h).unwrap();
+            if phase <= 5 {
+                return (h, owner);
+            }
+            h.here.current.layer = L::Normal;
+            wake(&mut owner);
+            tick(&mut owner, &mut h).unwrap();
+            if phase == 7 {
+                h.here.current.layer = L::Above;
+            }
+            (h, owner)
+        }
+
+        fn external(owner: &mut HereOwner, h: &mut Host, original: HostError) -> HostError {
+            finish_probe_run_with(Err(original), |original| {
+                let mut original = Some(original);
+                match owner.service(|active, _, _, reply| {
+                    fail_here_owner_with(active, h, reply, original.take().unwrap())
+                }) {
+                    Err(original) => original,
+                    Ok(false) => original.unwrap(),
+                    Ok(true) => panic!("fatal owner must return its original error"),
+                }
+            })
+            .unwrap_err()
+        }
+
+        #[test]
+        fn external_fatal_matrix_preserves_original_error_history_and_one_bounded_read() {
+            for phase in 0..8 {
+                for boundary in ["async", "buffered error", "batch read", "poll", "flush"] {
+                    for fail_reply in [false, true] {
+                        let (mut h, mut owner) = checkpoint(phase);
+                        let prior = h.here.log.len();
+                        owner.fail_reply(fail_reply);
+                        let original: HostError = Box::new(NativeFault(boundary, phase));
+                        let address = error_address(&original);
+                        let error = external(&mut owner, &mut h, original);
+                        assert_eq!(error_address(&error), address);
+                        let after = &h.here.log[prior..];
+                        assert!(!after.iter().any(|s| [
+                            "desktop", "zero", "map", "correct", "shape", "remove", "above"
+                        ]
+                        .contains(s)));
+                        assert_eq!(
+                            after.iter().filter(|&&s| s == "observe").count(),
+                            usize::from(phase != 0)
+                        );
+                        assert!(after.iter().filter(|&&s| s == "fence").count() <= 1);
+                        let reply = assert_terminal(&mut owner, &h, Reason::X11Failure);
+                        assert_eq!(reply.detail.stage, Stage::Shutdown);
+                        assert_eq!(
+                            reply.detail.placement.history.relocation_confirmed,
+                            phase >= 2
+                        );
+                        assert_eq!(
+                            reply.detail.placement.history.restoration_confirmed,
+                            phase >= 4
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn fatal_history_uses_here_preservation_and_top_restoration_interpretations() {
+            // Here can independently confirm unexpected restoration, but never hand off.
+            let (mut h, mut owner) = checkpoint(1);
+            h.restored();
+            let original: HostError = Box::new(NativeFault("Here restoration", 1));
+            external(&mut owner, &mut h, original);
+            let reply = assert_terminal(&mut owner, &h, Reason::X11Failure);
+            assert!(!reply.detail.placement.history.relocation_confirmed);
+            assert!(reply.detail.placement.history.restoration_confirmed);
+            assert_eq!(h.here.count("zero"), 0);
+            assert_eq!(h.here.count("above"), 0);
+
+            // Possibly dispatched relocation can first be confirmed on the fatal read.
+            let (mut h, mut owner) = checkpoint(1);
+            h.here.target();
+            external(
+                &mut owner,
+                &mut h,
+                Box::new(NativeFault("Here relocation", 1)),
+            );
+            assert!(
+                assert_terminal(&mut owner, &h, Reason::X11Failure)
+                    .detail
+                    .placement
+                    .history
+                    .relocation_confirmed
+            );
+
+            // Top's single read can first establish restoration after a map.
+            let (mut h, mut owner) = checkpoint(3);
+            h.restored();
+            external(
+                &mut owner,
+                &mut h,
+                Box::new(NativeFault("Top restoration", 1)),
+            );
+            let reply = assert_terminal(&mut owner, &h, Reason::X11Failure);
+            assert!(reply.detail.placement.history.restoration_confirmed);
+            assert_eq!(h.here.count("map"), 1);
+            assert_eq!(h.here.count("shape"), 0);
+        }
+
+        #[test]
+        fn fatal_cleanup_read_reply_failure_combinations_keep_original_and_do_not_retry() {
+            for cleanup_fails in [false, true] {
+                for history_fails in [false, true] {
+                    for reply_fails in [false, true] {
+                        let (mut h, mut owner) = checkpoint(5);
+                        let fences = h.here.count("fence");
+                        if cleanup_fails {
+                            h.here.faults.push(("empty", h.here.count("empty") + 1));
+                        }
+                        if history_fails {
+                            h.here.faults.push(("layout", h.here.count("layout") + 1));
+                        }
+                        owner.fail_reply(reply_fails);
+                        let original: HostError = Box::new(NativeFault("primary", 7));
+                        let address = error_address(&original);
+                        let error = external(&mut owner, &mut h, original);
+                        assert_eq!(error_address(&error), address);
+                        assert_eq!(h.here.count("fence"), fences + 1);
+                        assert_terminal(&mut owner, &h, Reason::X11Failure);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn fatal_history_is_skipped_without_live_body_or_trustworthy_ownership() {
+            for destroyed in [false, true] {
+                let (mut h, mut owner) = checkpoint(5);
+                if destroyed {
+                    h.here.runtime.unavailable(true);
+                } else {
+                    h.here.owned = false;
+                }
+                let reads = h.here.count("observe");
+                external(&mut owner, &mut h, Box::new(NativeFault("outer", 1)));
+                assert_eq!(h.here.count("observe"), reads);
+                assert_terminal(&mut owner, &h, Reason::X11Failure);
+            }
+        }
+
+        #[test]
+        fn native_failure_after_ordinary_invalidation_has_x11_diagnostic_priority() {
+            let (mut h, mut owner) = checkpoint(5);
+            owner
+                .active_mut()
+                .unwrap()
+                .placement
+                .invalidate_here(Reason::LayoutChanged);
+            external(
+                &mut owner,
+                &mut h,
+                Box::new(NativeFault("outer after drift", 1)),
+            );
+            assert_terminal(&mut owner, &h, Reason::X11Failure);
+        }
+
+        #[test]
+        fn orderly_termination_preserves_recover_history_and_never_enters_fatal_policy() {
+            for phase in 0..8 {
+                for termination in [
+                    Some(ProbeTermination::WmClose),
+                    Some(ProbeTermination::DurationExpired),
+                    Some(ProbeTermination::ControlEndpointLost),
+                    None,
+                ] {
+                    let (h, mut owner) = checkpoint(phase);
+                    let history = owner.active().unwrap().placement.proof.history;
+                    let lost = matches!(termination, Some(ProbeTermination::ControlEndpointLost));
+                    assert_eq!(
+                        finish_probe_run_with(Ok(termination), |_| panic!(
+                            "orderly shutdown is not a native failure"
+                        ))
+                        .is_err(),
+                        lost
+                    );
+                    owner.shutdown(!lost);
+                    let reply = owner.replies()[0];
+                    assert_eq!(reply.detail.placement.history, history);
+                    assert_eq!(
+                        reply.detail.reason,
+                        if lost {
+                            Reason::OwnershipLost
+                        } else {
+                            Reason::Closing
+                        }
+                    );
+                    assert_eq!(
+                        reply.detail.placement.current,
+                        control::PlacementConfirmation::default()
+                    );
+                    assert!(!reply.detail.progress.input_ready);
+                    assert!(owner.active().is_none());
+                    owner.shutdown(true);
+                    assert_eq!(owner.replies().len(), 1);
+                    assert_eq!(h.here.count("desktop"), usize::from(phase > 0));
+                }
+            }
+        }
+
+        #[test]
+        fn body_destruction_is_nonfatal_and_does_not_become_x11_failure() {
+            for phase in 0..8 {
+                let (mut h, mut owner) = checkpoint(phase);
+                h.here.runtime.unavailable(true);
+                h.here.terminal = Some(Visibility::Destroyed);
+                wake(&mut owner);
+                tick(&mut owner, &mut h).unwrap();
+                assert_terminal(&mut owner, &h, Reason::BodyDestroyed);
+            }
+        }
+
+        #[test]
+        fn incoming_transport_owner_loss_and_query_error_use_the_same_owner_terminal_policy() {
+            for phase in [1, 3, 5, 6] {
+                for during_validation in [false, true] {
+                    for query_error in [false, true] {
+                        let (mut h, mut owner) = checkpoint(phase);
+                        let prior = h.here.log.len();
+                        let original =
+                            owner.request_ownership_failure(during_validation, query_error);
+                        let address = error_address(&original);
+                        let error = external(&mut owner, &mut h, original);
+                        assert_eq!(error_address(&error), address);
+                        assert_terminal(
+                            &mut owner,
+                            &h,
+                            if query_error {
+                                Reason::X11Failure
+                            } else {
+                                Reason::OwnershipLost
+                            },
+                        );
+                        if !query_error {
+                            assert_eq!(h.here.log.len(), prior);
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn expected_layer_transitions_and_configure_require_fresh_final_geometry() {
+            let (mut h, mut owner) = checkpoint(5);
+            let (visibility, layout_atoms) = atoms();
+            let deadline = owner.active().unwrap().deadline;
+            h.here.current.layer = L::Normal;
+            assert!(route_here_evidence_event(
+                owner.active_mut(),
+                &event(1),
+                1,
+                100,
+                &visibility,
+                &layout_atoms
+            ));
+            tick(&mut owner, &mut h).unwrap();
+            assert_eq!(h.here.count("above"), 1);
+            assert_eq!(owner.active().unwrap().deadline, deadline);
+            let op = owner.active_mut().unwrap();
+            op.placement.proof.current.geometry = control::GeometryProof::Verified;
+            op.detail.progress.input_ready = true;
+            assert!(
+                !route_here_evidence_event(Some(op), &event(5), 1, 100, &visibility, &layout_atoms),
+                "Configure stays on ordinary reconciliation path"
+            );
+            assert_eq!(
+                op.placement.proof.current.geometry,
+                control::GeometryProof::Unknown
+            );
+            assert!(!op.detail.progress.input_ready);
+            h.here.current.layer = L::Above;
+            h.here.actual.x = -100;
+            tick(&mut owner, &mut h).unwrap();
+            assert_terminal(&mut owner, &h, Reason::Unverifiable);
+            assert_eq!(
+                h.here.count("correct"),
+                0,
+                "ordinary movement cannot grant a Recover correction"
+            );
+        }
+
+        #[test]
+        fn recover_phase_deadlines_survive_sustained_bounded_batches_without_polling() {
+            let (visibility, layout_atoms) = atoms();
+            for phase in [1, 3, 5] {
+                let (mut h, mut owner) = checkpoint(phase);
+                tick(&mut owner, &mut h).unwrap();
+                let deadline = remote_operation_deadline(owner.active().unwrap());
+                let reads = h.here.count("observe");
+                let mut queue = VecDeque::from(vec![property(999, 99); 4000]);
+                let mut buffered = Some(property(999, 99));
+                let mut processed = 0;
+                while owner.active().is_some() {
+                    let batch = drain_events_bounded(&mut buffered, 64, || {
+                        Ok::<_, HostError>(queue.pop_front())
+                    })
+                    .unwrap();
+                    assert!(batch.len() <= 64);
+                    for e in batch {
+                        h.here.now += Duration::from_millis(1);
+                        processed += 1;
+                        if owner
+                            .active()
+                            .is_some_and(|op| h.here.now >= remote_operation_deadline(op))
+                        {
+                            tick(&mut owner, &mut h).unwrap();
+                            assert_eq!(h.here.now, deadline);
+                        }
+                        assert!(!route_here_evidence_event(
+                            owner.active_mut(),
+                            &e,
+                            1,
+                            100,
+                            &visibility,
+                            &layout_atoms
+                        ));
+                    }
+                    tick(&mut owner, &mut h).unwrap();
+                }
+                assert!(processed > 64);
+                assert!(
+                    h.here.count("observe") <= reads + 3,
+                    "unrelated events do not poll"
+                );
+                assert_terminal(&mut owner, &h, Reason::ConfirmationTimeout);
+            }
+        }
+
+        #[test]
+        fn both_consumed_request_boundaries_immediately_service_internal_recover() {
+            for _site in ["batch", "lookahead"] {
+                let mut h = Host::new(true, true, L::Below);
+                let mut active = None;
+                route_owner_request_with(
+                    &mut active,
+                    &mut h,
+                    |active, h| {
+                        *active = Some(h.operation());
+                        Ok(true)
+                    },
+                    |active, h| service_recover_owner_with(active, h, |_| panic!("pending")),
+                )
+                .unwrap();
+                assert_eq!(h.here.count("desktop"), 1);
+                let deadline = active.as_ref().unwrap().deadline;
+                h.here.target();
+                mark_remote_observation(active.as_mut().unwrap(), false);
+                service_recover_owner_with(&mut active, &mut h, |_| panic!("Top still pending"))
+                    .unwrap();
+                assert_eq!(h.here.count("map"), 1);
+                assert_eq!(active.as_ref().unwrap().deadline, deadline);
+                assert!(!remote_service_due(active.as_ref().unwrap(), h.here.now));
+            }
+        }
+
+        #[test]
+        fn completed_recover_reply_failure_clears_the_slot_without_undoing_success() {
+            for history in [false, true] {
+                let mut h = Host::new(history, history, L::Below);
+                let mut owner = owner(&h);
+                owner.fail_reply(true);
+                assert!(finish_owner(&mut owner, &mut h).is_err());
+                let reply = assert_terminal(&mut owner, &h, Reason::None);
+                assert_eq!(reply.status, Status::Success);
+                assert!(h.here.visible_ready());
+                assert_eq!(h.here.current.layer, L::Above);
+                assert_eq!(
+                    reply.detail.placement.history,
+                    control::RecoveryHistory {
+                        relocation_confirmed: history,
+                        restoration_confirmed: history,
+                    }
+                );
+                tick(&mut owner, &mut h).unwrap();
+                assert_eq!(owner.replies().len(), 1);
+            }
+        }
+
+        #[test]
+        fn public_recover_guards_and_owner_wait_boundaries_remain_reachable_as_specified() {
+            assert!(!HELP.contains("--recover"));
+            assert!(parse_args(["--recover"]).is_err());
+            let source = include_str!("main.rs");
+            let service = source
+                .split("fn service_remote_with(")
+                .nth(1)
+                .unwrap()
+                .split("fn unsupported_placement(")
+                .next()
+                .unwrap();
+            assert!(service.contains("operation.request.command == control::Command::Recover"));
+            assert!(service.contains("return Ok(Some(unsupported_placement(operation)))"));
+            assert!(!service.contains("service_recover_with("));
+            let probe = source
+                .split("fn run_probe(")
+                .nth(1)
+                .unwrap()
+                .split("fn finish_probe_run_with(")
+                .next()
+                .unwrap();
+            assert_eq!(probe.matches("route_owner_request(").count(), 2);
+            assert!(probe.contains("drain_events_bounded(&mut buffered_event, 64"));
+            assert!(probe.contains(".chain(remote_deadline(owner))"));
+            assert!(probe.contains(".closing(conn)"));
+            assert!(probe.contains("owner.finish_remote(conn)"));
+            assert!(
+                probe.rfind("service_owner_operation(").unwrap()
+                    < probe.rfind("wait_x11(conn, timeout)").unwrap()
+            );
+            let transport = include_str!("x11/control.rs");
+            let route = transport
+                .split("fn route_request_with(")
+                .nth(1)
+                .unwrap()
+                .split("pub enum CallerOutcome")
+                .next()
+                .unwrap();
+            assert!(route.contains("if request.command == Command::Recover"));
+            assert!(
+                route.contains("control::preflight_detail(Reason::Unsupported, Stage::Preflight)")
+            );
+            assert!(!route.contains("service_recover_with("));
         }
 
         fn assert_result(
