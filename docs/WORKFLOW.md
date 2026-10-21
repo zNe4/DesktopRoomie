@@ -17,7 +17,7 @@ Use the short structure recommended by the [OpenAI Codex best-practices guide](h
 - **Constraints:** scope exclusions, preserved behavior, stop conditions and explicit publication authority or prohibition.
 - **Done when:** required checks, reviewable artifacts, acceptance gates and completion report.
 
-Keep durable repository rules in AGENTS and link detailed contracts/evidence rather than repeating their history in each prompt. This convention preserves the roles, approval gates and publication restrictions below.
+Keep durable repository rules in AGENTS and link detailed contracts/evidence rather than repeating their history in each prompt. **For multi-checkpoint work, prefer one fresh Codex session per small approved task:** re-read current STATUS/mission files, pin the new local and live remote starting SHA, check a clean tree, and do not inherit prior session context as execution authority. Review/publish one checkpoint before authorizing another. This convention preserves the roles, approval gates and publication restrictions below.
 
 ## Lifecycle
 
