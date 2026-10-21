@@ -16,6 +16,14 @@ cargo run --manifest-path experiments/desktop-probe/Cargo.toml -- --duration 30
 cargo run --manifest-path experiments/desktop-probe/Cargo.toml -- --diagnose
 ```
 
-Left click toggles the test color; left drag moves the body. Right press/release opens Above / Normal / Below / Dismiss / Quit. A matching left press/release selects a row; an outside left click dismisses without replay. A fully covered body has no independent recovery control yet, so finite duration is useful for layer experiments. `--delay 2` delays mapping for a typing-focus check.
+Left click toggles the test color; left drag moves the body. Right press/release opens Above / Normal / Below / Dismiss / Quit. A matching left press/release selects a row; an outside left click dismisses without replay. `--delay 2` delays mapping for a typing-focus check; finite duration provides an exit fallback.
+
+Independent CLI commands control the running instance even when its menu is covered:
+
+- `--bring-top` restores if minimized and establishes Above on the body's existing workspace.
+- `--bring-here` moves the same body to the caller's workspace frozen at invocation, preserving its layer and genuine minimization.
+- `--recover` composes Bring Here with restoration if needed and Above, confirming local placement and safe input.
+
+These are explicit requests without typing-focus theft or a user-workspace switch. Ordinary workspace changes do not make the body follow automatically. There are no built-in global hotkeys; [optional Openbox bindings](docs/host/OPENBOX.md) remain user-managed. See [Stage-E acceptance](experiments/desktop-probe/M03.3-E-ACCEPTANCE.md) for tested Openbox/X11 behavior and qualifications.
 
 Start at the [documentation index](docs/INDEX.md) for current status, implemented architecture, acceptance evidence, and future plans. Contributors should read [AGENTS.md](AGENTS.md) and the assigned mission before editing.

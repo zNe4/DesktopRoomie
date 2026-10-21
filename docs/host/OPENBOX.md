@@ -2,7 +2,7 @@
 
 **Acceptance status update, 2026-10-21:** M03.2 remains final-accepted at H. M03.3 standalone `--bring-here` is Stage-D accepted at `4c67da0b09ffe7b69605ac4a415d256acf8abd23` ([CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762), 677 tests). Public `--recover` is **Stage-E accepted on the exercised Openbox/X11 host** at `aa00f8e94aff1cf2ef1ff6a6cecf734f822d5603`, [CI 39529051360](https://github.com/zNe4/DesktopRoomie/actions/runs/39529051360), 737 tests. Owner N01–N19 native scenarios passed with [documented limitations](../../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md). No host configuration edit or Stage-F/G authorization is implied.
 
-**Historical 2026-10-18 snapshot:** M03.2 H and M03.3 A/B/H0/C were the then-accepted foundation, before public Bring Here. Current status is the D4.1 acceptance above; dated F/G/H evidence stays tied to original tested revisions.
+**Historical 2026-10-18 snapshot:** M03.2 H and M03.3 A/B/H0/C were the then-accepted foundation, before public Bring Here. Current status is the Stage-E acceptance above; dated M03.2 F/G/H evidence stays tied to original tested revisions.
 
 DesktopRoomie should own safe same-instance control, WM-state verification, input cleanup and keyboard-focus isolation. Openbox should be reused for *optional* user conveniences such as keyboard shortcuts, application menus and session autostart. The application must be recoverable from its CLI without optional Openbox bindings; no global key-grabbing daemon, tray framework or automatic dotfile rewriting is required.
 

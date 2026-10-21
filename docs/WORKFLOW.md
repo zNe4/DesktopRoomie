@@ -8,6 +8,17 @@
 
 Work one assigned mission at a time. The active approved contract and explicit decisions determine scope; [AGENTS](../AGENTS.md) supplies mandatory operating restrictions. [INVARIANTS](INVARIANTS.md) captures accepted review obligations, [STATUS](STATUS.md) the current checkpoint, [ARCHITECTURE](ARCHITECTURE.md) implemented ownership, and [INDEX](INDEX.md) deeper evidence. Roadmaps, studies and historical next-action text are not authorization.
 
+## Mission prompts
+
+Use the short structure recommended by the [OpenAI Codex best-practices guide](https://learn.chatgpt.com/guides/best-practices):
+
+- **Goal:** the concrete result for this mission.
+- **Context:** relevant paths, approved contract, accepted evidence and expected branch/base.
+- **Constraints:** scope exclusions, preserved behavior, stop conditions and explicit publication authority or prohibition.
+- **Done when:** required checks, reviewable artifacts, acceptance gates and completion report.
+
+Keep durable repository rules in AGENTS and link detailed contracts/evidence rather than repeating their history in each prompt. This convention preserves the roles, approval gates and publication restrictions below.
+
 ## Lifecycle
 
 1. Just-in-time research by ChatGPT if the next decision needs it; existing repository/dependency/API inspection remains ordinary Codex work. Do not trigger unrelated R00 studies.
