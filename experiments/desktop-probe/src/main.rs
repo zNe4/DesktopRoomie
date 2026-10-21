@@ -6,7 +6,6 @@ mod layer;
 mod x11;
 
 use std::env;
-use std::os::unix::io::AsRawFd;
 use std::process;
 use std::time::{Duration, Instant};
 
@@ -23,6 +22,7 @@ use crate::geometry::{calculate_centered_origin, compute_valid_origin_bounds, Po
 use crate::interaction::{HostAction, InteractionManager, InteractionState, MenuOutcome};
 use crate::layer::{Layer, LayerController, Mutation, ObservedLayer, Step};
 use crate::x11::control::{Acquisition, ControlWindow};
+use crate::x11::events::{drain_events_bounded, wait_x11};
 use crate::x11::menu::{MenuPopup, PopupInputGate};
 use crate::x11::monitors::query_desktop_layout;
 use crate::x11::pointer::{grab_pointer, CaptureOwner, PointerCaptureTracker};
@@ -31,19 +31,7 @@ use crate::x11::state::{LayerAtoms, LayerSupport, PropertyResult, RemoteLayerIss
 use crate::x11::visual::find_alpha_visual;
 use crate::x11::window::{ConfigureReconciliation, ManagedProbeWindow};
 
-#[repr(C)]
-struct PollFd {
-    fd: std::os::raw::c_int,
-    events: std::os::raw::c_short,
-    revents: std::os::raw::c_short,
-}
-
-const POLLIN: std::os::raw::c_short = 0x0001;
 const CONFIRMATION_TIMEOUT: Duration = Duration::from_millis(150);
-
-extern "C" {
-    fn poll(fds: *mut PollFd, nfds: usize, timeout: std::os::raw::c_int) -> std::os::raw::c_int;
-}
 
 fn main() {
     let mode = match parse_args(env::args().skip(1)) {
@@ -5733,57 +5721,6 @@ fn publish_ready_if(
     Ok(())
 }
 
-fn wait_x11(
-    conn: &x11rb::rust_connection::RustConnection,
-    deadline: Option<Instant>,
-) -> Result<(), HostError> {
-    conn.flush()?;
-    let timeout_ms = deadline.map_or(-1, |deadline| {
-        // Round up: a sub-millisecond remaining interval should not spin on poll(0).
-        deadline
-            .saturating_duration_since(Instant::now())
-            .as_nanos()
-            .div_ceil(1_000_000)
-            .min(i32::MAX as u128) as i32
-    });
-    let mut pfd = PollFd {
-        fd: conn.stream().as_raw_fd(),
-        events: POLLIN,
-        revents: 0,
-    };
-    let result = unsafe { poll(&mut pfd, 1, timeout_ms) };
-    if result < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error.into());
-        }
-    } else if pfd.revents & (0x0008 | 0x0010 | 0x0020) != 0 {
-        return Err(format!("X11 socket unavailable (poll revents=0x{:x})", pfd.revents).into());
-    }
-    Ok(())
-}
-
-/// Drains available X11 events into a bounded batch, prepending any previously buffered event.
-pub fn drain_events_bounded<T, E, F>(
-    buffered_event: &mut Option<T>,
-    max_batch: usize,
-    mut poll_fn: F,
-) -> Result<Vec<T>, E>
-where
-    F: FnMut() -> Result<Option<T>, E>,
-{
-    let mut batch = Vec::new();
-    if let Some(ev) = buffered_event.take() {
-        batch.push(ev);
-    }
-    while batch.len() < max_batch {
-        match poll_fn()? {
-            Some(ev) => batch.push(ev),
-            None => break,
-        }
-    }
-    Ok(batch)
-}
 #[allow(clippy::too_many_arguments)]
 fn cancel_movement_with(
     interaction: &mut InteractionManager,

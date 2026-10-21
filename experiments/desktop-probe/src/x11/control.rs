@@ -15,6 +15,7 @@ use x11rb::protocol::{ErrorKind, Event};
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as WrapperExt;
 
+use super::events::{drain_events_bounded, wait_x11};
 use super::monitors::destination::{CallerDesktop, CallerDesktopAtoms, DestinationError};
 #[cfg(test)]
 use crate::control::ExitCode;
@@ -477,7 +478,7 @@ impl ControlWindow {
             deadline,
             Instant::now,
             || Ok(conn.poll_for_event_with_sequence()?),
-            |deadline| crate::wait_x11(conn, Some(deadline)),
+            |deadline| wait_x11(conn, Some(deadline)),
             |event, _| {
                 if self.handle_event(conn, &event)? {
                     return Err("Control endpoint lost during startup delay".into());
@@ -748,7 +749,7 @@ impl AcquisitionHost for NativeAcquisition<'_> {
             deadline,
             Instant::now,
             || Ok(self.conn.poll_for_event_with_sequence()?),
-            |deadline| crate::wait_x11(self.conn, Some(deadline)),
+            |deadline| wait_x11(self.conn, Some(deadline)),
             |event, full_sequence| {
                 if endpoint.handle_event(self.conn, &event)? {
                     return Err("Control endpoint destroyed during timestamp probe".into());
@@ -931,7 +932,7 @@ fn closing_events_with(
     next: impl FnMut() -> Result<Option<Event>>,
     mut inspect: impl FnMut(Event) -> Result<bool>,
 ) -> Result<()> {
-    for event in crate::drain_events_bounded(&mut None, 64, next)? {
+    for event in drain_events_bounded(&mut None, 64, next)? {
         if inspect(event)? {
             break;
         }
@@ -1279,7 +1280,7 @@ impl CallerHost for NativeCaller<'_> {
     }
     fn wait(&mut self, deadline: Instant) -> Result<()> {
         self.peer.conn.flush()?;
-        crate::wait_x11(self.peer.conn, Some(deadline))
+        wait_x11(self.peer.conn, Some(deadline))
     }
     fn cleanup(&mut self) -> Result<()> {
         if let Some((window, resource)) = &self.reply {
