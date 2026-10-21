@@ -3826,6 +3826,675 @@ pub(crate) mod recover_tests {
         );
     }
 
+    // F-T2 uses the existing service host and transport slot, never a second
+    // progression model. Events retain deliberately misleading Configure data.
+    fn late_event(kind: usize) -> Event {
+        let mut e = event(kind);
+        match &mut e {
+            Event::PropertyNotify(e) if e.window == 100 => e.window = 88,
+            Event::MapNotify(e) => {
+                e.window = 88;
+                e.event = 88;
+            }
+            Event::UnmapNotify(e) => {
+                e.window = 88;
+                e.event = 88;
+            }
+            Event::ConfigureNotify(e) if e.window == 100 => e.window = 88,
+            Event::DestroyNotify(e) => {
+                e.window = 88;
+                e.event = 88;
+                e.response_type = 17;
+            }
+            _ => {}
+        }
+        e
+    }
+
+    fn route_late(owner: &mut HereOwner, kind: usize) -> bool {
+        let (visibility, layout) = atoms();
+        let before = owner.active().copied();
+        let e = late_event(kind);
+        let consumed =
+            route_here_evidence_event(owner.active_mut(), &e, 1, 88, &visibility, &layout);
+        if let Some(before) = before {
+            let after = owner.active().unwrap();
+            assert_eq!(consumed, remote_consumes_visibility_event(&before, &e, 88));
+            assert!(remote_service_due(
+                after,
+                before.deadline - before.request.command.owner_budget()
+            ));
+            assert_eq!(after.request, before.request);
+            assert_eq!(after.stage, before.stage);
+            assert_eq!(after.deadline, before.deadline);
+            assert_eq!(after.recover_phase, before.recover_phase);
+            assert_eq!(
+                after.placement.destination_desktop,
+                before.placement.destination_desktop
+            );
+            assert_eq!(after.placement.correction(), before.placement.correction());
+            assert_eq!(after.placement.baseline, before.placement.baseline);
+            assert_eq!(after.placement.layout(), before.placement.layout());
+            assert_eq!(after.show.correction, before.show.correction);
+            let mut expected_top = before.bring_top;
+            expected_top.layer_observe = after.bring_top.layer_observe;
+            assert_eq!(after.bring_top, expected_top);
+            assert_eq!(
+                after.placement.proof.history,
+                before.placement.proof.history
+            );
+            assert_eq!(
+                after.placement.proof.current,
+                control::PlacementConfirmation::default()
+            );
+        } else {
+            assert!(
+                !consumed,
+                "no operation-specific filter may hide lifecycle events"
+            );
+            assert!(owner.active().is_none());
+        }
+        consumed
+    }
+
+    fn turnover_tick(owner: &mut HereOwner, h: &mut Host) -> Result<bool, HostError> {
+        owner.service(|active, _, _, reply| service_admitted_placement_with(active, h, reply))
+    }
+
+    fn fresh_successor(owner: &mut HereOwner, h: &mut Host, command: Command) -> ActiveOperation {
+        assert!(owner.active().is_none());
+        let elapsed = Duration::from_millis(20);
+        owner.advance_peer(elapsed);
+        h.here.now += elapsed;
+        let id = owner.original_id() + 1;
+        owner.request_placement(command, id, 2, false);
+        let op = *owner.active().unwrap();
+        assert_eq!(op.request.command, command);
+        assert_eq!(op.request.request_id, id);
+        assert_eq!(op.deadline, h.here.now + command.owner_budget());
+        assert_eq!(op.placement.destination_desktop, 2);
+        assert_eq!(op.placement.baseline, None);
+        assert_eq!(op.placement.layout(), None);
+        assert_eq!(op.placement.correction(), None);
+        assert_eq!(op.placement.proof, control::PlacementProof::default());
+        assert_eq!(
+            op.show,
+            control::ShowProgress {
+                observe: true,
+                ..Default::default()
+            }
+        );
+        op
+    }
+
+    #[test]
+    fn late_event_here_success_turnover_requires_own_reads_correction_and_input_readiness() {
+        let mut h = Host::new(false, false, L::Below);
+        h.here.window.window = 88;
+        // Consume a genuine one-shot synchronization before the predecessor.
+        let Event::MapNotify(map) = late_event(3) else {
+            unreachable!()
+        };
+        h.here.runtime.arm_map_input_sync(20);
+        h.here
+            .runtime
+            .synchronize_map_input_with(&map, 88, 20, || Ok(25))
+            .unwrap();
+        assert_eq!(h.here.runtime.pending_map_input, None);
+        h.here.current.desktop = 0;
+        let mut owner = HereOwner::new(h.here.now, 2);
+        turnover_tick(&mut owner, &mut h).unwrap();
+        h.here.target();
+        h.here.actual.x = -100;
+        route_late(&mut owner, 0);
+        turnover_tick(&mut owner, &mut h).unwrap();
+        assert!(owner.active().unwrap().placement.correction().is_some());
+        route_late(&mut owner, 5);
+        turnover_tick(&mut owner, &mut h).unwrap();
+        let predecessor = owner.replies()[0];
+        assert_eq!(predecessor.status, Status::Success);
+        assert!(predecessor.detail.placement.history.relocation_confirmed);
+        assert!(owner.active().is_none());
+        let log = h.here.log.clone();
+        for kind in 0..12 {
+            route_late(&mut owner, kind);
+        }
+        assert!(!turnover_tick(&mut owner, &mut h).unwrap());
+        assert_eq!(h.here.log, log);
+        assert_eq!(owner.replies(), [predecessor]);
+
+        // External workspace changes are observations, not events.
+        h.here.current.desktop = 0;
+        let successor = fresh_successor(&mut owner, &mut h, Command::BringHere);
+        for kind in 0..12 {
+            route_late(&mut owner, kind);
+        }
+        assert_eq!(h.here.log, log, "routing alone performs no native work");
+        turnover_tick(&mut owner, &mut h).unwrap();
+        let shapes = h.here.count("shape");
+        for kind in 0..12 {
+            route_late(&mut owner, kind);
+            turnover_tick(&mut owner, &mut h).unwrap();
+            assert_eq!(
+                owner.active().unwrap().placement.proof.history,
+                control::RecoveryHistory::default()
+            );
+            assert_eq!(
+                h.here.count("desktop"),
+                2,
+                "one send per admitted operation"
+            );
+            assert_eq!(h.here.count("shape"), shapes);
+            assert_eq!(h.here.count("correct"), 1);
+            assert_eq!(owner.replies(), [predecessor]);
+        }
+        assert!(h.here.runtime.input_fence.blocked);
+        let press = Event::ButtonPress(x11rb::protocol::xproto::ButtonPressEvent {
+            event: 88,
+            ..Default::default()
+        });
+        assert!(h.here.runtime.input_fence.rejects(&press, 88, 9999));
+        h.here
+            .runtime
+            .synchronize_map_input_with(&map, 88, 9999, || {
+                panic!("old map cannot enable successor input")
+            })
+            .unwrap();
+        assert!(h.here.runtime.input_fence.blocked);
+
+        h.here.target();
+        h.here.current.transitional = true;
+        route_late(&mut owner, 4); // Unmap is a read prompt, not cancellation.
+        turnover_tick(&mut owner, &mut h).unwrap();
+        assert!(
+            owner
+                .active()
+                .unwrap()
+                .placement
+                .proof
+                .history
+                .relocation_confirmed
+        );
+        assert_eq!(h.here.count("shape"), shapes);
+        h.here.current.transitional = false;
+        h.here.actual.x = -100;
+        route_late(&mut owner, 5);
+        turnover_tick(&mut owner, &mut h).unwrap();
+        let correction = owner.active().unwrap().placement.correction().unwrap();
+        assert_eq!(h.here.count("correct"), 2);
+        let log = h.here.log.clone();
+        for kind in [3, 5, 5, 8] {
+            route_late(&mut owner, kind);
+        }
+        assert_eq!(
+            owner.active().unwrap().placement.correction(),
+            Some(correction)
+        );
+        assert_eq!(owner.active().unwrap().deadline, successor.deadline);
+        assert_eq!(h.here.log, log);
+        turnover_tick(&mut owner, &mut h).unwrap();
+        assert!(owner.active().is_none());
+        let replies = owner.replies();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0], predecessor);
+        assert_eq!(replies[1].request_id, successor.request.request_id);
+        assert_eq!(replies[1].status, Status::Success);
+        assert_eq!(
+            h.here.actual.origin(),
+            Point::new(0, 100),
+            "Configure payload was not geometry evidence"
+        );
+        assert_eq!(h.here.count("shape"), shapes + 1);
+        assert_eq!(h.here.count("correct"), 2);
+        assert!(!h.here.runtime.input_fence.blocked);
+        assert!(h.here.runtime.input_fence.rejects(&press, 88, 999));
+        assert!(!h.here.runtime.input_fence.rejects(&press, 88, 1000));
+        h.here
+            .runtime
+            .synchronize_map_input_with(&map, 88, 10000, || {
+                panic!("consumed synchronization cannot replay")
+            })
+            .unwrap();
+        assert!(!turnover_tick(&mut owner, &mut h).unwrap());
+        assert_eq!(owner.replies(), replies);
+    }
+
+    #[test]
+    fn late_event_recover_success_turnover_does_not_transfer_history_to_noop_or_invalid_successor()
+    {
+        for invalid in [false, true] {
+            let mut h = Host::new(true, true, L::Below);
+            h.here.window.window = 88;
+            let mut owner = HereOwner::placement(h.here.now, Command::Recover, 2);
+            finish_owner(&mut owner, &mut h).unwrap();
+            assert!(owner.active().is_none());
+            let predecessor = owner.replies()[0];
+            assert_eq!(predecessor.status, Status::Success);
+            assert_eq!(
+                predecessor.detail.placement.history,
+                control::RecoveryHistory {
+                    relocation_confirmed: true,
+                    restoration_confirmed: true
+                }
+            );
+            let log = h.here.log.clone();
+            for kind in 0..12 {
+                route_late(&mut owner, kind);
+            }
+            assert!(!turnover_tick(&mut owner, &mut h).unwrap());
+            assert_eq!(h.here.log, log);
+            let successor = fresh_successor(&mut owner, &mut h, Command::Recover);
+            for kind in 0..12 {
+                route_late(&mut owner, kind);
+            }
+            assert_eq!(h.here.log, log);
+            if invalid {
+                h.here.layout = Err(DestinationError::Changed);
+            }
+            turnover_tick(&mut owner, &mut h).unwrap();
+            assert!(owner.active().is_none());
+            let replies = owner.replies();
+            assert_eq!(replies.len(), 2);
+            assert_eq!(replies[0], predecessor);
+            assert_eq!(replies[1].request_id, successor.request.request_id);
+            assert_eq!(
+                replies[1].detail.placement.history,
+                control::RecoveryHistory::default()
+            );
+            assert_eq!(
+                replies[1].status,
+                if invalid {
+                    Status::Failed
+                } else {
+                    Status::Success
+                }
+            );
+            assert_eq!(
+                replies[1].detail.reason,
+                if invalid {
+                    Reason::LayoutChanged
+                } else {
+                    Reason::None
+                }
+            );
+            for step in ["desktop", "map", "correct", "shape", "remove", "above"] {
+                assert_eq!(
+                    h.here.count(step),
+                    log.iter().filter(|&&s| s == step).count(),
+                    "successor cannot mutate on inherited proof: {step}"
+                );
+            }
+            if invalid {
+                assert_eq!(
+                    replies[1].detail.placement.current,
+                    control::PlacementConfirmation::default()
+                );
+            }
+            assert!(!turnover_tick(&mut owner, &mut h).unwrap());
+            assert_eq!(owner.replies(), replies);
+        }
+    }
+
+    #[test]
+    fn late_event_incomplete_turnover_across_64_event_boundary_keeps_successor_identity_and_deadline(
+    ) {
+        // Failed before relocation, or Partial after real relocation, for each
+        // command. These are operation failures on a still-Ready endpoint.
+        for command in [Command::BringHere, Command::Recover] {
+            for relocated in [false, true] {
+                let mut h = Host::new(true, false, L::Normal);
+                h.here.window.window = 88;
+                let admitted_at = h.here.now;
+                let mut owner = HereOwner::placement(h.here.now, command, 2);
+                turnover_tick(&mut owner, &mut h).unwrap();
+                if relocated {
+                    h.here.target();
+                    h.here.current.transitional = true;
+                    route_late(&mut owner, 4);
+                    turnover_tick(&mut owner, &mut h).unwrap();
+                }
+                h.here.now = remote_operation_deadline(owner.active().unwrap());
+                turnover_tick(&mut owner, &mut h).unwrap();
+                assert!(owner.active().is_none());
+                let predecessor = owner.replies()[0];
+                assert_eq!(
+                    predecessor.status,
+                    if relocated {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    }
+                );
+                assert_eq!(predecessor.detail.reason, Reason::ConfirmationTimeout);
+                assert_eq!(
+                    predecessor.detail.placement.history.relocation_confirmed,
+                    relocated
+                );
+                assert_eq!(owner.descriptor().lifecycle, control::Lifecycle::Ready);
+                // Keep the transport clock aligned with the elapsed owner run.
+                owner.advance_peer(h.here.now - admitted_at);
+                let log = h.here.log.clone();
+                let mut queue: VecDeque<_> = (0..65).map(|i| late_event(i % 12)).collect();
+                let mut buffered = queue.pop_front();
+                let first = drain_events_bounded(&mut buffered, 64, || {
+                    Ok::<_, HostError>(queue.pop_front())
+                })
+                .unwrap();
+                assert_eq!(first.len(), 64);
+                assert_eq!(queue.len(), 1);
+                let (visibility, layout) = atoms();
+                for e in first {
+                    assert!(!route_here_evidence_event(
+                        owner.active_mut(),
+                        &e,
+                        1,
+                        88,
+                        &visibility,
+                        &layout
+                    ));
+                }
+                assert!(!turnover_tick(&mut owner, &mut h).unwrap());
+                assert_eq!(h.here.log, log);
+                h.here.current.desktop = 0;
+                h.here.current.transitional = false;
+                let successor = fresh_successor(&mut owner, &mut h, Command::Recover);
+                let second = drain_events_bounded(&mut buffered, 64, || {
+                    Ok::<_, HostError>(queue.pop_front())
+                })
+                .unwrap();
+                assert_eq!(second.len(), 1);
+                assert!(route_here_evidence_event(
+                    owner.active_mut(),
+                    &second[0],
+                    1,
+                    88,
+                    &visibility,
+                    &layout
+                ));
+                assert_eq!(
+                    *owner.active().unwrap(),
+                    successor,
+                    "late evidence before first read changes no authority"
+                );
+                turnover_tick(&mut owner, &mut h).unwrap();
+                route_late(&mut owner, 4);
+                turnover_tick(&mut owner, &mut h).unwrap();
+                assert_eq!(
+                    owner.active().unwrap().placement.proof.history,
+                    control::RecoveryHistory::default()
+                );
+                assert_eq!(owner.active().unwrap().deadline, successor.deadline);
+                h.here.target();
+                h.here.current.transitional = true;
+                route_late(&mut owner, 0);
+                turnover_tick(&mut owner, &mut h).unwrap();
+                assert!(
+                    owner
+                        .active()
+                        .unwrap()
+                        .placement
+                        .proof
+                        .history
+                        .relocation_confirmed
+                );
+                h.here.current.transitional = false;
+                route_late(&mut owner, 3);
+                finish_owner(&mut owner, &mut h).unwrap();
+                let replies = owner.replies();
+                assert_eq!(replies.len(), 2);
+                assert_eq!(replies[0], predecessor);
+                assert_eq!(replies[1].status, Status::Success);
+                assert_eq!(replies[1].request_id, successor.request.request_id);
+                assert!(!replies[1].detail.placement.history.restoration_confirmed);
+            }
+        }
+    }
+
+    #[test]
+    fn late_event_successor_recover_layer_requires_fresh_above_and_geometry() {
+        for invalid_geometry in [false, true] {
+            let mut h = Host::new(true, true, L::Normal);
+            h.here.window.window = 88;
+            let mut owner = HereOwner::new(h.here.now, 2);
+            turnover_tick(&mut owner, &mut h).unwrap();
+            h.here.target();
+            route_late(&mut owner, 0);
+            turnover_tick(&mut owner, &mut h).unwrap();
+            let predecessor = owner.replies()[0];
+            assert_eq!(predecessor.status, Status::Success);
+            assert!(predecessor.detail.progress.placement_deferred);
+            assert!(predecessor.detail.placement.history.relocation_confirmed);
+            assert!(owner.active().is_none());
+            let log = h.here.log.clone();
+            route_late(&mut owner, 3);
+            // A late map cannot turn minimized deferred readiness into input.
+            // Reuse the real deferred observer, whose geometry path must not
+            // run for this independently still-minimized observation.
+            restore_deferred_input(&mut h).unwrap();
+            assert_eq!(h.here.log[log.len()..], ["top_observe"]);
+            assert!(h.here.runtime.input_fence.blocked);
+            assert_eq!(h.here.count("shape"), 0);
+            assert_eq!(h.here.count("correct"), 0);
+            assert_eq!(owner.replies(), [predecessor]);
+            h.layer_changes = false;
+            let successor = fresh_successor(&mut owner, &mut h, Command::Recover);
+            turnover_tick(&mut owner, &mut h).unwrap();
+            assert_eq!(owner.active().unwrap().recover_phase, RecoverPhase::Top);
+            let visibility_cutoff = owner.active().unwrap().bring_top.visibility_cutoff;
+            route_late(&mut owner, 3);
+            turnover_tick(&mut owner, &mut h).unwrap();
+            assert_eq!(h.here.count("map"), 1);
+            assert!(
+                !owner
+                    .active()
+                    .unwrap()
+                    .placement
+                    .proof
+                    .history
+                    .restoration_confirmed
+            );
+            h.restored();
+            route_late(&mut owner, 4); // delayed unmap cannot cancel fresh visibility
+            turnover_tick(&mut owner, &mut h).unwrap();
+            let layer_admitted = owner.active().unwrap().bring_top.layer_admitted;
+            assert!(layer_admitted.is_some());
+            let shapes = h.here.count("shape");
+            for kind in [1, 3, 4, 5, 8] {
+                assert_eq!(route_late(&mut owner, kind), kind != 5);
+                turnover_tick(&mut owner, &mut h).unwrap();
+                let op = owner.active().unwrap();
+                assert_eq!(op.deadline, successor.deadline);
+                assert_eq!(op.bring_top.visibility_cutoff, visibility_cutoff);
+                assert_eq!(op.bring_top.layer_admitted, layer_admitted);
+                assert_eq!(h.here.count("above"), 1);
+                assert_eq!(h.here.count("map"), 1);
+                assert_eq!(h.here.count("correct"), 0);
+                assert_eq!(h.here.count("shape"), shapes);
+                assert_eq!(owner.replies(), [predecessor]);
+            }
+            h.here.current.layer = L::Above;
+            if invalid_geometry {
+                h.here.actual.width = 159;
+            }
+            route_late(&mut owner, 5);
+            turnover_tick(&mut owner, &mut h).unwrap();
+            assert!(owner.active().is_none());
+            let replies = owner.replies();
+            assert_eq!(replies.len(), 2);
+            assert_eq!(replies[1].request_id, successor.request.request_id);
+            assert_eq!(
+                replies[1].status,
+                if invalid_geometry {
+                    Status::Partial
+                } else {
+                    Status::Success
+                }
+            );
+            assert!(!replies[1].detail.placement.history.relocation_confirmed);
+            assert!(replies[1].detail.placement.history.restoration_confirmed);
+            if invalid_geometry {
+                assert_eq!(
+                    replies[1].detail.placement.current,
+                    control::PlacementConfirmation::default()
+                );
+                assert!(!replies[1].detail.progress.input_ready);
+                assert!(h.here.runtime.input_fence.blocked);
+            }
+            assert_eq!(h.here.count("correct"), 0);
+        }
+    }
+
+    #[test]
+    fn late_event_shutdown_and_fatal_completion_cannot_revive_dead_owner_obligations() {
+        for command in [Command::BringHere, Command::Recover] {
+            for reason in [Reason::Closing, Reason::OwnershipLost, Reason::X11Failure] {
+                let mut h = Host::new(true, false, L::Below);
+                h.here.window.window = 88;
+                let mut owner = HereOwner::placement(h.here.now, command, 2);
+                turnover_tick(&mut owner, &mut h).unwrap();
+                h.here.target();
+                h.here.current.transitional = true;
+                route_late(&mut owner, 0);
+                turnover_tick(&mut owner, &mut h).unwrap();
+                assert!(
+                    owner
+                        .active()
+                        .unwrap()
+                        .placement
+                        .proof
+                        .history
+                        .relocation_confirmed
+                );
+                match reason {
+                    Reason::Closing => {
+                        let descriptor = owner.descriptor();
+                        owner
+                            .closing_with(|| Ok(descriptor.control_xid), |_| Ok(()))
+                            .unwrap();
+                        owner.finish_remote().unwrap();
+                        assert_eq!(owner.descriptor().lifecycle, control::Lifecycle::Closing);
+                    }
+                    Reason::OwnershipLost => {
+                        h.here.owned = false;
+                        route_late(&mut owner, 1);
+                        assert!(turnover_tick(&mut owner, &mut h).is_err());
+                    }
+                    Reason::X11Failure => {
+                        let original: HostError =
+                            Box::new(NativeFault("late-event outer fatal", 1));
+                        let address = error_address(&original);
+                        assert_eq!(
+                            error_address(&external(&mut owner, &mut h, original)),
+                            address
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(owner.active().is_none());
+                let replies = owner.replies();
+                assert_eq!(replies.len(), 1);
+                assert_eq!(replies[0].request_id, owner.original_id());
+                assert_eq!(replies[0].status, Status::Partial);
+                assert_eq!(replies[0].detail.reason, reason);
+                assert_eq!(
+                    replies[0].detail.placement.current,
+                    control::PlacementConfirmation::default()
+                );
+                assert!(!replies[0].detail.progress.input_ready);
+                let log = h.here.log.clone();
+                for kind in 0..13 {
+                    route_late(&mut owner, kind);
+                }
+                assert!(!turnover_tick(&mut owner, &mut h).unwrap());
+                owner.finish_remote().unwrap();
+                assert_eq!(owner.replies(), replies);
+                assert_eq!(h.here.log, log);
+                // run_probe is ending. Never admit under this dead/Closing
+                // owner, or interpret its retained body as a replacement owner.
+            }
+        }
+    }
+
+    #[test]
+    fn late_event_body_destroy_after_terminal_falls_through_or_stops_the_live_successor() {
+        for command in [Command::BringHere, Command::Recover] {
+            for successor_active in [false, true] {
+                let mut h = Host::new(false, false, L::Above);
+                h.here.window.window = 88;
+                let mut owner = HereOwner::placement(h.here.now, command, 2);
+                turnover_tick(&mut owner, &mut h).unwrap();
+                let predecessor = owner.replies()[0];
+                assert_eq!(predecessor.status, Status::Success);
+                if successor_active {
+                    h.here.current.desktop = 0;
+                    fresh_successor(&mut owner, &mut h, command);
+                    turnover_tick(&mut owner, &mut h).unwrap();
+                }
+                assert_eq!(route_late(&mut owner, 12), successor_active);
+                if !successor_active {
+                    // Only run_probe owns native no-active Destroy teardown.
+                    // Prove fall-through, then end this trace: no successor is
+                    // admitted after actual destruction of this retained body.
+                    assert_eq!(owner.replies(), [predecessor]);
+                    continue;
+                }
+                let mutations = (
+                    h.here.count("desktop"),
+                    h.here.count("correct"),
+                    h.here.count("shape"),
+                );
+                // Independently inject the destroyed observation via the existing
+                // host seam; routing a Destroy is not itself a visibility read.
+                h.here.terminal = Some(Visibility::Destroyed);
+                turnover_tick(&mut owner, &mut h).unwrap();
+                assert!(owner.active().is_none());
+                assert!(!h.here.live());
+                assert_eq!(h.here.runtime.body, BodyAvailability::Destroyed);
+                assert!(h.here.runtime.layers.pending().is_none());
+                assert_eq!(
+                    (
+                        h.here.count("desktop"),
+                        h.here.count("correct"),
+                        h.here.count("shape")
+                    ),
+                    mutations
+                );
+                let replies = owner.replies();
+                assert_eq!(replies.len(), 2);
+                assert_eq!(replies[0], predecessor);
+                assert_eq!(replies[1].detail.reason, Reason::BodyDestroyed);
+                assert_eq!(replies[1].status, Status::Failed);
+                assert_eq!(
+                    replies[1].detail.placement,
+                    control::PlacementProof::default()
+                );
+                assert!(!replies[1].detail.progress.input_ready);
+                h.here
+                    .runtime
+                    .restore_visibility_input_with(
+                        &h.here.window,
+                        h.here.current.snapshot().evidence,
+                        &InputPlacement {
+                            selected_monitor: 20,
+                            observed_monitor: 20,
+                            geometry: h.here.actual,
+                            bounds: layout().valid_origins,
+                        },
+                        || panic!("destroyed body must not gain input authority"),
+                    )
+                    .unwrap_err();
+                let log = h.here.log.clone();
+                for kind in 0..13 {
+                    route_late(&mut owner, kind);
+                }
+                assert!(!turnover_tick(&mut owner, &mut h).unwrap());
+                owner.finish_remote().unwrap();
+                assert_eq!(h.here.log, log);
+                assert_eq!(owner.replies(), replies);
+            }
+        }
+    }
+
     fn assert_result(
         op: &ActiveOperation,
         result: control::OperationResult,

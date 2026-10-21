@@ -2866,6 +2866,10 @@ impl HereOwner {
         }
     }
     pub(crate) fn new(now: Instant, destination: u32) -> Self {
+        Self::placement(now, Command::BringHere, destination)
+    }
+    /// Admit either placement command through the production transport router.
+    pub(crate) fn placement(now: Instant, command: Command, destination: u32) -> Self {
         let mut endpoint = ControlWindow::candidate(0, CONTROL, 77, 50, 51, 52);
         endpoint.descriptor = owner();
         endpoint.root = ROOT;
@@ -2874,10 +2878,10 @@ impl HereOwner {
         let mut peer = Fake::new();
         peer.now = now;
         let mut result = Self { endpoint, peer };
-        result.request(ID, destination, false);
+        result.request_placement(command, ID, destination, false);
         assert!(result.peer.sent.is_empty());
         let active = result.active().unwrap();
-        assert_eq!(active.request, request(Command::BringHere));
+        assert_eq!(active.request, request(command));
         assert_eq!(active.placement.destination_desktop, destination);
         assert_eq!(active.stage, Stage::Placement);
         assert!(active.placement.observation_due());
@@ -2885,30 +2889,43 @@ impl HereOwner {
         result
     }
     pub(crate) fn request(&mut self, id: u64, destination: u32, busy: bool) {
+        self.request_placement(Command::BringHere, id, destination, busy);
+    }
+    pub(crate) fn request_placement(
+        &mut self,
+        command: Command,
+        id: u64,
+        destination: u32,
+        busy: bool,
+    ) {
+        assert!(matches!(command, Command::BringHere | Command::Recover));
         let marker = CallerMarker {
             request_id: id,
             destination_desktop: destination,
-            ..marker(Command::BringHere)
+            ..marker(command)
         };
         self.peer
             .evidence
             .push_back(Some(evidence(&marker.encode().unwrap())));
-        self.peer
-            .route(
-                &mut self.endpoint.active,
-                Lifecycle::Ready,
-                busy,
-                &request_event(
-                    atoms(),
-                    CONTROL,
-                    Request {
-                        request_id: id,
-                        ..request(Command::BringHere)
-                    },
-                )
-                .unwrap(),
+        route_request_with(
+            &mut self.peer,
+            self.endpoint.descriptor,
+            self.endpoint.root,
+            self.endpoint.transport,
+            Some(99),
+            busy,
+            &mut self.endpoint.active,
+            &request_event(
+                atoms(),
+                CONTROL,
+                Request {
+                    request_id: id,
+                    ..request(command)
+                },
             )
-            .unwrap();
+            .unwrap(),
+        )
+        .unwrap();
     }
     pub(crate) fn active(&self) -> Option<&ActiveOperation> {
         self.endpoint.active()
@@ -2985,6 +3002,114 @@ impl HereOwner {
     }
     pub(crate) fn original_id(&self) -> u64 {
         ID
+    }
+}
+
+#[test]
+fn late_event_turnover_terminal_correlation_and_completed_replay_keep_existing_protocol() {
+    // Actual admitted slots and production service/finalization produce these
+    // replies. Body observations use the established public-roundtrip fixtures.
+    for predecessor_command in [Command::BringHere, Command::Recover] {
+        let finish = |endpoint: &mut HereOwner, command| {
+            endpoint
+                .service(|active, _, _, reply| match command {
+                    Command::BringHere => crate::here_service_tests::public_roundtrip_service(
+                        active,
+                        false,
+                        false,
+                        control::LayerObservation::Above,
+                        reply,
+                    ),
+                    Command::Recover => {
+                        crate::here_service_tests::recover_tests::public_roundtrip_service(
+                            active,
+                            false,
+                            false,
+                            control::LayerObservation::Above,
+                            crate::here_service_tests::recover_tests::PublicFault::None,
+                            reply,
+                        )
+                    }
+                    _ => unreachable!(),
+                })
+                .unwrap();
+            assert!(endpoint.active().is_none());
+        };
+        let mut endpoint = HereOwner::placement(Instant::now(), predecessor_command, 2);
+        finish(&mut endpoint, predecessor_command);
+        let old = endpoint.replies()[0];
+        assert_eq!(old.status, Status::Success);
+        let old_event = Event::ClientMessage(reply_event(atoms(), REPLY_WINDOW, old).unwrap());
+        endpoint.advance_peer(Duration::from_millis(100));
+        let successor_command = if predecessor_command == Command::BringHere {
+            Command::Recover
+        } else {
+            Command::BringHere
+        };
+        endpoint.request_placement(successor_command, ID + 1, 2, false);
+        let successor = *endpoint.active().unwrap();
+        let correlation = ReplyCorrelation {
+            control_xid: CONTROL,
+            epoch: 77,
+            request_id: ID + 1,
+            reply_xid: REPLY_WINDOW,
+        };
+        assert!(
+            correlated_reply(&old_event, atoms(), endpoint.descriptor(), correlation).is_none()
+        );
+        // An active identical request is still a duplicate, with no new reply,
+        // deadline, correction allowance or changed frozen destination.
+        endpoint.request_placement(successor_command, ID + 1, 2, false);
+        assert_eq!(endpoint.active(), Some(&successor));
+        assert_eq!(endpoint.replies(), [old]);
+        finish(&mut endpoint, successor_command);
+        let fresh = endpoint.replies()[1];
+        assert_eq!(fresh.request_id, ID + 1);
+        let good = reply_event(atoms(), REPLY_WINDOW, fresh).unwrap();
+        assert_eq!(
+            correlated_reply(
+                &Event::ClientMessage(good),
+                atoms(),
+                endpoint.descriptor(),
+                correlation
+            ),
+            Some(fresh)
+        );
+        for field in 0..4 {
+            let mut event = good;
+            let mut descriptor = endpoint.descriptor();
+            match field {
+                0 => event.window += 1,
+                1 => event.type_ += 1,
+                2 => {
+                    let mut words = event.data.as_data32();
+                    words[3] += 1;
+                    event.data = words.into();
+                }
+                _ => descriptor.epoch += 1,
+            }
+            assert!(correlated_reply(
+                &Event::ClientMessage(event),
+                atoms(),
+                descriptor,
+                correlation
+            )
+            .is_none());
+        }
+        // No completed-request replay cache: an identical valid request after
+        // completion creates another terminal obligation under this contract.
+        endpoint.advance_peer(Duration::from_millis(100));
+        endpoint.request_placement(successor_command, ID + 1, 2, false);
+        let replay = endpoint.active().unwrap();
+        assert_eq!(replay.request, successor.request);
+        assert!(replay.deadline > successor.deadline);
+        assert_eq!(replay.placement, control::PlacementProgress::new(2));
+        assert_eq!(endpoint.replies(), [old, fresh]);
+        finish(&mut endpoint, successor_command);
+        assert_eq!(endpoint.replies(), [old, fresh, fresh]);
+        assert!(!endpoint
+            .service(|_, _, _, _| panic!("no predecessor or successor obligation remains"))
+            .unwrap());
     }
 }
 
