@@ -5,7 +5,7 @@
 **Planning base:** `46adda6a6dc1e25930c9656e7c84d125296c8691` (documentation-only handoff HEAD).  
 **Accepted executable foundation:** M03.2 `a46e432c1f97b03c576737b1fc0ac35d7f90c158`, matching CI 39098551853, 453 tests.  
 **Lifecycle update — 2026-10-21:** Stages A/B/H0/C/D and E1–E4 have separately passed review/owner acceptance. Public Bring Here remains Stage-D accepted at `4c67da0b09ffe7b69605ac4a415d256acf8abd23` ([CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762), 677 tests). Public Recover is Stage-E accepted on the exercised Openbox/X11 host at E4 `aa00f8e94aff1cf2ef1ff6a6cecf734f822d5603` ([CI 39529051360](https://github.com/zNe4/DesktopRoomie/actions/runs/39529051360), **737 tests**; [Stage-E acceptance](../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md)). **Next: Stage F then Stage G**, each separately authorized. The original future-tense requirements below remain the approved design contract.
-**Current sequencing note (2026-10-21):** Before beginning Stage F implementation, the owner requested a separate behavior-preserving Rust modularization effort. RF-P's architecture inventory was reviewed; the [A00-RF modularization plan](DesktopRoomie-A00-RF-modularization-plan.md) assigns test-only RF1a as its first small candidate. **Stage F/G contract and acceptance requirements below remain unchanged**; RF checkpoints do not fulfill F/G or imply permission to implement them.
+**Current sequencing note (2026-10-21):** RF1 selected unit-test externalization and RF2a–d behavior-preserving production extractions are complete, reviewed and accepted at RF2d `df5faa6ec17da464e1eeacfbb3c785688f60ea36` ([CI 39673542266](https://github.com/zNe4/DesktopRoomie/actions/runs/39673542266), 737 tests), with qualified owner-native regression evidence in the [RF closeout](DesktopRoomie-A00-RF-modularization-plan.md#current-closeout-2026-10-21). RF2e layer-service and RF2f caller-lifecycle extractions are deferred; the structural effort is closed at RF2d and the modularization pause has ended. **A read-only Stage-F coverage/architecture review is the recommended next mission. Stage F remains unimplemented and separately gated; Stage G follows F.** Stage F/G requirements and historical approvals below remain unchanged; RF checkpoints neither fulfill these gates nor authorize their implementation.
 **Authority:** this document freezes design and stage boundaries. It does **not** authorize implementation, commits, pushes, host configuration edits, or advancement between stages. Each mission remains separately owner-authorized and independently reviewed.
 
 ## 1. Objective
@@ -226,6 +226,8 @@ A current-desktop/layout change invalidates the frozen Recover destination and p
 
 ## 11. Stage F — lifecycle, concurrency and deadline hardening
 
+**Current status:** unimplemented and separately gated. A read-only coverage/architecture review is proposed before any implementation assignment; RF closure is not Stage-F acceptance or execution authority.
+
 **Purpose:** no new behavior; exhaustively harden the integrated operations.
 
 Required coverage:
@@ -247,6 +249,8 @@ Required coverage:
 
 ## 12. Stage G — integrated M03.3 acceptance
 
+**Current status:** pending after Stage F; separately authorized and not accepted by Stage E or RF modularization.
+
 Freeze an exact executable SHA and perform:
 
 1. complete local fmt/build/Clippy/tests;
@@ -263,6 +267,8 @@ Injected malformed/failure tests remain distinct from native evidence.
 Stage G closes **M03.3 only**. It does not perform M03.4 integrated A00 architecture closure.
 
 ## 13. Expected source ownership
+
+**Historical P0 planning map:** this table preserves expected locations at approval, before RF modularization. Current ownership is documented in [ARCHITECTURE](ARCHITECTURE.md) and the [RF closeout](DesktopRoomie-A00-RF-modularization-plan.md#current-source-ownership-and-resolved-coupling): parser/help in `cli.rs`, codecs in `control/protocol.rs`, diagnostics in `x11/control/outcome.rs`, shared wait/drain in `x11/events.rs`; root coordination and native control ownership remain intact. Do not read the older locations below as instructions to move these responsibilities back.
 
 | File/module | M03.3 responsibility |
 | --- | --- |
@@ -299,5 +305,5 @@ Record executable code SHA separately from later documentation-only commits. Pre
 
 ## 16. Immediate next gate
 
-**A00-M03.3 Stage F — lifecycle, concurrency and deadline hardening, paused before implementation while separately staged A00-RF modularization proceeds; Stage F still requires its own approved assignment.** E1–E4 are complete; public Recover is accepted at frozen E4 `aa00f8e94aff1cf2ef1ff6a6cecf734f822d5603`, [CI 39529051360](https://github.com/zNe4/DesktopRoomie/actions/runs/39529051360), **737 tests**, with [qualified Openbox/X11 evidence](../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md). The [E-P plan](DesktopRoomie-A00-M03.3-stage-E-approved-plan.md) remains the historical approved design, now implemented. Stage G integrated M03.3 acceptance follows F as another future gate; neither is accepted or authorized by this documentation update.
+**Recommended next mission: read-only A00-M03.3 Stage-F coverage/architecture review.** RF1 and RF2a–d are complete; RF2e/f are deferred and the modularization pause has ended. Latest reviewed and owner-tested RF executable is `df5faa6ec17da464e1eeacfbb3c785688f60ea36`; the [RF closeout](DesktopRoomie-A00-RF-modularization-plan.md#current-closeout-2026-10-21) preserves exact CI and native regression evidence. Historical public Recover feature acceptance remains frozen at E4 `aa00f8e94aff1cf2ef1ff6a6cecf734f822d5603`, [CI 39529051360](https://github.com/zNe4/DesktopRoomie/actions/runs/39529051360), **737 tests**, with [qualified Openbox/X11 evidence](../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md). The [E-P plan](DesktopRoomie-A00-M03.3-stage-E-approved-plan.md) remains historical implemented design. Stage-F hardening remains unimplemented and requires its own approved assignment; Stage G integrated M03.3 acceptance follows F as another future gate. Neither is accepted or authorized by this documentation update.
 

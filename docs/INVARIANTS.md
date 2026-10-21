@@ -1,6 +1,6 @@
 # Accepted non-regression obligations
 
-These are review obligations distilled from accepted work through M03.3 Stage E, not new behavior requirements or permission to extend scope. Use the assigned contract and approved decisions for details; a specific approved change is not overridden by inference from this summary. [STATUS](STATUS.md) identifies revisions and evidence boundaries.
+These are review obligations distilled from accepted behavior through M03.3 Stage E and source boundaries through RF2d, not new behavior requirements or permission to extend scope. Use the assigned contract and approved decisions for details; a specific approved change is not overridden by inference from this summary. [STATUS](STATUS.md) identifies revisions and evidence boundaries.
 
 | Obligation | Traceable contract/evidence |
 | --- | --- |
@@ -21,6 +21,16 @@ These are review obligations distilled from accepted work through M03.3 Stage E,
 | **Recover cannot renew mutation or deadline authority.** One correction across Here/Top, including consumed or uncertain attempts, with the full 150 ms confirmation interval. Owner total 7000 ms; Here ≤3500 ms, Top visibility ≤2500 ms from validated handoff, layer ≤1000 ms after admission, each capped by the original total; caller 9000 ms. Strict frozen layout/monitor/body-size evidence guards each mutation, including restore and layer substeps. No event, handoff, duplicate or re-fence grants a retry or fresh allowance. | [Stage-E public contract](../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md#accepted-public-recover-contract). |
 | **Recover shares placement fatal/terminal handling across phases and external errors.** Clear current proof, retain only genuine history, safely re-fence as needed and preserve the original error over later read/reply/cleanup failures. Clear the sole slot and attempt at most one correlated terminal response. Caller OutcomeUnknown never resends or invents a terminal result. Native failures, clean Closing and actual OwnershipLost retain distinct classifications. | [Stage-E public contract](../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md#accepted-public-recover-contract); [native evidence limits](../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md#native-boundaries-and-next-gate). |
 | **Public engine and private content stay separate.** No copyrighted NEKOPARA assets, extracted dialogue/voice, trained character models or private sensor data in the public repository. Use synthetic fixtures; third-party reuse needs approved scope and provenance/license review. | [AGENTS content/reuse rules](../AGENTS.md); [roadmap principles](DesktopRoomie-roadmap-v0.1.md#3-principles-to-preserve-as-the-design-changes). |
+
+## Source architecture preservation
+
+Preserve the accepted RF boundaries as review obligations, subject to future explicitly approved architecture changes; these do not alter existing behavioral contracts. See [ARCHITECTURE](ARCHITECTURE.md) and the [completed RF closeout](DesktopRoomie-A00-RF-modularization-plan.md#current-closeout-2026-10-21).
+
+- Keep one active owner operation in `ControlWindow.active` and one runtime `LayerController` in `ProbeRuntime`; local/remote adapters borrow authority rather than create parallel state owners.
+- Keep pure codecs and operation evidence separate from native X11 resources. Preserve explicit parent API re-exports when reviewing those boundaries.
+- Keep runtime scheduler ordering and fatal policy coordinated in `main.rs`. Shared X11 wait/drain helpers do not independently own scheduling, deadline selection or operation progression.
+- Preserve test identity, fixture access and meaningful source-sensitive coverage when moving code/tests; do not weaken checks to accommodate a source move.
+- Do not create dependency cycles, parallel state owners, generic utilities dumping grounds or frameworks merely to reduce file size. Further extraction needs a concrete architectural need and separate approval.
 
 **Approved host-integration design policy (2026-10-09; not a newly verified runtime guarantee):** reuse mature window-manager features for optional shortcuts, launchers and session integration instead of adding a global key listener or generic daemon. The engine still owns lifecycle safety, no-focus interaction, state verification and independent CLI control. Configuration edits under the user's home directory are opt-in and documented, never silently applied. See [M03 recovery design](DesktopRoomie-A00-M03-placement-recovery-host-selection.md#5-m032--preliminary-design-boundary-not-yet-implementation-authority) and the [Openbox guide](host/OPENBOX.md).
 

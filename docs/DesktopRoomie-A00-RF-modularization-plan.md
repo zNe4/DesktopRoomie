@@ -1,5 +1,75 @@
 # A00-RF — DesktopRoomie Rust modularization and session-by-session refactor plan
 
+**Current authority and reading rule — 2026-10-21:** RF1 selected test externalization and RF2a–d are complete, independently reviewed, published and accepted. The structural effort is **closed at RF2d**; RF2e/f are deferred. The current closeout below supersedes all next-step/status language in the archived RF-P record that follows it. In that archive, “RF1a — NEXT”, “no RF coding checkpoint is complete”, candidate extractions, old source locations and copyable missions describe the original planning snapshot, **not current execution instructions**. All archived line counts and source line numbers are historical; inspect current declarations and definitions instead. This document grants no new implementation or publication authority.
+
+## Current closeout (2026-10-21)
+
+### Completion and architectural reassessment
+
+RF1 completed the selected externalization of existing unit-test child modules: the three `control` suites, selected root suites (including Show and Here/Recover), and X11 control ownership/transport suites. Module names, reachable fixtures, assertions and test identities were preserved. These are moves of existing tests, not newly developed tests, and not a conversion to Cargo integration-test crates. Small/cohesive inline suites were intentionally retained. [ARCHITECTURE](ARCHITECTURE.md#test-organization) maps the current layout.
+
+RF2-P reassessed production ownership after those test moves, as required by RF-P. It selected cohesive boundaries with concrete navigation/dependency benefits, implemented in this order: **RF2a caller outcomes → RF2b CLI → RF2c protocol → RF2d X11 events**. The original candidate-table order below was not the implementation order. Operation state, native resource ownership, owner scheduling and shared fatal policy remained coordinated.
+
+### Accepted publication and CI evidence
+
+The owner supplied independent source-review and acceptance decisions for these exact published checkpoints. Live GitHub run metadata and job logs checked during A00-RF-DOC1 match each SHA/run pair below. Every run passed formatting, build, all-target Clippy with warnings denied and the full **737-test** suite (0 failed). The five CI logs contain the same 737 passing test names; the extractions preserved existing identities rather than adding coverage. These are recorded CI results, not newly executed local Cargo checks.
+
+| Checkpoint | Published, reviewed commit | Matching successful GitHub CI |
+| --- | --- | --- |
+| RF1 final test extraction | [`e108122e04603388b42f482a0ee86d5a24101d10`](https://github.com/zNe4/DesktopRoomie/commit/e108122e04603388b42f482a0ee86d5a24101d10) | [39662963394](https://github.com/zNe4/DesktopRoomie/actions/runs/39662963394) |
+| RF2a — Caller outcomes | [`3127f6e32b05f161f951d2748aae22ce129d79bf`](https://github.com/zNe4/DesktopRoomie/commit/3127f6e32b05f161f951d2748aae22ce129d79bf) | [39667461888](https://github.com/zNe4/DesktopRoomie/actions/runs/39667461888) |
+| RF2b — CLI | [`7c1c52a32c85593cede5776d449fc57b60feb2d2`](https://github.com/zNe4/DesktopRoomie/commit/7c1c52a32c85593cede5776d449fc57b60feb2d2) | [39669252236](https://github.com/zNe4/DesktopRoomie/actions/runs/39669252236) |
+| RF2c — Protocol | [`8058cf0fefaa4409f22d76aa2320047b71f353b1`](https://github.com/zNe4/DesktopRoomie/commit/8058cf0fefaa4409f22d76aa2320047b71f353b1) | [39671337436](https://github.com/zNe4/DesktopRoomie/actions/runs/39671337436) |
+| RF2d — X11 events | [`df5faa6ec17da464e1eeacfbb3c785688f60ea36`](https://github.com/zNe4/DesktopRoomie/commit/df5faa6ec17da464e1eeacfbb3c785688f60ea36) | [39673542266](https://github.com/zNe4/DesktopRoomie/actions/runs/39673542266) |
+
+RF2d is the latest reviewed and owner-tested RF executable. Historical Stage-E feature acceptance remains frozen at `aa00f8e94aff1cf2ef1ff6a6cecf734f822d5603`, [CI 39529051360](https://github.com/zNe4/DesktopRoomie/actions/runs/39529051360), with its own qualified [E4 acceptance record](../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md). RF2d introduced no new Recover behavior and does not replace that historical record. Later documentation-only HEADs identify no newly tested executable.
+
+### Current source ownership and resolved coupling
+
+All paths below describe the accepted RF2d source, without historical line numbers. [ARCHITECTURE](ARCHITECTURE.md) is the descriptive implementation map; [INVARIANTS](INVARIANTS.md#source-architecture-preservation) records review obligations.
+
+| Source | Established responsibility / resolved concern |
+| --- | --- |
+| [src/main.rs](../experiments/desktop-probe/src/main.rs) | Process entry and sole CLI dispatcher; X11 setup/startup/shutdown; `ProbeRuntime`, pointer/popup/input-fence/movement authority and its sole `LayerController`; local/remote layer service; Hide/Show/Top/Here/Recover integration; main event loop, owner-service scheduling and fatal finalization. Parsing/help and socket-wait implementations are now separate. |
+| [src/cli.rs](../experiments/desktop-probe/src/cli.rs) | RF2b isolated `CliMode`, `UsageError`, `parse_args`, `HELP` and `print_help` from runtime coordination, without a second runtime/dispatcher. |
+| [src/control/protocol.rs](../experiments/desktop-probe/src/control/protocol.rs) | RF2c isolated protocol-v2 constants, command/exit vocabulary, wire codecs, validation, `Detail`, terminal responses and reply correlation. [control.rs](../experiments/desktop-probe/src/control.rs) explicitly re-exports the original `control::*` paths and retains operation progress, admission, visibility classification, result construction and one active operation's pure authority. No native resources moved into pure control. |
+| [src/x11/control/outcome.rs](../experiments/desktop-probe/src/x11/control/outcome.rs) | RF2a separated `CallerOutcome`, exit mapping and diagnostic formatting from native transport; explicit parent re-export preserves `x11::control::CallerOutcome`. [x11/control.rs](../experiments/desktop-probe/src/x11/control.rs) retains cooperative selection ownership, `ControlWindow.active`, caller invocation lifecycle, correlation use and transport. There is no separate `caller.rs`. |
+| [src/x11/events.rs](../experiments/desktop-probe/src/x11/events.rs) | RF2d moved `poll` FFI/definitions, `wait_x11` and `drain_events_bounded` into a narrow shared host module. Both root runtime and control transport import it directly, removing `x11/control.rs`'s reverse wait/drain helper dependency on `main.rs`. Scheduling, deadline selection and fatal behavior remain with their callers. |
+| [src/layer.rs](../experiments/desktop-probe/src/layer.rs), [src/x11/state.rs](../experiments/desktop-probe/src/x11/state.rs), `main.rs` | Pure layer controller / native observations and checked EWMH requests / orchestration borrowing `ProbeRuntime.layers`. One shared controller serves local and remote work. No `layer_service.rs` was introduced. |
+| [src/probe_tests/](../experiments/desktop-probe/src/probe_tests/), [src/control/](../experiments/desktop-probe/src/control/), [src/x11/control/](../experiments/desktop-probe/src/x11/control/) | RF1 improved source navigation by moving selected child unit-test bodies to files while preserving module identity and fixture access. Root explicit path declarations do not add a `probe_tests` module prefix. Source-sensitive tests still inspect the relevant production source. |
+
+These changes resolved concrete test-navigation, parser/runtime, codec/progression, diagnostics/transport and shared wait/drain coupling. They did not promise to eliminate every root support reference: `x11/window.rs` still uses root `CONFIRMATION_TIMEOUT`, and `x11/events.rs` uses root `HostError`. No broad error-type or constant extraction was required. No dependency cycle, new state owner, queue, generic utilities module or framework was introduced.
+
+### RF2d owner-native regression evidence
+
+On **2026-10-21**, the owner reported **PASS for all seven categories** on the supported **Archcraft (Arch) / Openbox 3.6.1 / X11 / Picom v13** setup, using RF2d `df5faa6ec17da464e1eeacfbb3c785688f60ea36`:
+
+1. Fresh owner launch, dragging, popup and transparent click-through.
+2. Hide, Show and Bring Top.
+3. Visible Bring Here across workspaces.
+4. Minimized Bring Here preserving genuine minimization.
+5. Recover restoring the existing body on the destination workspace with Above.
+6. Typing focus and current-workspace preservation.
+7. No-owner handling and relaunch.
+
+Recorded CLI observations: Hide exit `0`, existing instance retained; Show exit `0`, restored and input-ready; Bring Top exit `0`, Above already satisfied; Bring Here exit `0`, relocation and placement confirmed; no-owner Show exit `3`, correctly reporting no running instance. Focus identity was unchanged: `FOCUS_BEFORE=56623118`, `FOCUS_AFTER=56623118`. The current desktop remained `1` across the visible Bring Here test.
+
+These are **owner-reported native regression observations**, supplied with A00-RF-DOC1, not CI assertions or fault-injection evidence on the physical host. They do not exhaustively retest Stage-E N01–N19 or Stage-F lifecycle faults. Physical X11 failure injection, every lifecycle race, native reply loss, every Partial/OutcomeUnknown condition, Wayland and other window managers remain unverified. The original E4 acceptance qualifications remain intact.
+
+### Deferrals and next proposed gate
+
+**RF2e layer-service extraction is deferred after architectural reassessment.** Useful boundaries are already established: pure controller in `layer.rs`, native observations/requests in `x11/state.rs`, and local/remote coordination in `main.rs` borrowing the sole runtime controller. Further movement would need a concrete benefit sufficient to justify extra interfaces around runtime/input/deadline ordering. Large-file size by itself does not supply that need.
+
+**RF2f caller-lifecycle extraction is deferred.** Caller capture/discovery, immutable identity/send, reply correlation and cleanup remain cohesive with native control transport in `x11/control.rs`; the useful diagnostic boundary is already separate. No current need justifies another lifecycle module or parallel resource authority.
+
+**The structural effort is closed at RF2d because useful ownership boundaries have been established, not because every large Rust file has been split.** RF3 remains conditional on a future concrete architectural need and a separately approved design/mission; it is not an automatic continuation or an authorization to divide the event loop.
+
+The modularization pause has ended. A **read-only Stage-F coverage/architecture review** is the recommended next mission, to assess existing coverage against the unchanged [M03.3 Stage-F contract](DesktopRoomie-A00-M03.3-staged-implementation-roadmap.md#11-stage-f--lifecycle-concurrency-and-deadline-hardening) before proposing bounded work. Stage F remains unimplemented and separately gated; Stage G integrated M03.3 acceptance follows F. Neither was completed, accepted or pre-authorized by RF closure or this documentation mission.
+
+## Historical RF-P record (superseded planning snapshot)
+
+**Archive boundary:** everything below preserves the original RF-P audit, proposed sequencing and RF1a contract. Its status labels, source sizes/locations and next-action language apply only to the old snapshot. Use the current closeout above and the actual source tree for present status and ownership; do not execute archived assignments without a fresh owner-approved mission.
+
 **Design decision, 2026-10-21:** RF-P read-only architecture audit completed and independently reviewed. **Approved direction:** extract selected inline unit-test modules first; reassess production-only ownership afterward, then authorize small cohesive production extractions only where they improve dependency direction or maintainability. **Next candidate assignment: RF1a only.** This is a planning and documentation record, not implementation, source review, CI or native acceptance. No RF coding checkpoint is complete.
 
 **Repository:** `zNe4/DesktopRoomie`, mission branch `m03`.
