@@ -1,3 +1,4 @@
+mod cli;
 mod control;
 mod geometry;
 mod interaction;
@@ -15,6 +16,9 @@ use x11rb::protocol::shape::ConnectionExt as ShapeExt;
 use x11rb::protocol::xproto::{GrabStatus, MapNotifyEvent, VisualClass};
 use x11rb::protocol::Event;
 
+#[cfg(test)]
+use crate::cli::HELP;
+use crate::cli::{parse_args, print_help, CliMode};
 use crate::geometry::{calculate_centered_origin, compute_valid_origin_bounds, Point, Size};
 use crate::interaction::{HostAction, InteractionManager, InteractionState, MenuOutcome};
 use crate::layer::{Layer, LayerController, Mutation, ObservedLayer, Step};
@@ -26,26 +30,6 @@ use crate::x11::render::{Renderer, WINDOW_HEIGHT, WINDOW_WIDTH};
 use crate::x11::state::{LayerAtoms, LayerSupport, PropertyResult, RemoteLayerIssue};
 use crate::x11::visual::find_alpha_visual;
 use crate::x11::window::{ConfigureReconciliation, ManagedProbeWindow};
-
-#[derive(Debug, PartialEq, Eq)]
-enum CliMode {
-    Help,
-    Diagnose,
-    Owner {
-        delay_secs: Option<u64>,
-        duration_secs: Option<u64>,
-    },
-    Control(control::Command),
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct UsageError(String);
-
-impl UsageError {
-    fn exit_code(&self) -> control::ExitCode {
-        control::ExitCode::Usage
-    }
-}
 
 #[repr(C)]
 struct PollFd {
@@ -59,99 +43,6 @@ const CONFIRMATION_TIMEOUT: Duration = Duration::from_millis(150);
 
 extern "C" {
     fn poll(fds: *mut PollFd, nfds: usize, timeout: std::os::raw::c_int) -> std::os::raw::c_int;
-}
-
-// Arguments exclude argv[0]. Parsing has no process, output, or host side effects.
-fn parse_args<I, S>(args: I) -> Result<CliMode, UsageError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let mut args = args.into_iter();
-    let mut help = false;
-    let mut diagnose = false;
-    let mut duration_secs = None;
-    let mut delay_secs = None;
-    let mut command = None;
-    while let Some(arg) = args.next() {
-        match arg.as_ref() {
-            "-h" | "--help" => help = true,
-            "--diagnose" => diagnose = true,
-            flag @ ("--delay" | "--duration") => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| UsageError(format!("Missing value for {flag} <seconds>")))?;
-                let value = value.as_ref().parse::<u64>().map_err(|_| {
-                    UsageError(format!("Invalid value for {flag}: '{}'", value.as_ref()))
-                })?;
-                if flag == "--delay" {
-                    delay_secs = Some(value);
-                } else {
-                    duration_secs = Some(value);
-                }
-            }
-            flag @ ("--hide" | "--show" | "--bring-top" | "--bring-here" | "--recover") => {
-                let next = match flag {
-                    "--hide" => control::Command::Hide,
-                    "--show" => control::Command::Show,
-                    "--bring-here" => control::Command::BringHere,
-                    "--recover" => control::Command::Recover,
-                    _ => control::Command::BringTop,
-                };
-                if command.replace(next).is_some() {
-                    return Err(UsageError("Control commands are mutually exclusive".into()));
-                }
-            }
-            unknown => {
-                return Err(UsageError(format!(
-                    "Unknown option: '{unknown}'. Use --help for usage."
-                )))
-            }
-        }
-    }
-    if let Some(command) = command {
-        if diagnose || delay_secs.is_some() || duration_secs.is_some() {
-            return Err(UsageError(
-                "Control commands cannot combine with --diagnose, --delay, or --duration".into(),
-            ));
-        }
-        if !help {
-            return Ok(CliMode::Control(command));
-        }
-    }
-    if help {
-        Ok(CliMode::Help)
-    } else if diagnose {
-        Ok(CliMode::Diagnose)
-    } else {
-        Ok(CliMode::Owner {
-            delay_secs,
-            duration_secs,
-        })
-    }
-}
-
-const HELP: &str = "DesktopRoomie - A00-M03.3: Desktop Probe
-
-Left click toggles color; left drag moves the body.
-Right click opens Above/Normal/Below/Dismiss/Quit after release. Outside left click dismisses.
-
-USAGE:
-  desktop-probe [OPTIONS]
-
-OPTIONS:
-  -h, --help              Show this help message and exit
-  --diagnose              Run pure X11 environment diagnostics and exit
-  --delay <SECONDS>       Delay in seconds before mapping window (for typing test)
-  --duration <SECONDS>    Run for a specified duration in seconds, then exit
-  --show       Restore the existing body without activation or workspace/layer changes
-  --hide       Minimize the existing body without workspace/layer changes
-  --bring-top  Ensure the existing body is not minimized and set Above on its existing workspace
-  --bring-here Move the existing body to the caller's current workspace, preserving its effective layer and genuine minimized state; do not activate it or switch the user's workspace
-  --recover    Bring the existing body to the caller's frozen current workspace, restore it if minimized, and set Above; confirm placement and input readiness without activation or switching the user's workspace";
-
-fn print_help() {
-    println!("{HELP}");
 }
 
 fn main() {
