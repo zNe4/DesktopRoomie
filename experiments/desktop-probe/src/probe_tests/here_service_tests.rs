@@ -3145,6 +3145,18 @@ pub(crate) mod recover_tests {
         (h, owner)
     }
 
+    /// Export only the sole active slot reached by the existing production turns:
+    /// admission, desktop attempt, Here arrival, Top restore/correction, layer
+    /// removal/addition, then host Above before the slot's final validation.
+    pub(crate) fn lifecycle_snapshots() -> Vec<(usize, ActiveOperation)> {
+        (0..8)
+            .map(|phase| {
+                let (_, owner) = checkpoint(phase);
+                (phase, *owner.active().unwrap())
+            })
+            .collect()
+    }
+
     fn external(owner: &mut HereOwner, h: &mut Host, original: HostError) -> HostError {
         finish_probe_run_with(Err(original), |original| {
             let mut original = Some(original);

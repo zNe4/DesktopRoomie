@@ -1,6 +1,6 @@
 use super::*;
 use std::collections::VecDeque;
-use x11rb::protocol::xproto::DestroyNotifyEvent;
+use x11rb::protocol::xproto::{DestroyNotifyEvent, SelectionClearEvent};
 
 const ROOT: u32 = 55;
 const CONTROL: u32 = 10;
@@ -1012,6 +1012,305 @@ fn recover_shutdown_preserves_every_history_partition_and_clears_current_proof()
                 }
             }
         }
+    }
+}
+
+fn recover_lifecycle_endpoint(operation: ActiveOperation) -> ControlWindow {
+    let mut endpoint = ControlWindow::candidate(0, CONTROL, 77, 50, 51, 52);
+    endpoint.root = ROOT;
+    endpoint.transport = atoms();
+    endpoint.descriptor = owner();
+    endpoint.owns_selection = true;
+    // Transfer a snapshot of the production-driven slot, without reconstructing
+    // any phase, proof, consumed attempt or deadline in this transport fixture.
+    endpoint.active = Some(operation);
+    endpoint
+}
+
+fn recover_selection_clear(synthetic: bool) -> Event {
+    Event::SelectionClear(SelectionClearEvent {
+        response_type: 29 | if synthetic { 0x80 } else { 0 },
+        owner: CONTROL,
+        selection: 50,
+        ..Default::default()
+    })
+}
+
+fn assert_recover_lifecycle_terminal(
+    endpoint: &mut ControlWindow,
+    phase: usize,
+    operation: ActiveOperation,
+    reason: Reason,
+    peer_failure: usize,
+) {
+    let owned = endpoint.owns_selection;
+    assert_eq!(owned, reason == Reason::Closing);
+    let descriptor = endpoint.descriptor;
+    let mut queries = 0;
+    let mut writes = 0;
+    endpoint
+        .closing_with(
+            || {
+                assert!(owned, "lost owner must not query or reacquire");
+                queries += 1;
+                Ok(CONTROL)
+            },
+            |published| {
+                assert!(owned, "must not publish under a replacement owner");
+                writes += 1;
+                assert_eq!(
+                    published,
+                    OwnerDescriptor {
+                        lifecycle: Lifecycle::Closing,
+                        ..descriptor
+                    }
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!((queries, writes), (usize::from(owned), usize::from(owned)));
+    // Lifecycle handling/Closing cannot replenish attempts, change identity,
+    // advance the operation or renew any of its phase/total deadlines.
+    assert_eq!(endpoint.active(), Some(&operation), "snapshot {phase}");
+    assert_eq!(endpoint.owns_selection, owned);
+
+    let mut peer = Fake::new();
+    peer.owner = CONTROL + 1;
+    peer.send_ok = peer_failure != 1;
+    peer.failure = (peer_failure == 2).then_some("send");
+    assert_eq!(
+        endpoint.finish_remote_with(&mut peer).is_err(),
+        peer_failure == 2,
+        "snapshot {phase}"
+    );
+    assert!(endpoint.active().is_none(), "clear even on a failed send");
+    assert_eq!(peer.sent.len(), 1);
+    let event = &peer.sent[0];
+    assert_eq!(event.window, operation.request.reply_xid);
+    assert_eq!(event.type_, atoms().reply);
+    let reply = TerminalResponse::decode(&event.data.as_data32()).unwrap();
+    assert_eq!(reply.control_xid, CONTROL);
+    assert_eq!(reply.request_id, operation.request.request_id);
+    assert!(ReplyCorrelation {
+        control_xid: CONTROL,
+        epoch: operation.request.epoch,
+        request_id: operation.request.request_id,
+        reply_xid: operation.request.reply_xid,
+    }
+    .matches(descriptor, event.window, reply));
+    let history = operation.placement.proof.history;
+    assert_eq!(history.relocation_confirmed, phase >= 2);
+    assert_eq!(history.restoration_confirmed, phase >= 4);
+    assert_eq!(reply.detail.placement.history, history);
+    assert_eq!(
+        reply.status,
+        if history.relocation_confirmed || history.restoration_confirmed {
+            Status::Partial
+        } else {
+            Status::Failed
+        }
+    );
+    assert_eq!(
+        (reply.detail.reason, reply.detail.stage),
+        (reason, Stage::Shutdown)
+    );
+    assert_eq!(
+        reply.detail.placement.current,
+        control::PlacementConfirmation::default()
+    );
+    assert_eq!(
+        reply.detail.progress,
+        control::Progress {
+            host_mutation_dispatched: operation.detail.progress.host_mutation_dispatched,
+            ..Default::default()
+        }
+    );
+    assert_eq!(
+        (
+            reply.detail.visibility,
+            reply.detail.layer,
+            reply.detail.workspace
+        ),
+        (
+            control::Visibility::Unknown,
+            control::LayerObservation::Unknown,
+            control::Workspace::Unknown
+        )
+    );
+    if !owned {
+        assert!(!endpoint
+            .handle_event_with(&recover_selection_clear(false), || panic!(
+                "loss stays terminal"
+            ))
+            .unwrap());
+        assert!(endpoint
+            .handle_event_with(&destroyed(false), || panic!(
+                "native destruction needs no query"
+            ))
+            .unwrap());
+        endpoint
+            .closing_with(
+                || panic!("no reacquisition"),
+                |_| panic!("no publication after loss"),
+            )
+            .unwrap();
+    }
+    endpoint.finish_remote_with(&mut peer).unwrap();
+    assert!(!endpoint
+        .service_here_with_peer(&mut peer, |_, _, _, _| panic!(
+            "no operation after loss/shutdown"
+        ))
+        .unwrap());
+    assert_eq!(peer.sent.len(), 1, "no second terminal attempt");
+    assert_eq!(
+        peer.log,
+        ["send"],
+        "no discovery, read or mutation after loss/shutdown"
+    );
+}
+
+#[test]
+fn recover_selection_clear_confirms_loss_at_every_service_snapshot() {
+    for (phase, operation) in crate::here_service_tests::recover_tests::lifecycle_snapshots() {
+        for replacement in [0, CONTROL + 1] {
+            for synthetic in [false, true] {
+                for peer_failure in 0..3 {
+                    let mut endpoint = recover_lifecycle_endpoint(operation);
+                    let event = recover_selection_clear(synthetic);
+                    let mut queries = 0;
+                    assert!(endpoint
+                        .handle_event_with(&event, || {
+                            queries += 1;
+                            Ok(replacement)
+                        })
+                        .unwrap());
+                    assert_eq!(queries, 1, "SelectionClear requires fresh confirmation");
+                    assert!(!endpoint.owns_selection);
+                    assert!(
+                        endpoint.exists,
+                        "selection loss is not endpoint destruction"
+                    );
+                    for repeated in [
+                        recover_selection_clear(false),
+                        recover_selection_clear(true),
+                    ] {
+                        assert!(!endpoint
+                            .handle_event_with(&repeated, || panic!(
+                                "no query or reacquisition after loss"
+                            ))
+                            .unwrap());
+                    }
+                    assert_recover_lifecycle_terminal(
+                        &mut endpoint,
+                        phase,
+                        operation,
+                        Reason::OwnershipLost,
+                        peer_failure,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn recover_selection_clear_with_unchanged_owner_preserves_every_service_snapshot() {
+    for (phase, operation) in crate::here_service_tests::recover_tests::lifecycle_snapshots() {
+        for synthetic in [false, true] {
+            let mut endpoint = recover_lifecycle_endpoint(operation);
+            let descriptor = endpoint.descriptor;
+            let mut queries = 0;
+            assert!(!endpoint
+                .handle_event_with(&recover_selection_clear(synthetic), || {
+                    queries += 1;
+                    Ok(CONTROL)
+                })
+                .unwrap());
+            assert_eq!(queries, 1);
+            assert!(endpoint.owns_selection);
+            assert!(endpoint.exists);
+            assert_eq!(endpoint.descriptor, descriptor);
+            assert_eq!(endpoint.active(), Some(&operation));
+            // A later clean shutdown must still be Closing, never OwnershipLost.
+            assert_recover_lifecycle_terminal(&mut endpoint, phase, operation, Reason::Closing, 0);
+        }
+    }
+}
+
+#[test]
+fn recover_native_endpoint_destroy_is_terminal_at_every_service_snapshot() {
+    for (phase, operation) in crate::here_service_tests::recover_tests::lifecycle_snapshots() {
+        for peer_failure in 0..3 {
+            let mut endpoint = recover_lifecycle_endpoint(operation);
+            let event = destroyed(false);
+            assert!(endpoint
+                .handle_event_with(&event, || panic!(
+                    "native destruction needs no ownership query"
+                ))
+                .unwrap());
+            assert!(!endpoint.exists);
+            assert!(!endpoint.owns_selection);
+            endpoint
+                .resource
+                .release_with(|| panic!("externally destroyed endpoint"))
+                .unwrap();
+            assert!(endpoint
+                .handle_event_with(&event, || panic!("repeated destroy needs no query"))
+                .unwrap());
+            assert!(!endpoint
+                .handle_event_with(&recover_selection_clear(false), || panic!(
+                    "no reacquisition"
+                ))
+                .unwrap());
+            assert!(!endpoint
+                .handle_event_with(&destroyed(true), || panic!("synthetic destroy"))
+                .unwrap());
+            assert_recover_lifecycle_terminal(
+                &mut endpoint,
+                phase,
+                operation,
+                Reason::OwnershipLost,
+                peer_failure,
+            );
+        }
+    }
+}
+
+#[test]
+fn recover_synthetic_destroy_and_unrelated_lifecycle_events_preserve_every_snapshot() {
+    for (phase, operation) in crate::here_service_tests::recover_tests::lifecycle_snapshots() {
+        let mut endpoint = recover_lifecycle_endpoint(operation);
+        for synthetic in [false, true] {
+            for (clear_owner, selection) in [(CONTROL + 1, 50), (CONTROL, 51)] {
+                let event = Event::SelectionClear(SelectionClearEvent {
+                    response_type: 29 | if synthetic { 0x80 } else { 0 },
+                    owner: clear_owner,
+                    selection,
+                    ..Default::default()
+                });
+                assert!(!endpoint
+                    .handle_event_with(&event, || panic!("unrelated clear"))
+                    .unwrap());
+                assert_eq!(endpoint.active(), Some(&operation));
+            }
+            let event = Event::DestroyNotify(DestroyNotifyEvent {
+                response_type: 17 | if synthetic { 0x80 } else { 0 },
+                window: CONTROL + 1,
+                ..Default::default()
+            });
+            assert!(!endpoint
+                .handle_event_with(&event, || panic!("unrelated destroy"))
+                .unwrap());
+        }
+        assert!(!endpoint
+            .handle_event_with(&destroyed(true), || panic!("fabricated destroy"))
+            .unwrap());
+        assert!(endpoint.exists);
+        assert!(endpoint.owns_selection);
+        assert_eq!(endpoint.descriptor, owner());
+        assert_eq!(endpoint.active(), Some(&operation));
+        assert_recover_lifecycle_terminal(&mut endpoint, phase, operation, Reason::Closing, 0);
     }
 }
 
