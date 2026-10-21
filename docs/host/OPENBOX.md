@@ -1,6 +1,6 @@
 # Openbox host integration — user-managed setup
 
-**Acceptance status update, 2026-10-20:** M03.2 remains final-accepted at frozen H. M03.3 standalone public `--bring-here` is now owner-accepted at D4.1 executable `4c67da0b09ffe7b69605ac4a415d256acf8abd23`, [CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762), **677 tests**. [Stage-D native evidence](../../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md) records N08/N09 qualifications and N10–N13 natively unexercised conditions. Recover remains Unsupported; no host configuration change is authorized by this record.
+**Acceptance status update, 2026-10-21:** M03.2 remains final-accepted at H. M03.3 standalone `--bring-here` is Stage-D accepted at `4c67da0b09ffe7b69605ac4a415d256acf8abd23` ([CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762), 677 tests). Public `--recover` is **Stage-E accepted on the exercised Openbox/X11 host** at `aa00f8e94aff1cf2ef1ff6a6cecf734f822d5603`, [CI 39529051360](https://github.com/zNe4/DesktopRoomie/actions/runs/39529051360), 737 tests. Owner N01–N19 native scenarios passed with [documented limitations](../../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md). No host configuration edit or Stage-F/G authorization is implied.
 
 **Historical 2026-10-18 snapshot:** M03.2 H and M03.3 A/B/H0/C were the then-accepted foundation, before public Bring Here. Current status is the D4.1 acceptance above; dated F/G/H evidence stays tied to original tested revisions.
 
@@ -256,15 +256,23 @@ After deliberately editing the active `rc.xml`, `openbox --reconfigure` requests
 | `--hide` | Hide safely while leaving the same instance controllable | M03.2 |
 | `--bring-top` | Show if hidden and place Above on the **existing body workspace** | M03.2 |
 | `--bring-here` | **Accepted standalone Stage D**: move same body to frozen caller workspace; preserve layer and genuine minimization without focus/user-desktop switching; minimized geometry/input deferred | M03.3-D |
-| `--recover` | **Not public / Unsupported**; intended composition Bring Here then Bring Top | M03.3-E (future) |
+| `--recover` | **Accepted Stage E on this Openbox/X11 host**: frozen-workspace Bring Here followed by local restore/Above and fresh input/geometry proof | M03.3-E |
 
-M03.2 Hide/Show/Bring Top are final-accepted at H. M03.3 A/B/H0/C/D are separately accepted, including public Bring Here at D4.1. Recover remains unsupported. Optional keyboard bindings are user-managed and were not smoke-tested for Here; Stage E requires separate authorization.
+M03.2 Hide/Show/Bring Top are final-accepted at H. M03.3 A/B/H0/C/D and Stage E are separately accepted, including Bring Here at D4.1 and Recover at E4. Optional keyboard bindings remain user-managed and were not separately smoke-tested for Recover. Stage F/G require separate authorization.
 
 ## Stage-D owner-native Bring Here acceptance (2026-10-20)
 
 Frozen executable `4c67da0b09ffe7b69605ac4a415d256acf8abd23`, [CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762), 677 tests. Unlike H0's manually instrumented Stage-B feasibility experiment, D4.1 exercised the public `--bring-here` command with real owner/reply routing. Normal/Above/Below and genuine minimized relocation were confirmed, as were uninterrupted typing/focus, same body identity, transparent-padding interaction, already-local gesture cancellation, independent covered/minimized control, repeated successful relocation, duplicate refusal, clean Quit/relaunch and passive state stability. The owner's N08 delayed tests captured an **already-local** workspace at execution time, not remote relocation during a drag; N09 was manual with retained-monitor geometry corroboration. Real malformed-property/monitor-loss/WM-refusal tests N10–N13 were not fully exercised, nor were concurrent/kill/duration native regressions repeated at D4.1. Full [acceptance record](../../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md).
 
-Bring Here captures the **current workspace when the caller executes**; scheduling a command before switching back does not freeze the earlier workspace. It is not an Openbox keybinding or continuous-follow feature, and does not target the physical monitor containing the caller's terminal. Recover remains unavailable.
+Bring Here and Recover capture the **current workspace when the caller executes** before owner discovery; scheduling a command before switching back does not freeze the earlier workspace. Neither is an automatic-follow feature nor targets the caller terminal's physical monitor. Recover was unavailable at the historical Stage-D executable and became public at accepted E4.
+
+## Stage-E owner-native Recover acceptance (2026-10-21)
+
+Frozen public Recover executable `aa00f8e94aff1cf2ef1ff6a6cecf734f822d5603`, [matching CI 39529051360](https://github.com/zNe4/DesktopRoomie/actions/runs/39529051360), **737 passed / 0 failed**; fmt/build/Clippy PASS. E1–E4 and owner-native N01–N19 passed for exercised cases. The [Stage-E acceptance](../../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md) supplies exact revision identities, per-test findings and evidence limits.
+
+Native coverage: local and remote visible/minimized Normal/Above/Below recovery, historical relocation/restoration, retained body and focus, click-through, popup/drag behavior, and 20 sequential operations. Bounded concurrent N13 no-ops were all successful; genuine remote minimized N14 contention gave **one Success and seven Busy (exit 5)**, with N15 proving post-Busy release. N16 no-owner returned exit 3 without implicit launch; N17 Quit/relaunch, N18 four local variants, and N19 popup/drag interaction plus identical 15-second passive X11 snapshots all passed. The original N13 shell **harness** used zsh's special `commands` parameter and launched runaway jobs; after a reboot a bounded Bash harness passed. This was not an observed DesktopRoomie failure.
+
+Monitor retention and some pointer/focus observations were owner-reported without new RandR topology snapshots. No native hot-plug, induced WM/X11 errors, transport-loss Partial/Unknown, other-WM/Wayland certification or optional binding tests are claimed. Openbox configuration remains user-managed and unchanged.
 
 ## Official reference material
 
@@ -273,4 +281,4 @@ Bring Here captures the **current workspace when the caller executes**; scheduli
 - [Openbox autostart](https://openbox.org/help/Autostart) — user startup scripts and `openbox-session` distinction.
 - [Openbox configuration](https://openbox.org/help/Configuration) — user/system configuration locations.
 
-Hide, Show, original-workspace Bring Top and standalone Bring Here are accepted on the exercised Openbox host. Optional bindings are owner-managed/not tested here; Recover is still unsupported. M03.2 H-A, M03.3 H0, and Stage-D evidence retain distinct executable identities. [Stage-D acceptance](../../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md).
+Hide, Show, original-workspace Bring Top, standalone Bring Here and composed Recover are accepted on the exercised Openbox host at their distinct frozen revisions. Optional bindings remain owner-managed, not independently acceptance-tested. M03.2 H-A, M03.3 H0, Stage D and Stage E evidence retain separate executable identities. [Stage-D acceptance](../../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md); [Stage-E acceptance](../../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md).
