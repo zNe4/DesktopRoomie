@@ -90,11 +90,12 @@ where
                     duration_secs = Some(value);
                 }
             }
-            flag @ ("--hide" | "--show" | "--bring-top" | "--bring-here") => {
+            flag @ ("--hide" | "--show" | "--bring-top" | "--bring-here" | "--recover") => {
                 let next = match flag {
                     "--hide" => control::Command::Hide,
                     "--show" => control::Command::Show,
                     "--bring-here" => control::Command::BringHere,
+                    "--recover" => control::Command::Recover,
                     _ => control::Command::BringTop,
                 };
                 if command.replace(next).is_some() {
@@ -146,7 +147,8 @@ OPTIONS:
   --show       Restore the existing body without activation or workspace/layer changes
   --hide       Minimize the existing body without workspace/layer changes
   --bring-top  Ensure the existing body is not minimized and set Above on its existing workspace
-  --bring-here Move the existing body to the caller's current workspace, preserving its effective layer and genuine minimized state; do not activate it or switch the user's workspace";
+  --bring-here Move the existing body to the caller's current workspace, preserving its effective layer and genuine minimized state; do not activate it or switch the user's workspace
+  --recover    Bring the existing body to the caller's frozen current workspace, restore it if minimized, and set Above; confirm placement and input readiness without activation or switching the user's workspace";
 
 fn print_help() {
     println!("{HELP}");
@@ -2326,7 +2328,9 @@ fn service_visibility_with(
         control::Command::BringHere => {
             Err("Bring Here requires the dedicated Here owner service".into())
         }
-        control::Command::Recover => Ok(Some(unsupported_placement(operation))),
+        control::Command::Recover => {
+            Err("Recover requires the dedicated placement owner service".into())
+        }
     }
 }
 
@@ -3593,25 +3597,13 @@ fn service_remote_with(
         return Err("Bring Here requires the dedicated Here owner service".into());
     }
     if operation.request.command == control::Command::Recover {
-        return Ok(Some(unsupported_placement(operation)));
+        return Err("Recover requires the dedicated placement owner service".into());
     }
     if operation.request.command == control::Command::BringTop {
         service_bring_top_with(operation, host)
     } else {
         service_visibility_with(operation, host)
     }
-}
-
-/// Recover remains unavailable at the service boundary without any host call.
-fn unsupported_placement(operation: &control::ActiveOperation) -> control::OperationResult {
-    control::OperationResult::placement(
-        operation.request.command,
-        control::Status::Failed,
-        control::preflight_detail(control::Reason::Unsupported, control::Stage::Preflight),
-        control::Confirmation::default(),
-        &operation.placement,
-    )
-    .expect("Recover is unsupported without progress")
 }
 
 /// Retains marked dispatch even when the native check fails. A transitional
@@ -4371,6 +4363,22 @@ fn service_recover_owner_with(
     reply: impl FnOnce(control::OperationResult) -> Result<(), HostError>,
 ) -> Result<(), HostError> {
     service_placement_owner_with(active, host, reply, service_recover_with)
+}
+
+/// Dispatch the borrowed public placement slot without entering legacy visibility.
+fn service_admitted_placement_with(
+    active: &mut Option<control::ActiveOperation>,
+    host: &mut impl RecoverHost,
+    reply: impl FnMut(control::OperationResult) -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    if active
+        .as_ref()
+        .is_some_and(|op| op.request.command == control::Command::Recover)
+    {
+        service_recover_owner_with(active, host, reply)
+    } else {
+        service_here_owner_with(active, host, reply)
+    }
 }
 
 fn service_placement_owner_with<H: BringHereHost>(
@@ -5927,14 +5935,7 @@ fn service_owner_operation<C: Connection>(
             selection,
             control_xid,
         };
-        if active
-            .as_ref()
-            .is_some_and(|op| op.request.command == control::Command::Recover)
-        {
-            service_recover_owner_with(active, &mut here, reply)
-        } else {
-            service_here_owner_with(active, &mut here, reply)
-        }
+        service_admitted_placement_with(active, &mut here, reply)
     })? {
         return Ok(());
     }
@@ -9863,33 +9864,53 @@ mod cli_tests {
             ("--show", Command::Show),
             ("--bring-top", Command::BringTop),
             ("--bring-here", Command::BringHere),
+            ("--recover", Command::Recover),
         ] {
             assert_eq!(parse_args([flag]), Ok(CliMode::Control(command)));
         }
     }
     #[test]
-    fn help_advertises_only_enabled_bring_here_with_preservation_semantics() {
+    fn help_advertises_both_placement_commands_with_their_semantics() {
         assert!(HELP.contains("A00-M03.3"));
         assert!(HELP.contains("--bring-here"));
         assert!(HELP.contains("genuine minimized state"));
         assert!(HELP.contains("do not activate it or switch the user's workspace"));
-        assert!(!HELP.contains("--recover"));
-    }
-    #[test]
-    fn recover_remains_unknown_cli_option() {
-        let flag = "--recover";
-        let error = parse_args([flag]).unwrap_err();
-        assert_eq!(error.exit_code(), ExitCode::Usage);
-        assert!(error.0.contains(&format!("Unknown option: '{flag}'")));
+        let recover = HELP
+            .lines()
+            .find(|line| line.contains("--recover"))
+            .unwrap();
+        for meaning in [
+            "existing body",
+            "frozen current workspace",
+            "restore it if minimized",
+            "Above",
+            "placement and input readiness",
+            "without activation",
+            "switching the user's workspace",
+        ] {
+            assert!(recover.contains(meaning), "{meaning}");
+        }
+        assert_eq!(
+            parse_args(["--recover"]),
+            Ok(CliMode::Control(Command::Recover))
+        );
+        assert_eq!(parse_args(["--recover", "--help"]), Ok(CliMode::Help));
     }
     #[test]
     fn control_conflicts_in_either_order_are_usage_errors() {
-        for a in ["--hide", "--show", "--bring-top", "--bring-here"] {
+        for a in [
+            "--hide",
+            "--show",
+            "--bring-top",
+            "--bring-here",
+            "--recover",
+        ] {
             for b in [
                 "--hide",
                 "--show",
                 "--bring-top",
                 "--bring-here",
+                "--recover",
                 "--diagnose",
             ] {
                 for args in [[a, b], [b, a]] {
@@ -10677,20 +10698,17 @@ mod show_tests {
         );
         let mut operation = active.unwrap();
         let original = operation;
-        let result = service_remote_with(&mut operation, &mut host)
-            .unwrap()
-            .unwrap();
         assert_eq!(
-            (
-                result.status(),
-                result.detail().reason,
-                result.detail().stage
-            ),
-            (
-                Status::Failed,
-                Reason::Unsupported,
-                control::Stage::Preflight
-            )
+            service_remote_with(&mut operation, &mut host)
+                .unwrap_err()
+                .to_string(),
+            "Recover requires the dedicated placement owner service"
+        );
+        assert_eq!(
+            service_visibility_with(&mut operation, &mut host)
+                .unwrap_err()
+                .to_string(),
+            "Recover requires the dedicated placement owner service"
         );
         assert!(host.log.is_empty());
         assert!(host.mutations.is_empty());
@@ -17820,7 +17838,7 @@ mod here_service_tests {
         assert_eq!(service.matches("owner.verify_active_ownership").count(), 1);
     }
 
-    mod recover_tests {
+    pub(crate) mod recover_tests {
         use super::*;
         use control::{RecoverPhase, Visibility};
         use std::cell::{Cell, RefCell};
@@ -18160,6 +18178,93 @@ mod here_service_tests {
 
         fn owner(h: &Host) -> HereOwner {
             HereOwner::recover(h.here.now, 2)
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum PublicFault {
+            None,
+            Layout,
+            AfterRelocation,
+            AfterRestoration,
+            AfterBoth,
+            OwnerLost,
+            Native,
+            NativeDispatch,
+        }
+
+        /// Borrow the actually admitted public slot into the production dispatcher
+        /// and scheduler. Only WM observations and native resources are injected.
+        pub(crate) fn public_roundtrip_service(
+            active: &mut Option<ActiveOperation>,
+            remote: bool,
+            minimized: bool,
+            layer: L,
+            fault: PublicFault,
+            reply: &mut dyn FnMut(control::OperationResult) -> Result<(), HostError>,
+        ) -> Result<(), HostError> {
+            let mut h = Host::new(remote, minimized, layer);
+            h.here.window.window = 88;
+            let original = *active.as_ref().unwrap();
+            h.here.now = original.deadline - Command::Recover.owner_budget();
+            assert_eq!(original.request.command, Command::Recover);
+            assert_eq!(original.placement.destination_desktop, 2);
+            assert_eq!(original.stage, Stage::Placement);
+            match fault {
+                PublicFault::Layout => h.here.layout = Err(DestinationError::Changed),
+                PublicFault::OwnerLost => h.here.owned = false,
+                PublicFault::Native => h.here.faults.push(("layout", 1)),
+                PublicFault::NativeDispatch => h.here.faults.push(("desktop", 1)),
+                PublicFault::AfterRestoration | PublicFault::AfterBoth => h.layer_changes = false,
+                _ => {}
+            }
+            let mut injected = false;
+            for _ in 0..16 {
+                let Some(op) = active.as_mut() else {
+                    assert_eq!(h.here.window.window, 88);
+                    assert!(h.here.count("desktop") <= 1);
+                    assert!(h.here.count("map") <= 1);
+                    assert!(h.here.count("correct") <= 1);
+                    return Ok(());
+                };
+                assert_eq!(op.request, original.request);
+                assert_eq!(op.deadline, original.deadline);
+                let history = op.placement.proof.history;
+                let fail_now = match fault {
+                    PublicFault::AfterRelocation => history.relocation_confirmed,
+                    PublicFault::AfterRestoration => history.restoration_confirmed,
+                    PublicFault::AfterBoth => {
+                        history.relocation_confirmed && history.restoration_confirmed
+                    }
+                    _ => false,
+                };
+                if fail_now && !injected {
+                    h.here.layout = Err(DestinationError::Changed);
+                    mark_remote_observation(op, false);
+                    injected = true;
+                }
+                if !remote_service_due(op, h.here.now) {
+                    // A real WM notification supplies the next fresh observation.
+                    if op.recover_phase == RecoverPhase::Here && h.here.count("desktop") > 0 {
+                        h.here.target();
+                    } else if h.here.count("map") > 0 && fault != PublicFault::AfterRelocation {
+                        h.restored();
+                    }
+                    mark_remote_observation(op, false);
+                }
+                let outcome = service_admitted_placement_with(active, &mut h, &mut *reply);
+                if let Err(error) = outcome {
+                    // Fatal owner errors still send their one correlated terminal
+                    // result before propagating to global cleanup.
+                    assert!(active.is_none());
+                    if !matches!(
+                        fault,
+                        PublicFault::Native | PublicFault::NativeDispatch | PublicFault::OwnerLost
+                    ) {
+                        return Err(error);
+                    }
+                }
+            }
+            panic!("public Recover did not terminate: {fault:?}");
         }
 
         fn tick(owner: &mut HereOwner, h: &mut Host) -> Result<(), HostError> {
@@ -18918,20 +19023,8 @@ mod here_service_tests {
         }
 
         #[test]
-        fn public_recover_guards_and_owner_wait_boundaries_remain_reachable_as_specified() {
-            assert!(!HELP.contains("--recover"));
-            assert!(parse_args(["--recover"]).is_err());
+        fn production_owner_wait_boundaries_remain_reachable_as_specified() {
             let source = include_str!("main.rs");
-            let service = source
-                .split("fn service_remote_with(")
-                .nth(1)
-                .unwrap()
-                .split("fn unsupported_placement(")
-                .next()
-                .unwrap();
-            assert!(service.contains("operation.request.command == control::Command::Recover"));
-            assert!(service.contains("return Ok(Some(unsupported_placement(operation)))"));
-            assert!(!service.contains("service_recover_with("));
             let probe = source
                 .split("fn run_probe(")
                 .nth(1)
@@ -18948,19 +19041,6 @@ mod here_service_tests {
                 probe.rfind("service_owner_operation(").unwrap()
                     < probe.rfind("wait_x11(conn, timeout)").unwrap()
             );
-            let transport = include_str!("x11/control.rs");
-            let route = transport
-                .split("fn route_request_with(")
-                .nth(1)
-                .unwrap()
-                .split("pub enum CallerOutcome")
-                .next()
-                .unwrap();
-            assert!(route.contains("if request.command == Command::Recover"));
-            assert!(
-                route.contains("control::preflight_detail(Reason::Unsupported, Stage::Preflight)")
-            );
-            assert!(!route.contains("service_recover_with("));
         }
 
         fn assert_result(

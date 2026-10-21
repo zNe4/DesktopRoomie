@@ -1098,25 +1098,10 @@ fn route_request_with(
             (status, control::preflight_detail(reason, stage))
         }
         Admission::Admitted => {
-            if request.command == Command::Recover {
-                // Recover remains unavailable before any body/WM/input call.
-                return finish_active(
-                    host,
-                    atoms,
-                    active,
-                    TerminalResponse {
-                        status: Status::Failed,
-                        request_id: request.request_id,
-                        control_xid: owner.control_xid,
-                        detail: control::preflight_detail(Reason::Unsupported, Stage::Preflight),
-                    },
-                )
-                .map(|()| true);
-            }
             let operation = active.as_mut().unwrap();
             operation.stage = match request.command {
                 Command::Hide => Stage::Hide,
-                Command::BringHere => Stage::Placement,
+                Command::BringHere | Command::Recover => Stage::Placement,
                 _ => Stage::Show,
             };
             operation.detail = control::preflight_detail(Reason::None, operation.stage);
@@ -1164,6 +1149,7 @@ impl CallerOutcome {
             Self::Terminal(response) if command == Command::BringHere => {
                 bring_here_diagnostic(response)
             }
+            Self::Terminal(response) if command == Command::Recover => recover_diagnostic(response),
             Self::Terminal(response)
                 if command == Command::Hide && response.status == Status::Success =>
             {
@@ -1207,6 +1193,49 @@ impl CallerOutcome {
             Self::Unknown(reason) => format!("outcome unknown — {reason}"),
         };
         format!("{command}: {message}")
+    }
+}
+
+fn recover_diagnostic(response: &TerminalResponse) -> String {
+    let d = response.detail;
+    let reason = match d.reason {
+        Reason::None => "no failure reported".into(),
+        Reason::ConfirmationTimeout => "confirmation timed out".into(),
+        Reason::LayoutChanged => "frozen workspace/layout changed".into(),
+        Reason::LayerChanged => "effective layer changed incompatibly".into(),
+        Reason::OwnershipLost => "owner selection lost".into(),
+        Reason::X11Failure => "native X11 failure".into(),
+        Reason::Closing => "owner is closing".into(),
+        Reason::BodyDestroyed => "existing body was destroyed".into(),
+        Reason::Withdrawn => "existing body was withdrawn".into(),
+        Reason::Unverifiable => "required state could not be verified".into(),
+        Reason::Unsupported => "required WM support unavailable".into(),
+        Reason::Busy => "another remote or local layer/placement operation is active".into(),
+        reason => format!("{reason:?}"),
+    };
+    let history = d.placement.history;
+    match response.status {
+        Status::Success => {
+            let transitions = match (history.relocation_confirmed, history.restoration_confirmed) {
+                (true, true) => "; relocation and restoration confirmed earlier",
+                (true, false) => "; relocation confirmed earlier",
+                (false, true) => "; restoration confirmed earlier",
+                (false, false) => "",
+            };
+            format!("same existing body confirmed on caller's frozen workspace, not minimized and Above; placement verified, input ready{transitions}")
+        }
+        Status::Partial => {
+            let transitions = match (history.relocation_confirmed, history.restoration_confirmed) {
+                (true, true) => "relocation and restoration were both confirmed earlier",
+                (true, false) => "relocation was confirmed earlier; restoration was not confirmed as history",
+                (false, true) => "restoration was confirmed earlier; relocation was not confirmed as history",
+                (false, false) => "neither relocation nor restoration was confirmed as history",
+            };
+            format!("partial — {transitions}; complete final Recover postcondition is not currently confirmed; {reason} ({:?})", d.stage)
+        }
+        Status::Failed => format!("failed — complete Recover was not confirmed; neither relocation nor restoration was confirmed as history; {reason} ({:?}){}", d.stage,
+            if d.progress.host_mutation_dispatched { "; a native request may have reached the WM and later state may still change" } else { "" }),
+        status => format!("{status:?} — Recover was not completed; {reason} ({:?})", d.stage),
     }
 }
 
@@ -1475,18 +1504,22 @@ fn caller_budget(command: Command) -> Duration {
 }
 
 /// The immutable v2 marker is built once from the invoking caller's capture.
-fn here_caller_marker(
+fn placement_caller_marker(
+    command: Command,
     captured: super::monitors::destination::CallerDesktop,
     owner: OwnerDescriptor,
     request_id: u64,
-) -> CallerMarker {
-    CallerMarker {
+) -> Result<CallerMarker> {
+    if !matches!(command, Command::BringHere | Command::Recover) {
+        return Err("Only placement commands carry a frozen caller destination".into());
+    }
+    Ok(CallerMarker {
         control_xid: owner.control_xid,
         epoch: owner.epoch,
         request_id,
-        command: Command::BringHere,
+        command,
         destination_desktop: captured.frozen_destination(),
-    }
+    })
 }
 
 fn caller_with(
@@ -1499,7 +1532,7 @@ fn caller_with(
     // This begins before atom/selection discovery and never changes.
     let deadline = host.now() + caller_budget(command);
     let operation = (|| {
-        let captured = if command == Command::BringHere {
+        let captured = if matches!(command, Command::BringHere | Command::Recover) {
             match host.capture_desktop() {
                 Ok(captured) => Some(captured),
                 Err(error) => {
@@ -1538,7 +1571,7 @@ fn caller_with(
         }
         let request_id = id()?;
         let marker = if let Some(captured) = captured {
-            here_caller_marker(captured, owner, request_id)
+            placement_caller_marker(command, captured, owner, request_id)?
         } else {
             CallerMarker {
                 control_xid: owner.control_xid,
@@ -2627,6 +2660,8 @@ pub(crate) mod transport_tests {
         log: Vec<&'static str>,
         waits: Vec<Instant>,
         cost: Option<(&'static str, Duration)>,
+        step_costs: Vec<(&'static str, usize, Duration)>,
+        id_elapsed: std::rc::Rc<std::cell::Cell<Duration>>,
         endless_events: bool,
         watch_ok: bool,
         send_ok: bool,
@@ -2649,6 +2684,8 @@ pub(crate) mod transport_tests {
                 log: vec![],
                 waits: vec![],
                 cost: None,
+                step_costs: vec![],
+                id_elapsed: Default::default(),
                 endless_events: false,
                 watch_ok: true,
                 send_ok: true,
@@ -2663,6 +2700,12 @@ pub(crate) mod transport_tests {
             if let Some((target, cost)) = self.cost {
                 if target == name {
                     self.now += cost;
+                }
+            }
+            let occurrence = self.log.iter().filter(|&&step| step == name).count();
+            for &(step, nth, elapsed) in &self.step_costs {
+                if step == name && nth == occurrence {
+                    self.now += elapsed;
                 }
             }
             if self.failure == Some(name) {
@@ -2709,7 +2752,7 @@ pub(crate) mod transport_tests {
     }
     impl PeerHost for Fake {
         fn now(&self) -> Instant {
-            self.now
+            self.now + self.id_elapsed.get()
         }
         fn owner(&mut self) -> Result<u32> {
             self.call("owner")?;
@@ -2764,6 +2807,7 @@ pub(crate) mod transport_tests {
                 self.marker.replace(marker).is_none(),
                 "one immutable marker only"
             );
+            self.call("marker write")?;
             Ok(REPLY_WINDOW)
         }
         fn next(&mut self) -> Result<Option<Event>> {
@@ -2779,7 +2823,7 @@ pub(crate) mod transport_tests {
         fn wait(&mut self, deadline: Instant) -> Result<()> {
             self.call("wait")?;
             self.waits.push(deadline);
-            self.now = deadline;
+            self.now = deadline - self.id_elapsed.get();
             Ok(())
         }
         fn cleanup(&mut self) -> Result<()> {
@@ -3074,7 +3118,13 @@ pub(crate) mod transport_tests {
     }
     #[test]
     fn caller_reply_returned_at_or_after_fixed_deadline_is_unknown_without_resend() {
-        for command in [Command::Hide, Command::Show, Command::BringTop] {
+        for command in [
+            Command::Hide,
+            Command::Show,
+            Command::BringTop,
+            Command::BringHere,
+            Command::Recover,
+        ] {
             for delta in [-1_i64, 0, 1] {
                 let mut h = Fake::new();
                 let budget = caller_budget(command);
@@ -4794,7 +4844,7 @@ pub(crate) mod transport_tests {
         }
     }
     #[test]
-    fn recover_requests_end_unsupported_in_transport_without_an_active_body_operation() {
+    fn public_recover_admission_retains_the_sole_placement_slot_without_reply() {
         let command = Command::Recover;
         let mut host = Fake::new();
         host.evidence
@@ -4807,23 +4857,19 @@ pub(crate) mod transport_tests {
             &request_event(atoms(), CONTROL, request(command)).unwrap(),
         )
         .unwrap();
-        assert!(active.is_none());
-        assert_eq!(host.sent.len(), 1);
-        let event = host.sent[0];
-        assert_eq!((event.window, event.type_), (REPLY_WINDOW, atoms().reply));
-        let reply = TerminalResponse::decode(&event.data.as_data32()).unwrap();
-        assert_eq!(
-            (reply.status, reply.detail.reason, reply.detail.stage),
-            (Status::Failed, Reason::Unsupported, Stage::Preflight)
-        );
-        assert_eq!(reply.detail.progress, control::Progress::default());
-        assert_eq!(reply.detail.placement, control::PlacementProof::default());
-        assert_eq!(reply.request_id, ID);
-        assert_eq!(host.log, ["owner", "evidence", "owner", "send"]);
+        let operation = active.unwrap();
+        assert_eq!(operation.request, request(command));
+        assert_eq!(operation.placement.destination_desktop, 7);
+        assert_eq!(operation.stage, Stage::Placement);
+        assert_eq!(operation.recover_phase, control::RecoverPhase::Here);
+        assert!(operation.placement.observation_due());
+        assert_eq!(operation.deadline, host.now + Duration::from_millis(7000));
+        assert!(host.sent.is_empty());
+        assert_eq!(host.log, ["owner", "evidence", "owner"]);
     }
 
     #[test]
-    fn placement_transport_respects_lifecycle_and_busy_before_unsupported_boundary() {
+    fn placement_transport_preserves_lifecycle_and_busy_admission_policy() {
         for command in [Command::BringHere, Command::Recover] {
             for (lifecycle, busy, status, reason, stage) in [
                 (
@@ -5165,148 +5211,794 @@ pub(crate) mod transport_tests {
         }
     }
 
-    #[test]
-    fn public_bring_here_roundtrip_uses_actual_caller_admission_dispatch_and_correlated_reply() {
-        struct Coupled {
-            caller: Fake,
-            peer: Fake,
-            endpoint: ControlWindow,
-            remote: bool,
-            minimized: bool,
-            layer: control::LayerObservation,
+    use crate::here_service_tests::recover_tests::PublicFault;
+
+    struct PublicPlacementCaller {
+        caller: Fake,
+        peer: Fake,
+        endpoint: ControlWindow,
+        remote: bool,
+        minimized: bool,
+        layer: control::LayerObservation,
+        fault: PublicFault,
+        drop_reply: bool,
+        fail_reply: bool,
+        reply_error: bool,
+    }
+    impl PeerHost for PublicPlacementCaller {
+        fn now(&self) -> Instant {
+            self.caller.now()
         }
-        impl PeerHost for Coupled {
-            fn now(&self) -> Instant {
-                self.caller.now()
+        fn owner(&mut self) -> Result<u32> {
+            self.caller.owner()
+        }
+        fn evidence(&mut self, window: u32, property: u32) -> Result<Option<EndpointEvidence>> {
+            self.caller.evidence(window, property)
+        }
+        fn send(&mut self, event: ClientMessageEvent) -> Result<bool> {
+            self.caller.send(event)?;
+            let marker = self.caller.marker.unwrap();
+            assert_eq!(marker.destination_desktop, 2);
+            let command = Request::decode(&event.data.as_data32()).unwrap().command;
+            assert_eq!(marker.command, command);
+            assert_eq!(marker.encode().unwrap().len(), 8);
+            self.peer
+                .evidence
+                .push_back(Some(evidence(&marker.encode().unwrap())));
+            self.peer
+                .route(&mut self.endpoint.active, Lifecycle::Ready, false, &event)?;
+            let active = self.endpoint.active.as_ref().unwrap();
+            assert_eq!(active.request.command, command);
+            assert_eq!(active.stage, Stage::Placement);
+            assert_eq!(active.placement.destination_desktop, 2);
+            assert!(
+                self.peer.sent.is_empty(),
+                "admission must not reply Unsupported"
+            );
+            if self.fail_reply {
+                self.peer.send_ok = false;
             }
-            fn owner(&mut self) -> Result<u32> {
-                self.caller.owner()
+            if self.reply_error {
+                self.peer.failure = Some("send");
             }
-            fn evidence(&mut self, window: u32, property: u32) -> Result<Option<EndpointEvidence>> {
-                self.caller.evidence(window, property)
+            let serviced =
+                self.endpoint
+                    .service_here_with_peer(&mut self.peer, |active, _, _, reply| {
+                        if command == Command::Recover {
+                            crate::here_service_tests::recover_tests::public_roundtrip_service(
+                                active,
+                                self.remote,
+                                self.minimized,
+                                self.layer,
+                                self.fault,
+                                reply,
+                            )
+                        } else {
+                            crate::here_service_tests::public_roundtrip_service(
+                                active,
+                                self.remote,
+                                self.minimized,
+                                self.layer,
+                                reply,
+                            )
+                        }
+                    });
+            if self.reply_error {
+                assert_eq!(serviced.unwrap_err().to_string(), "send");
+            } else {
+                assert!(serviced?);
             }
-            fn send(&mut self, event: ClientMessageEvent) -> Result<bool> {
-                self.caller.send(event)?;
-                let marker = self.caller.marker.unwrap();
-                assert_eq!(marker.destination_desktop, 2);
-                self.peer
-                    .evidence
-                    .push_back(Some(evidence(&marker.encode().unwrap())));
-                self.peer
-                    .route(&mut self.endpoint.active, Lifecycle::Ready, false, &event)?;
-                assert!(self.endpoint.active.is_some());
-                assert!(
-                    self.peer.sent.is_empty(),
-                    "admission must not reply Unsupported"
-                );
-                assert!(self.endpoint.service_here_with_peer(
-                    &mut self.peer,
-                    |active, _, _, reply| {
-                        crate::here_service_tests::public_roundtrip_service(
-                            active,
-                            self.remote,
-                            self.minimized,
-                            self.layer,
-                            reply,
-                        )
-                    }
-                )?);
-                assert!(self.endpoint.active.is_none());
-                assert_eq!(self.peer.sent.len(), 1);
+            assert!(self.endpoint.active.is_none());
+            assert_eq!(self.peer.sent.len(), 1);
+            if !self.drop_reply && !self.fail_reply && !self.reply_error {
                 self.caller
                     .events
                     .push_back(Event::ClientMessage(self.peer.sent[0]));
-                Ok(true)
+            }
+            Ok(true)
+        }
+    }
+    impl CallerHost for PublicPlacementCaller {
+        fn capture_desktop(&mut self) -> std::result::Result<CallerDesktop, DestinationError> {
+            self.caller.capture_desktop()
+        }
+        fn revalidate_desktop(
+            &mut self,
+            captured: CallerDesktop,
+        ) -> std::result::Result<(), DestinationError> {
+            self.caller.revalidate_desktop(captured)
+        }
+        fn atoms(&mut self, screen: u32) -> Result<(u32, TransportAtoms)> {
+            self.caller.atoms(screen)
+        }
+        fn watch(&mut self, owner: u32) -> Result<bool> {
+            self.caller.watch(owner)
+        }
+        fn create_reply(&mut self, marker: CallerMarker) -> Result<u32> {
+            self.caller.create_reply(marker)
+        }
+        fn next(&mut self) -> Result<Option<Event>> {
+            self.caller.next()
+        }
+        fn wait(&mut self, deadline: Instant) -> Result<()> {
+            self.caller.wait(deadline)
+        }
+        fn cleanup(&mut self) -> Result<()> {
+            self.caller.cleanup()
+        }
+    }
+    impl PublicPlacementCaller {
+        fn new(remote: bool, minimized: bool, layer: control::LayerObservation) -> Self {
+            let mut caller = Fake::new();
+            caller.caller_pair = (5, 2);
+            let mut endpoint = ControlWindow::candidate(0, CONTROL, 77, 50, 51, 52);
+            endpoint.descriptor = owner();
+            endpoint.transport = atoms();
+            endpoint.root = ROOT;
+            let mut peer = Fake::new();
+            peer.now = caller.now;
+            Self {
+                caller,
+                peer,
+                endpoint,
+                remote,
+                minimized,
+                layer,
+                fault: PublicFault::None,
+                drop_reply: false,
+                fail_reply: false,
+                reply_error: false,
             }
         }
-        impl CallerHost for Coupled {
-            fn capture_desktop(&mut self) -> std::result::Result<CallerDesktop, DestinationError> {
-                self.caller.capture_desktop()
-            }
-            fn revalidate_desktop(
-                &mut self,
-                captured: CallerDesktop,
-            ) -> std::result::Result<(), DestinationError> {
-                self.caller.revalidate_desktop(captured)
-            }
-            fn atoms(&mut self, screen: u32) -> Result<(u32, TransportAtoms)> {
-                self.caller.atoms(screen)
-            }
-            fn watch(&mut self, owner: u32) -> Result<bool> {
-                self.caller.watch(owner)
-            }
-            fn create_reply(&mut self, marker: CallerMarker) -> Result<u32> {
-                self.caller.create_reply(marker)
-            }
-            fn next(&mut self) -> Result<Option<Event>> {
-                self.caller.next()
-            }
-            fn wait(&mut self, deadline: Instant) -> Result<()> {
-                self.caller.wait(deadline)
-            }
-            fn cleanup(&mut self) -> Result<()> {
-                self.caller.cleanup()
-            }
+        fn invoke(&mut self, flag: &str) -> CallerOutcome {
+            let crate::CliMode::Control(command) = crate::parse_args([flag]).unwrap() else {
+                panic!("caller role")
+            };
+            caller_with(self, ROOT, 0, command, || Ok(ID)).unwrap()
         }
-        for remote in [false, true] {
-            for minimized in [false, true] {
-                for layer in [
-                    control::LayerObservation::Normal,
-                    control::LayerObservation::Above,
-                    control::LayerObservation::Below,
-                ] {
-                    let mut caller = Fake::new();
-                    caller.caller_pair = (5, 2);
-                    let mut endpoint = ControlWindow::candidate(0, CONTROL, 77, 50, 51, 52);
-                    endpoint.descriptor = owner();
-                    endpoint.transport = atoms();
-                    endpoint.root = ROOT;
-                    let mut host = Coupled {
-                        caller,
-                        peer: Fake::new(),
-                        endpoint,
-                        remote,
-                        minimized,
-                        layer,
-                    };
-                    let crate::CliMode::Control(command) =
-                        crate::parse_args(["--bring-here"]).unwrap()
-                    else {
-                        panic!("caller role")
-                    };
-                    let result = caller_with(&mut host, ROOT, 0, command, || Ok(ID)).unwrap();
-                    let CallerOutcome::Terminal(reply) = &result else {
-                        panic!("terminal reply: {result:?}")
-                    };
-                    assert_eq!(result.exit_code(), ExitCode::Success);
-                    assert_eq!(reply.request_id, ID);
-                    assert_eq!(reply.control_xid, CONTROL);
-                    assert_eq!(reply.detail.layer, layer);
-                    assert_eq!(reply.detail.placement.history.relocation_confirmed, remote);
-                    assert_eq!(reply.detail.progress.placement_deferred, minimized);
-                    assert_eq!(host.caller.sent.len(), 1);
-                    assert_eq!(
-                        host.caller
-                            .log
-                            .iter()
-                            .filter(|&&s| s == "create reply")
-                            .count(),
-                        1
-                    );
-                    assert_eq!(host.caller.log.last(), Some(&"cleanup"));
+        fn assert_single_roundtrip(&self, command: Command) {
+            assert_eq!(self.caller.marker.unwrap().command, command);
+            assert_eq!(self.caller.marker.unwrap().destination_desktop, 2);
+            assert_eq!(self.caller.sent.len(), 1);
+            assert_eq!(
+                Request::decode(&self.caller.sent[0].data.as_data32()).unwrap(),
+                request(command)
+            );
+            assert_eq!(
+                self.caller
+                    .log
+                    .iter()
+                    .filter(|&&s| s == "create reply")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                self.caller
+                    .log
+                    .iter()
+                    .filter(|&&s| s == "marker write")
+                    .count(),
+                1
+            );
+            assert_eq!(self.peer.sent.len(), 1);
+            let reply = self.peer.sent[0];
+            assert_eq!(reply.window, REPLY_WINDOW);
+            let response = TerminalResponse::decode(&reply.data.as_data32()).unwrap();
+            assert_eq!(response.request_id, ID);
+            assert_eq!(response.control_xid, CONTROL);
+            assert_ne!(response.detail.reason, Reason::Unsupported);
+            assert_eq!(self.caller.log.last(), Some(&"cleanup"));
+            assert!(self.endpoint.active.is_none());
+        }
+    }
+
+    #[test]
+    fn public_placement_roundtrip_uses_actual_cli_caller_admission_owner_and_correlated_reply() {
+        for (flag, command) in [
+            ("--bring-here", Command::BringHere),
+            ("--recover", Command::Recover),
+        ] {
+            for remote in [false, true] {
+                for minimized in [false, true] {
+                    for layer in [
+                        control::LayerObservation::Normal,
+                        control::LayerObservation::Above,
+                        control::LayerObservation::Below,
+                    ] {
+                        let mut host = PublicPlacementCaller::new(remote, minimized, layer);
+                        let outcome = host.invoke(flag);
+                        let CallerOutcome::Terminal(reply) = &outcome else {
+                            panic!("{outcome:?}")
+                        };
+                        host.assert_single_roundtrip(command);
+                        assert_eq!(outcome.exit_code() as i32, 0);
+                        assert_eq!(reply.status, Status::Success);
+                        assert_eq!(reply.detail.placement.history.relocation_confirmed, remote);
+                        if command == Command::Recover {
+                            assert_eq!(reply.detail.stage, Stage::Layer);
+                            assert_eq!(reply.detail.layer, control::LayerObservation::Above);
+                            assert_eq!(
+                                reply.detail.visibility,
+                                control::Visibility::NotMinimizedHere
+                            );
+                            assert!(reply.detail.progress.input_ready);
+                            assert_eq!(
+                                reply.detail.placement.current.geometry,
+                                control::GeometryProof::Verified
+                            );
+                            assert!(!reply.detail.progress.placement_deferred);
+                            assert_eq!(
+                                reply.detail.placement.history.restoration_confirmed,
+                                minimized
+                            );
+                            let text = outcome.diagnostic(command);
+                            for meaning in [
+                                "same existing body",
+                                "frozen workspace",
+                                "not minimized and Above",
+                                "placement verified, input ready",
+                            ] {
+                                assert!(text.contains(meaning), "{text}");
+                            }
+                            if !remote && !minimized && layer == control::LayerObservation::Above {
+                                assert!(!reply.detail.progress.host_mutation_dispatched);
+                                assert!(!text.contains("confirmed earlier"));
+                            }
+                        } else {
+                            assert_eq!(reply.detail.layer, layer);
+                            assert_eq!(reply.detail.progress.placement_deferred, minimized);
+                        }
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn production_here_dispatch_excludes_recover_and_all_legacy_commands() {
-        for command in [
+    fn public_recover_failures_preserve_history_and_terminal_correlation() {
+        for (fault, remote, minimized, status, reason, relocation, restoration) in [
+            (
+                PublicFault::Layout,
+                false,
+                false,
+                Status::Failed,
+                Reason::LayoutChanged,
+                false,
+                false,
+            ),
+            (
+                PublicFault::AfterRelocation,
+                true,
+                true,
+                Status::Partial,
+                Reason::LayoutChanged,
+                true,
+                false,
+            ),
+            (
+                PublicFault::AfterRestoration,
+                false,
+                true,
+                Status::Partial,
+                Reason::LayoutChanged,
+                false,
+                true,
+            ),
+            (
+                PublicFault::AfterBoth,
+                true,
+                true,
+                Status::Partial,
+                Reason::LayoutChanged,
+                true,
+                true,
+            ),
+            (
+                PublicFault::OwnerLost,
+                true,
+                true,
+                Status::Failed,
+                Reason::OwnershipLost,
+                false,
+                false,
+            ),
+            (
+                PublicFault::Native,
+                true,
+                true,
+                Status::Failed,
+                Reason::X11Failure,
+                false,
+                false,
+            ),
+            (
+                PublicFault::NativeDispatch,
+                true,
+                true,
+                Status::Failed,
+                Reason::X11Failure,
+                false,
+                false,
+            ),
+        ] {
+            let mut host =
+                PublicPlacementCaller::new(remote, minimized, control::LayerObservation::Below);
+            host.fault = fault;
+            let outcome = host.invoke("--recover");
+            host.assert_single_roundtrip(Command::Recover);
+            let CallerOutcome::Terminal(reply) = &outcome else {
+                panic!("{fault:?}: {outcome:?}")
+            };
+            assert_eq!(reply.status, status, "{fault:?}");
+            assert_eq!(reply.detail.reason, reason, "{fault:?}");
+            assert_eq!(
+                reply.detail.placement.history,
+                control::RecoveryHistory {
+                    relocation_confirmed: relocation,
+                    restoration_confirmed: restoration
+                }
+            );
+            assert_eq!(
+                outcome.exit_code() as i32,
+                if status == Status::Partial { 9 } else { 7 }
+            );
+            let text = outcome.diagnostic(Command::Recover);
+            assert!(
+                text.contains(if status == Status::Partial {
+                    "not currently confirmed"
+                } else {
+                    "complete Recover was not confirmed"
+                }),
+                "{text}"
+            );
+            assert!(!text.contains("input ready"));
+            if fault == PublicFault::NativeDispatch {
+                assert!(reply.detail.progress.host_mutation_dispatched);
+                assert!(text.contains("may have reached the WM and later state may still change"));
+            } else if fault == PublicFault::Layout {
+                assert!(!reply.detail.progress.host_mutation_dispatched);
+            }
+        }
+    }
+
+    #[test]
+    fn public_recover_lost_terminal_or_disappeared_caller_is_bounded_unknown_without_resend() {
+        for loss in 0..3 {
+            let mut host = PublicPlacementCaller::new(true, true, control::LayerObservation::Below);
+            host.drop_reply = loss == 0;
+            host.fail_reply = loss == 1;
+            host.reply_error = loss == 2;
+            let started = host.caller.now;
+            let outcome = host.invoke("--recover");
+            host.assert_single_roundtrip(Command::Recover);
+            assert_eq!(outcome.exit_code() as i32, 8);
+            assert!(outcome
+                .diagnostic(Command::Recover)
+                .contains("outcome unknown"));
+            assert_eq!(host.caller.waits, [started + Duration::from_millis(9000)]);
+            // Owner success is deliberately unavailable to this caller.
+            assert_eq!(
+                TerminalResponse::decode(&host.peer.sent[0].data.as_data32())
+                    .unwrap()
+                    .status,
+                Status::Success
+            );
+        }
+    }
+
+    #[test]
+    fn recover_fixed_nine_second_deadline_covers_every_synchronous_boundary_exactly() {
+        let budget = Duration::from_millis(9000);
+        for (step, occurrence) in [
+            ("capture", 1),
+            ("caller count", 1),
+            ("caller current", 1),
+            ("atoms", 1),
+            ("owner", 1),
+            ("evidence", 1),
+            ("owner", 2),
+            ("watch", 1),
+            ("create reply", 1),
+            ("marker write", 1),
+            ("owner", 3),
+            ("evidence", 2),
+            ("owner", 4),
+            ("revalidate", 1),
+            ("caller count", 3),
+            ("caller current", 3),
+            ("caller count", 4),
+            ("caller current", 4),
+            ("send", 1),
+            ("next", 1),
+        ] {
+            for delta in [-1_i64, 0, 1] {
+                let mut h = Fake::new();
+                let start = h.now;
+                let elapsed = if delta < 0 {
+                    budget - Duration::from_nanos(1)
+                } else {
+                    budget + Duration::from_nanos(delta as u64)
+                };
+                h.step_costs.push((step, occurrence, elapsed));
+                h.events.push_back(terminal());
+                let outcome = caller_with(&mut h, ROOT, 0, Command::Recover, || Ok(ID)).unwrap();
+                let dispatched = delta < 0 || matches!(step, "send" | "next");
+                assert_eq!(
+                    h.sent.len(),
+                    usize::from(dispatched),
+                    "{step}/{occurrence}/{delta}"
+                );
+                assert_eq!(
+                    matches!(outcome, CallerOutcome::Terminal(_)),
+                    delta < 0,
+                    "{step}/{occurrence}/{delta}"
+                );
+                if delta >= 0 {
+                    assert_eq!(outcome.exit_code(), ExitCode::OutcomeUnknown);
+                    assert_eq!(
+                        outcome
+                            .diagnostic(Command::Recover)
+                            .contains("request not sent"),
+                        !dispatched
+                    );
+                }
+                assert_eq!(h.now, start + elapsed);
+                assert!(h.log.iter().filter(|&&s| s == "capture").count() == 1);
+                assert!(h.log.iter().filter(|&&s| s == "marker write").count() <= 1);
+                assert_eq!(h.log.last(), Some(&"cleanup"));
+            }
+        }
+        for elapsed in [
+            budget - Duration::from_nanos(1),
+            budget,
+            budget + Duration::from_nanos(1),
+        ] {
+            let mut h = Fake::new();
+            let clock = h.id_elapsed.clone();
+            h.events.push_back(terminal());
+            let outcome = caller_with(&mut h, ROOT, 0, Command::Recover, || {
+                clock.set(elapsed);
+                Ok(ID)
+            })
+            .unwrap();
+            assert_eq!(
+                matches!(outcome, CallerOutcome::Terminal(_)),
+                elapsed < budget
+            );
+            assert_eq!(h.sent.len(), usize::from(elapsed < budget));
+            assert_eq!(h.marker.is_some(), elapsed < budget);
+        }
+        // Several separate calls consume one budget; revalidation cannot renew it.
+        let mut h = Fake::new();
+        let start = h.now;
+        h.step_costs = vec![
+            ("capture", 1, Duration::from_millis(2000)),
+            ("marker write", 1, Duration::from_millis(2000)),
+            ("revalidate", 1, Duration::from_millis(2000)),
+        ];
+        let outcome = caller_with(&mut h, ROOT, 0, Command::Recover, || Ok(ID)).unwrap();
+        assert_eq!(outcome.exit_code(), ExitCode::OutcomeUnknown);
+        assert_eq!(h.sent.len(), 1);
+        assert_eq!(h.waits, [start + budget]);
+        assert_eq!(h.now, start + budget);
+        // Waiting itself and an endless stream of unrelated replies stay bounded.
+        for step in ["wait", "next"] {
+            let mut h = Fake::new();
+            let start = h.now;
+            h.cost = Some((
+                step,
+                if step == "wait" {
+                    budget
+                } else {
+                    Duration::from_millis(10)
+                },
+            ));
+            h.endless_events = step == "next";
+            let outcome = caller_with(&mut h, ROOT, 0, Command::Recover, || Ok(ID)).unwrap();
+            assert_eq!(outcome.exit_code(), ExitCode::OutcomeUnknown);
+            assert_eq!(h.now, start + budget);
+            assert_eq!(h.sent.len(), 1);
+        }
+    }
+
+    #[test]
+    fn recover_reply_correlation_ignores_wrong_envelopes_and_stale_owner_identity() {
+        let good = reply_event(atoms(), REPLY_WINDOW, response()).unwrap();
+        let mut h = Fake::new();
+        for case in 0..7 {
+            let mut event = good;
+            let mut words = event.data.as_data32();
+            match case {
+                0 => event.window += 1,
+                1 => event.type_ += 1,
+                2 => event.format = 8,
+                3 => words[0] ^= 1 << 16,
+                4 => words[1] ^= 1,
+                5 => words[3] += 1,
+                _ => words[4] |= 1 << 31,
+            }
+            event.data = words.into();
+            h.events.push_back(Event::ClientMessage(event));
+        }
+        h.events.extend([terminal(), terminal()]);
+        assert_eq!(
+            caller_with(&mut h, ROOT, 0, Command::Recover, || Ok(ID)).unwrap(),
+            CallerOutcome::Terminal(response())
+        );
+        assert_eq!(
+            h.events.len(),
+            1,
+            "accept only the first exact terminal reply"
+        );
+        assert_eq!(h.sent.len(), 1);
+        let correlation = ReplyCorrelation {
+            control_xid: CONTROL,
+            epoch: 77,
+            request_id: ID,
+            reply_xid: REPLY_WINDOW,
+        };
+        // Epoch is deliberately absent from the unchanged terminal wire. It is
+        // checked against the captured descriptor, never invented from a reply.
+        for stale_owner in [
+            OwnerDescriptor {
+                epoch: 78,
+                ..owner()
+            },
+            OwnerDescriptor {
+                control_xid: CONTROL + 1,
+                ..owner()
+            },
+        ] {
+            assert!(correlated_reply(&terminal(), atoms(), stale_owner, correlation).is_none());
+        }
+    }
+
+    #[test]
+    fn recover_public_duplicates_competitors_and_local_layer_busy_preserve_the_active_slot() {
+        let commands = [
             Command::Hide,
             Command::Show,
             Command::BringTop,
+            Command::BringHere,
             Command::Recover,
+        ];
+        let mut h = Fake::new();
+        let mut endpoint = ControlWindow::candidate(0, CONTROL, 77, 50, 51, 52);
+        endpoint.descriptor = owner();
+        endpoint.root = ROOT;
+        endpoint.transport = atoms();
+        let frozen = CallerMarker {
+            destination_desktop: 2,
+            ..marker(Command::Recover)
+        };
+        h.evidence
+            .push_back(Some(evidence(&frozen.encode().unwrap())));
+        h.route(
+            &mut endpoint.active,
+            Lifecycle::Ready,
+            false,
+            &request_event(atoms(), CONTROL, request(Command::Recover)).unwrap(),
+        )
+        .unwrap();
+        let original = endpoint.active;
+        h.evidence
+            .push_back(Some(evidence(&frozen.encode().unwrap())));
+        h.now += Duration::from_secs(1);
+        h.route(
+            &mut endpoint.active,
+            Lifecycle::Ready,
+            true,
+            &request_event(atoms(), CONTROL, request(Command::Recover)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(endpoint.active, original);
+        assert!(
+            h.sent.is_empty(),
+            "duplicate retains the existing terminal obligation"
+        );
+        for (i, command) in commands.into_iter().enumerate() {
+            let competing = Request {
+                request_id: ID + 1 + i as u64,
+                ..request(command)
+            };
+            h.evidence.push_back(Some(evidence(
+                &CallerMarker {
+                    request_id: competing.request_id,
+                    ..marker(command)
+                }
+                .encode()
+                .unwrap(),
+            )));
+            h.route(
+                &mut endpoint.active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, competing).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                endpoint.active, original,
+                "state/deadline/history preserved"
+            );
+            let reply = TerminalResponse::decode(&h.sent.last().unwrap().data.as_data32()).unwrap();
+            assert_eq!(
+                (reply.status, reply.detail.reason, reply.request_id),
+                (Status::Busy, Reason::Busy, competing.request_id)
+            );
+        }
+        // Complete the actual Recover through the existing owner, then admit anew.
+        assert!(endpoint
+            .service_here_with_peer(&mut h, |active, _, _, reply| {
+                crate::here_service_tests::recover_tests::public_roundtrip_service(
+                    active,
+                    false,
+                    false,
+                    control::LayerObservation::Above,
+                    PublicFault::None,
+                    reply,
+                )
+            })
+            .unwrap());
+        assert!(endpoint.active.is_none());
+        for command in commands {
+            let mut active = None;
+            h.evidence
+                .push_back(Some(evidence(&marker(command).encode().unwrap())));
+            h.route(
+                &mut active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, request(command)).unwrap(),
+            )
+            .unwrap();
+            let original = active;
+            let competing = Request {
+                request_id: ID + 100,
+                ..request(Command::Recover)
+            };
+            h.evidence.push_back(Some(evidence(
+                &CallerMarker {
+                    request_id: competing.request_id,
+                    ..marker(Command::Recover)
+                }
+                .encode()
+                .unwrap(),
+            )));
+            h.route(
+                &mut active,
+                Lifecycle::Ready,
+                false,
+                &request_event(atoms(), CONTROL, competing).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(active, original);
+            assert_eq!(
+                TerminalResponse::decode(&h.sent.last().unwrap().data.as_data32())
+                    .unwrap()
+                    .status,
+                Status::Busy
+            );
+        }
+        h.evidence
+            .push_back(Some(evidence(&marker(Command::Recover).encode().unwrap())));
+        h.route(
+            &mut endpoint.active,
+            Lifecycle::Ready,
+            true,
+            &request_event(atoms(), CONTROL, request(Command::Recover)).unwrap(),
+        )
+        .unwrap();
+        assert!(endpoint.active.is_none());
+        assert_eq!(
+            TerminalResponse::decode(&h.sent.last().unwrap().data.as_data32())
+                .unwrap()
+                .status,
+            Status::Busy
+        );
+        h.evidence
+            .push_back(Some(evidence(&marker(Command::Show).encode().unwrap())));
+        let before = h.sent.len();
+        h.route(
+            &mut endpoint.active,
+            Lifecycle::Ready,
+            false,
+            &request_event(atoms(), CONTROL, request(Command::Show)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(endpoint.active.unwrap().request.command, Command::Show);
+        assert_eq!(
+            h.sent.len(),
+            before,
+            "new command admitted after Recover terminal"
+        );
+    }
+
+    #[test]
+    fn recover_diagnostics_distinguish_every_history_partition_and_reason_at_the_actual_stage() {
+        for (fault, remote, minimized, expected) in [
+            (
+                PublicFault::Layout,
+                false,
+                false,
+                "neither relocation nor restoration was confirmed as history",
+            ),
+            (
+                PublicFault::AfterRelocation,
+                true,
+                true,
+                "relocation was confirmed earlier; restoration was not confirmed as history",
+            ),
+            (
+                PublicFault::AfterRestoration,
+                false,
+                true,
+                "restoration was confirmed earlier; relocation was not confirmed as history",
+            ),
+            (
+                PublicFault::AfterBoth,
+                true,
+                true,
+                "relocation and restoration were both confirmed earlier",
+            ),
         ] {
+            let mut h =
+                PublicPlacementCaller::new(remote, minimized, control::LayerObservation::Below);
+            h.fault = fault;
+            let CallerOutcome::Terminal(mut response) = h.invoke("--recover") else {
+                panic!("terminal")
+            };
+            for (reason, meaning) in [
+                (Reason::ConfirmationTimeout, "confirmation timed out"),
+                (Reason::LayoutChanged, "frozen workspace/layout changed"),
+                (Reason::LayerChanged, "effective layer changed incompatibly"),
+                (Reason::OwnershipLost, "owner selection lost"),
+                (Reason::X11Failure, "native X11 failure"),
+                (Reason::Closing, "owner is closing"),
+                (Reason::BodyDestroyed, "existing body was destroyed"),
+                (Reason::Withdrawn, "existing body was withdrawn"),
+                (Reason::Unverifiable, "required state could not be verified"),
+                (Reason::Unsupported, "required WM support unavailable"),
+                (
+                    Reason::Busy,
+                    "another remote or local layer/placement operation is active",
+                ),
+            ] {
+                response.detail.reason = reason;
+                let outcome = CallerOutcome::Terminal(response);
+                let text = outcome.diagnostic(Command::Recover);
+                assert!(text.contains(expected), "{text}");
+                assert!(text.contains(meaning), "{text}");
+                assert!(
+                    text.contains(&format!("({:?})", response.detail.stage)),
+                    "{text}"
+                );
+                assert!(!text.contains("input ready"));
+                assert_eq!(
+                    outcome.exit_code() as i32,
+                    if fault == PublicFault::Layout { 7 } else { 9 }
+                );
+            }
+        }
+        let mut busy = response();
+        busy.status = Status::Busy;
+        busy.detail.reason = Reason::Busy;
+        assert!(CallerOutcome::Terminal(busy)
+            .diagnostic(Command::Recover)
+            .contains("Busy — Recover was not completed"));
+    }
+
+    #[test]
+    fn placement_marker_builder_rejects_legacy_commands_without_changing_the_v2_codec() {
+        let mut h = Fake::new();
+        let captured = h.capture_desktop().unwrap();
+        for command in [Command::Hide, Command::Show, Command::BringTop] {
+            assert!(placement_caller_marker(command, captured, owner(), ID).is_err());
+        }
+    }
+
+    #[test]
+    fn production_placement_dispatch_excludes_all_legacy_commands() {
+        for command in [Command::Hide, Command::Show, Command::BringTop] {
             let mut peer = Fake::new();
             let mut endpoint = ControlWindow::candidate(0, CONTROL, 77, 50, 51, 52);
             endpoint.descriptor = owner();
@@ -5328,287 +6020,306 @@ pub(crate) mod transport_tests {
                 ))
                 .unwrap());
             assert_eq!(endpoint.active, active);
-            if command == Command::Recover {
+            assert!(active.is_some());
+            assert!(peer.sent.is_empty());
+        }
+    }
+
+    #[test]
+    fn public_placement_admission_rejects_selection_loss_before_and_after_marker_validation() {
+        for command in [Command::BringHere, Command::Recover] {
+            for owners in [vec![CONTROL + 1], vec![CONTROL, CONTROL + 1]] {
+                let mut host = Fake::new();
+                host.owners = owners.into();
+                host.evidence
+                    .push_back(Some(evidence(&marker(command).encode().unwrap())));
+                let mut active = None;
+                assert!(host
+                    .route(
+                        &mut active,
+                        Lifecycle::Ready,
+                        false,
+                        &request_event(atoms(), CONTROL, request(command)).unwrap()
+                    )
+                    .is_err());
                 assert!(active.is_none());
-                let reply = TerminalResponse::decode(&peer.sent[0].data.as_data32()).unwrap();
-                assert_eq!(
-                    (reply.status, reply.detail.reason, reply.detail.stage),
-                    (Status::Failed, Reason::Unsupported, Stage::Preflight)
-                );
-                assert_eq!(peer.log, ["owner", "evidence", "owner", "send"]);
-            } else {
-                assert!(active.is_some());
-                assert!(peer.sent.is_empty());
+                assert!(host.sent.is_empty());
             }
         }
     }
 
     #[test]
-    fn public_here_admission_rejects_selection_loss_before_and_after_marker_validation() {
-        for owners in [vec![CONTROL + 1], vec![CONTROL, CONTROL + 1]] {
+    fn public_placement_capture_marker_rediscovery_revalidation_send_order_is_exact() {
+        for command in [Command::BringHere, Command::Recover] {
             let mut host = Fake::new();
-            host.owners = owners.into();
-            host.evidence.push_back(Some(evidence(
-                &marker(Command::BringHere).encode().unwrap(),
-            )));
-            let mut active = None;
-            assert!(host
-                .route(
-                    &mut active,
-                    Lifecycle::Ready,
-                    false,
-                    &request_event(atoms(), CONTROL, request(Command::BringHere)).unwrap()
-                )
-                .is_err());
-            assert!(active.is_none());
-            assert!(host.sent.is_empty());
+            host.events.push_back(terminal());
+            let outcome = caller_with(&mut host, ROOT, 0, command, || Ok(ID)).unwrap();
+            assert_eq!(outcome, CallerOutcome::Terminal(response()));
+            assert_eq!(host.marker, Some(marker(command)));
+            assert_eq!(host.sent.len(), 1);
+            assert_eq!(
+                Request::decode(&host.sent[0].data.as_data32()).unwrap(),
+                request(command)
+            );
+            assert_eq!(
+                host.log,
+                [
+                    "capture",
+                    "caller count",
+                    "caller current",
+                    "caller count",
+                    "caller current",
+                    "atoms",
+                    "owner",
+                    "evidence",
+                    "owner",
+                    "watch",
+                    "create reply",
+                    "marker write",
+                    "owner",
+                    "evidence",
+                    "owner",
+                    "revalidate",
+                    "caller count",
+                    "caller current",
+                    "caller count",
+                    "caller current",
+                    "send",
+                    "next",
+                    "cleanup",
+                ]
+            );
         }
     }
 
     #[test]
-    fn public_here_capture_marker_rediscovery_revalidation_send_order_is_exact() {
-        let mut host = Fake::new();
-        host.events.push_back(terminal());
-        let outcome = caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID)).unwrap();
-        assert_eq!(outcome, CallerOutcome::Terminal(response()));
-        assert_eq!(host.marker, Some(marker(Command::BringHere)));
-        assert_eq!(host.sent.len(), 1);
-        assert_eq!(
-            Request::decode(&host.sent[0].data.as_data32()).unwrap(),
-            request(Command::BringHere)
-        );
-        assert_eq!(
-            host.log,
-            [
+    fn public_placement_capture_failure_or_invalid_two_read_evidence_never_discovers_or_sends() {
+        for command in [Command::BringHere, Command::Recover] {
+            for case in 0..13 {
+                let mut host = Fake::new();
+                match case {
+                    0 => host.failure = Some("capture"),
+                    1 => host.failure = Some("caller current"),
+                    2 => host.caller_pair = (0, 0),
+                    3 => host.caller_pair = (9, 9),
+                    4 => host.caller_pair = (9, u32::MAX),
+                    5 => host
+                        .caller_snapshots
+                        .push_back(Ok((GetPropertyReply::default(), cardinal(7)))),
+                    6 => host
+                        .caller_snapshots
+                        .push_back(Ok((cardinal(9), cardinal(6)))),
+                    7 => host
+                        .caller_snapshots
+                        .push_back(Ok((cardinal(9), GetPropertyReply::default()))),
+                    8 => {
+                        let mut count = cardinal(9);
+                        count.format = 8;
+                        host.caller_snapshots.push_back(Ok((count, cardinal(7))));
+                    }
+                    9 => {
+                        let mut current = cardinal(7);
+                        current.type_ = AtomEnum::STRING.into();
+                        host.caller_snapshots.push_back(Ok((cardinal(9), current)));
+                    }
+                    10 => host.failure = Some("caller count"),
+                    11 => host.caller_snapshots.extend([
+                        Ok((cardinal(9), cardinal(7))),
+                        Ok((cardinal(10), cardinal(7))),
+                    ]),
+                    _ => host
+                        .caller_snapshots
+                        .push_back(Err(DestinationError::Unverifiable(
+                            "native capture failure".into(),
+                        ))),
+                }
+                let outcome = caller_with(&mut host, ROOT, 0, command, || {
+                    panic!("no ID before capture")
+                })
+                .unwrap();
+                assert_eq!(outcome.exit_code(), ExitCode::Protocol);
+                assert!(outcome.diagnostic(command).contains("capture failed"));
+                assert!(outcome.diagnostic(command).contains("request not sent"));
+                assert!(!host.log.contains(&"owner"));
+                assert!(host.marker.is_none());
+                assert!(host.sent.is_empty());
+                assert_eq!(host.log.last(), Some(&"cleanup"));
+            }
+        }
+    }
+
+    #[test]
+    fn public_placement_discovery_drift_never_retargets_rewrites_retries_or_sends() {
+        for command in [Command::BringHere, Command::Recover] {
+            for (count, current) in [(10, 7), (9, 6), (9, u32::MAX), (0, 0)] {
+                let mut host = Fake::new();
+                host.discovery_pair = Some((count, current));
+                let outcome = caller_with(&mut host, ROOT, 0, command, || Ok(ID)).unwrap();
+                assert_eq!(outcome.exit_code(), ExitCode::Protocol);
+                assert!(outcome
+                    .diagnostic(command)
+                    .contains("frozen caller workspace changed"));
+                assert_eq!(host.marker, Some(marker(command)));
+                assert_eq!(host.log.iter().filter(|&&s| s == "create reply").count(), 1);
+                assert_eq!(host.log.iter().filter(|&&s| s == "capture").count(), 1);
+                assert_eq!(host.log.iter().filter(|&&s| s == "revalidate").count(), 1);
+                assert!(host.sent.is_empty());
+                assert_eq!(host.log.last(), Some(&"cleanup"));
+            }
+            let mut host = Fake::new();
+            host.failure = Some("revalidate");
+            assert_eq!(
+                caller_with(&mut host, ROOT, 0, command, || Ok(ID))
+                    .unwrap()
+                    .exit_code(),
+                ExitCode::Protocol
+            );
+            assert_eq!(host.marker, Some(marker(command)));
+            assert_eq!(host.log.iter().filter(|&&s| s == "create reply").count(), 1);
+            assert!(host.sent.is_empty());
+            assert_eq!(host.log.last(), Some(&"cleanup"));
+        }
+    }
+
+    #[test]
+    fn public_placement_capture_and_revalidation_share_original_command_deadline() {
+        for command in [Command::BringHere, Command::Recover] {
+            for step in [
                 "capture",
-                "caller count",
-                "caller current",
-                "caller count",
-                "caller current",
                 "atoms",
                 "owner",
                 "evidence",
-                "owner",
                 "watch",
                 "create reply",
-                "owner",
-                "evidence",
-                "owner",
                 "revalidate",
                 "caller count",
                 "caller current",
-                "caller count",
-                "caller current",
+            ] {
+                let mut host = Fake::new();
+                host.cost = Some((step, caller_budget(command)));
+                let outcome = caller_with(&mut host, ROOT, 0, command, || Ok(ID)).unwrap();
+                assert_eq!(outcome.exit_code(), ExitCode::OutcomeUnknown, "{step}");
+                assert!(outcome.diagnostic(command).contains("request not sent"));
+                assert!(host.sent.is_empty(), "{step}");
+                assert_eq!(host.log.last(), Some(&"cleanup"));
+            }
+            for step in ["capture", "create reply", "revalidate"] {
+                let mut host = Fake::new();
+                let start = host.now;
+                host.cost = Some((step, caller_budget(command) / 3));
+                assert_eq!(
+                    caller_with(&mut host, ROOT, 0, command, || Ok(ID))
+                        .unwrap()
+                        .exit_code(),
+                    ExitCode::OutcomeUnknown
+                );
+                assert_eq!(host.waits, [start + caller_budget(command)]);
+                assert_eq!(host.now, start + caller_budget(command));
+                assert_eq!(host.sent.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn public_placement_cleanup_covers_each_setup_send_and_wait_failure_boundary() {
+        for command in [Command::BringHere, Command::Recover] {
+            for step in [
+                "atoms",
+                "owner",
+                "evidence",
+                "watch",
+                "create reply",
                 "send",
                 "next",
-                "cleanup",
-            ]
-        );
+                "wait",
+            ] {
+                let mut host = Fake::new();
+                host.failure = Some(step);
+                assert_eq!(
+                    caller_with(&mut host, ROOT, 0, command, || Ok(ID))
+                        .unwrap_err()
+                        .to_string(),
+                    step
+                );
+                assert_eq!(host.log.last(), Some(&"cleanup"));
+                assert_eq!(host.log.iter().filter(|&&s| s == "cleanup").count(), 1);
+                assert!(host.sent.len() <= 1);
+            }
+            let mut host = Fake::new();
+            assert!(caller_with(&mut host, ROOT, 0, command, || Err("id failed".into())).is_err());
+            assert_eq!(host.log.last(), Some(&"cleanup"));
+            assert!(host.sent.is_empty());
+        }
     }
 
     #[test]
-    fn public_here_capture_failure_or_invalid_two_read_evidence_never_discovers_or_sends() {
-        for case in 0..7 {
+    fn public_placement_owner_replacement_epoch_or_lifecycle_change_prevents_dispatch() {
+        for command in [Command::BringHere, Command::Recover] {
+            for case in 0..4 {
+                let mut host = Fake::new();
+                let changed = OwnerDescriptor {
+                    control_xid: if case == 0 { CONTROL + 1 } else { CONTROL },
+                    epoch: if case == 1 { 78 } else { 77 },
+                    lifecycle: match case {
+                        2 => Lifecycle::Starting,
+                        3 => Lifecycle::Closing,
+                        _ => Lifecycle::Ready,
+                    },
+                    ..owner()
+                };
+                host.owners =
+                    VecDeque::from([CONTROL, CONTROL, changed.control_xid, changed.control_xid]);
+                host.evidence = VecDeque::from([
+                    Some(evidence(&owner().encode().unwrap())),
+                    Some(evidence(&changed.encode().unwrap())),
+                ]);
+                let outcome = caller_with(&mut host, ROOT, 0, command, || Ok(ID)).unwrap();
+                assert!(!matches!(outcome, CallerOutcome::Terminal(_)));
+                assert_eq!(host.marker, Some(marker(command)));
+                assert!(!host.log.contains(&"revalidate"));
+                assert!(host.sent.is_empty());
+                assert_eq!(host.log.last(), Some(&"cleanup"));
+            }
+        }
+    }
+
+    #[test]
+    fn public_placement_replies_keep_full_correlation_and_owner_loss_is_bounded_unknown() {
+        for command in [Command::BringHere, Command::Recover] {
             let mut host = Fake::new();
-            match case {
-                0 => host.failure = Some("capture"),
-                1 => host.failure = Some("caller current"),
-                2 => host.caller_pair = (0, 0),
-                3 => host.caller_pair = (9, 9),
-                4 => host.caller_pair = (9, u32::MAX),
-                5 => host
-                    .caller_snapshots
-                    .push_back(Ok((GetPropertyReply::default(), cardinal(7)))),
-                _ => {
-                    host.caller_snapshots
-                        .push_back(Ok((cardinal(9), cardinal(6))));
+            for case in 0..4 {
+                let mut reply = reply_event(atoms(), REPLY_WINDOW, response()).unwrap();
+                let mut words = reply.data.as_data32();
+                match case {
+                    0 => words[1] ^= 1,
+                    1 => words[3] += 1,
+                    2 => reply.window += 1,
+                    _ => reply.type_ += 1,
                 }
+                reply.data = words.into();
+                host.events.push_back(Event::ClientMessage(reply));
             }
-            let outcome = caller_with(&mut host, ROOT, 0, Command::BringHere, || {
-                panic!("no ID before capture")
-            })
-            .unwrap();
-            assert_eq!(outcome.exit_code(), ExitCode::Protocol);
-            assert!(outcome
-                .diagnostic(Command::BringHere)
-                .contains("capture failed"));
-            assert!(outcome
-                .diagnostic(Command::BringHere)
-                .contains("request not sent"));
-            assert!(!host.log.contains(&"owner"));
-            assert!(host.marker.is_none());
-            assert!(host.sent.is_empty());
-            assert_eq!(host.log.last(), Some(&"cleanup"));
-        }
-    }
-
-    #[test]
-    fn public_here_discovery_drift_never_retargets_rewrites_retries_or_sends() {
-        for (count, current) in [(10, 7), (9, 6), (9, u32::MAX), (0, 0)] {
-            let mut host = Fake::new();
-            host.discovery_pair = Some((count, current));
-            let outcome = caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID)).unwrap();
-            assert_eq!(outcome.exit_code(), ExitCode::Protocol);
-            assert!(outcome
-                .diagnostic(Command::BringHere)
-                .contains("frozen caller workspace changed"));
-            assert_eq!(host.marker, Some(marker(Command::BringHere)));
-            assert_eq!(host.log.iter().filter(|&&s| s == "create reply").count(), 1);
-            assert_eq!(host.log.iter().filter(|&&s| s == "capture").count(), 1);
-            assert_eq!(host.log.iter().filter(|&&s| s == "revalidate").count(), 1);
-            assert!(host.sent.is_empty());
-            assert_eq!(host.log.last(), Some(&"cleanup"));
-        }
-        let mut host = Fake::new();
-        host.failure = Some("revalidate");
-        assert_eq!(
-            caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID))
-                .unwrap()
-                .exit_code(),
-            ExitCode::Protocol
-        );
-        assert_eq!(host.marker, Some(marker(Command::BringHere)));
-        assert_eq!(host.log.iter().filter(|&&s| s == "create reply").count(), 1);
-        assert!(host.sent.is_empty());
-        assert_eq!(host.log.last(), Some(&"cleanup"));
-    }
-
-    #[test]
-    fn public_here_capture_and_revalidation_share_original_five_second_deadline() {
-        for step in [
-            "capture",
-            "atoms",
-            "owner",
-            "evidence",
-            "watch",
-            "create reply",
-            "revalidate",
-            "caller count",
-            "caller current",
-        ] {
-            let mut host = Fake::new();
-            host.cost = Some((step, Duration::from_millis(5000)));
-            let outcome = caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID)).unwrap();
-            assert_eq!(outcome.exit_code(), ExitCode::OutcomeUnknown, "{step}");
-            assert!(outcome
-                .diagnostic(Command::BringHere)
-                .contains("request not sent"));
-            assert!(host.sent.is_empty(), "{step}");
-            assert_eq!(host.log.last(), Some(&"cleanup"));
-        }
-        for step in ["capture", "create reply", "revalidate"] {
-            let mut host = Fake::new();
-            let start = host.now;
-            host.cost = Some((step, Duration::from_millis(1700)));
+            host.events.push_back(terminal());
             assert_eq!(
-                caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID))
-                    .unwrap()
-                    .exit_code(),
-                ExitCode::OutcomeUnknown
+                caller_with(&mut host, ROOT, 0, command, || Ok(ID)).unwrap(),
+                CallerOutcome::Terminal(response())
             );
-            assert_eq!(host.waits, [start + Duration::from_millis(5000)]);
-            assert_eq!(host.now, start + Duration::from_millis(5000));
+            assert_eq!(host.log.iter().filter(|&&s| s == "next").count(), 5);
             assert_eq!(host.sent.len(), 1);
-        }
-    }
-
-    #[test]
-    fn public_here_cleanup_covers_each_setup_send_and_wait_failure_boundary() {
-        for step in [
-            "atoms",
-            "owner",
-            "evidence",
-            "watch",
-            "create reply",
-            "send",
-            "next",
-            "wait",
-        ] {
-            let mut host = Fake::new();
-            host.failure = Some(step);
-            assert_eq!(
-                caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID))
-                    .unwrap_err()
-                    .to_string(),
-                step
-            );
-            assert_eq!(host.log.last(), Some(&"cleanup"));
-            assert_eq!(host.log.iter().filter(|&&s| s == "cleanup").count(), 1);
-            assert!(host.sent.len() <= 1);
-        }
-        let mut host = Fake::new();
-        assert!(caller_with(&mut host, ROOT, 0, Command::BringHere, || Err(
-            "id failed".into()
-        ))
-        .is_err());
-        assert_eq!(host.log.last(), Some(&"cleanup"));
-        assert!(host.sent.is_empty());
-    }
-
-    #[test]
-    fn public_here_owner_replacement_epoch_or_lifecycle_change_prevents_dispatch() {
-        for case in 0..4 {
-            let mut host = Fake::new();
-            let changed = OwnerDescriptor {
-                control_xid: if case == 0 { CONTROL + 1 } else { CONTROL },
-                epoch: if case == 1 { 78 } else { 77 },
-                lifecycle: match case {
-                    2 => Lifecycle::Starting,
-                    3 => Lifecycle::Closing,
-                    _ => Lifecycle::Ready,
-                },
-                ..owner()
-            };
-            host.owners =
-                VecDeque::from([CONTROL, CONTROL, changed.control_xid, changed.control_xid]);
-            host.evidence = VecDeque::from([
-                Some(evidence(&owner().encode().unwrap())),
-                Some(evidence(&changed.encode().unwrap())),
-            ]);
-            let outcome = caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID)).unwrap();
-            assert!(!matches!(outcome, CallerOutcome::Terminal(_)));
-            assert_eq!(host.marker, Some(marker(Command::BringHere)));
-            assert!(!host.log.contains(&"revalidate"));
-            assert!(host.sent.is_empty());
-            assert_eq!(host.log.last(), Some(&"cleanup"));
-        }
-    }
-
-    #[test]
-    fn public_here_replies_keep_full_correlation_and_owner_loss_is_bounded_unknown() {
-        let mut host = Fake::new();
-        for case in 0..4 {
-            let mut reply = reply_event(atoms(), REPLY_WINDOW, response()).unwrap();
-            let mut words = reply.data.as_data32();
-            match case {
-                0 => words[1] ^= 1,
-                1 => words[3] += 1,
-                2 => reply.window += 1,
-                _ => reply.type_ += 1,
+            for events in [vec![destroyed(false)], vec![]] {
+                let mut host = Fake::new();
+                let start = host.now;
+                host.events = events.into();
+                assert_eq!(
+                    caller_with(&mut host, ROOT, 0, command, || Ok(ID))
+                        .unwrap()
+                        .exit_code(),
+                    ExitCode::OutcomeUnknown
+                );
+                assert!(host.now <= start + caller_budget(command));
+                assert_eq!(host.sent.len(), 1);
+                assert_eq!(host.log.last(), Some(&"cleanup"));
             }
-            reply.data = words.into();
-            host.events.push_back(Event::ClientMessage(reply));
-        }
-        host.events.push_back(terminal());
-        assert_eq!(
-            caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID)).unwrap(),
-            CallerOutcome::Terminal(response())
-        );
-        assert_eq!(host.log.iter().filter(|&&s| s == "next").count(), 5);
-        assert_eq!(host.sent.len(), 1);
-        for events in [vec![destroyed(false)], vec![]] {
-            let mut host = Fake::new();
-            let start = host.now;
-            host.events = events.into();
-            assert_eq!(
-                caller_with(&mut host, ROOT, 0, Command::BringHere, || Ok(ID))
-                    .unwrap()
-                    .exit_code(),
-                ExitCode::OutcomeUnknown
-            );
-            assert!(host.now <= start + Duration::from_millis(5000));
-            assert_eq!(host.sent.len(), 1);
-            assert_eq!(host.log.last(), Some(&"cleanup"));
         }
     }
 
@@ -5638,79 +6349,86 @@ pub(crate) mod transport_tests {
     }
 
     #[test]
-    fn prepared_here_marker_freezes_only_the_validated_destination_in_existing_v2_shape() {
-        use super::super::monitors::destination::capture_caller_with;
-        let cardinal = |word: u32| GetPropertyReply {
-            format: 32,
-            type_: AtomEnum::CARDINAL.into(),
-            length: 1,
-            value_len: 1,
-            value: word.to_ne_bytes().to_vec(),
-            ..Default::default()
-        };
-        let mut reads = 0;
-        let captured = capture_caller_with(|| {
-            reads += 1;
-            Ok((cardinal(9_u32), cardinal(7_u32)))
-        })
-        .unwrap();
-        assert_eq!(reads, 2);
-        let marker = here_caller_marker(captured, owner(), ID);
-        assert_eq!(marker, self::marker(Command::BringHere));
-        let words = marker.encode().unwrap();
-        assert_eq!(words.len(), 8);
-        assert_eq!(words[1], control::VERSION);
-        assert_eq!(words[7], 7);
-        assert_eq!(CallerMarker::decode(&words).unwrap(), marker);
-        let mut host = Fake::new();
-        host.create_reply(marker).unwrap();
-        assert_eq!(host.log, ["create reply"]);
-        assert!(host.sent.is_empty(), "preparation does not dispatch");
+    fn prepared_placement_marker_freezes_only_the_validated_destination_in_existing_v2_shape() {
+        for command in [Command::BringHere, Command::Recover] {
+            use super::super::monitors::destination::capture_caller_with;
+            let cardinal = |word: u32| GetPropertyReply {
+                format: 32,
+                type_: AtomEnum::CARDINAL.into(),
+                length: 1,
+                value_len: 1,
+                value: word.to_ne_bytes().to_vec(),
+                ..Default::default()
+            };
+            let mut reads = 0;
+            let captured = capture_caller_with(|| {
+                reads += 1;
+                Ok((cardinal(9_u32), cardinal(7_u32)))
+            })
+            .unwrap();
+            assert_eq!(reads, 2);
+            let marker = placement_caller_marker(command, captured, owner(), ID).unwrap();
+            assert_eq!(marker, self::marker(command));
+            let words = marker.encode().unwrap();
+            assert_eq!(words.len(), 8);
+            assert_eq!(words[1], control::VERSION);
+            assert_eq!(words[7], 7);
+            assert_eq!(CallerMarker::decode(&words).unwrap(), marker);
+            let mut host = Fake::new();
+            host.create_reply(marker).unwrap();
+            assert_eq!(host.log, ["create reply", "marker write"]);
+            assert!(host.sent.is_empty(), "preparation does not dispatch");
+        }
     }
 
     #[test]
     fn pre_send_capture_failure_or_drift_cannot_rewrite_the_marker_or_choose_another_target() {
-        use super::super::monitors::destination::{capture_caller_with, DestinationError};
-        let cardinal = |word: u32| GetPropertyReply {
-            format: 32,
-            type_: AtomEnum::CARDINAL.into(),
-            length: 1,
-            value_len: 1,
-            value: word.to_ne_bytes().to_vec(),
-            ..Default::default()
-        };
-        let captured = capture_caller_with(|| Ok((cardinal(9), cardinal(7)))).unwrap();
-        // Retain the D2 seam-level validation cases beside public routing tests.
-        for case in 0..9 {
-            let mut host = Fake::new();
-            let original = here_caller_marker(captured, owner(), ID);
-            host.create_reply(original).unwrap();
-            let mut reads = 0;
-            let fresh = capture_caller_with(|| {
-                reads += 1;
-                let mut count = cardinal(9);
-                let mut current = cardinal(7);
-                match case {
-                    0 => count = cardinal(10),
-                    1 => current = cardinal(6),
-                    2 => current = cardinal(u32::MAX),
-                    3 => current = cardinal(9),
-                    4 => current = GetPropertyReply::default(),
-                    5 => count.format = 8,
-                    6 => return Err(DestinationError::Unverifiable("read failed".into())),
-                    7 if reads == 2 => current = cardinal(6),
-                    _ => {}
-                }
-                Ok((count, current))
-            });
-            let validated = fresh.and_then(|fresh| captured.revalidate(fresh));
-            assert_eq!(validated.is_ok(), case == 8);
-            assert_eq!(reads, if case == 6 { 1 } else { 2 });
-            assert_eq!(host.marker, Some(original));
-            assert_eq!(host.log, ["create reply"]);
-            assert!(host.sent.is_empty());
-            assert_eq!(captured.frozen_destination(), 7);
-            assert_eq!(here_caller_marker(captured, owner(), ID), original);
+        for command in [Command::BringHere, Command::Recover] {
+            use super::super::monitors::destination::{capture_caller_with, DestinationError};
+            let cardinal = |word: u32| GetPropertyReply {
+                format: 32,
+                type_: AtomEnum::CARDINAL.into(),
+                length: 1,
+                value_len: 1,
+                value: word.to_ne_bytes().to_vec(),
+                ..Default::default()
+            };
+            let captured = capture_caller_with(|| Ok((cardinal(9), cardinal(7)))).unwrap();
+            // Retain the D2 seam-level validation cases beside public routing tests.
+            for case in 0..9 {
+                let mut host = Fake::new();
+                let original = placement_caller_marker(command, captured, owner(), ID).unwrap();
+                host.create_reply(original).unwrap();
+                let mut reads = 0;
+                let fresh = capture_caller_with(|| {
+                    reads += 1;
+                    let mut count = cardinal(9);
+                    let mut current = cardinal(7);
+                    match case {
+                        0 => count = cardinal(10),
+                        1 => current = cardinal(6),
+                        2 => current = cardinal(u32::MAX),
+                        3 => current = cardinal(9),
+                        4 => current = GetPropertyReply::default(),
+                        5 => count.format = 8,
+                        6 => return Err(DestinationError::Unverifiable("read failed".into())),
+                        7 if reads == 2 => current = cardinal(6),
+                        _ => {}
+                    }
+                    Ok((count, current))
+                });
+                let validated = fresh.and_then(|fresh| captured.revalidate(fresh));
+                assert_eq!(validated.is_ok(), case == 8);
+                assert_eq!(reads, if case == 6 { 1 } else { 2 });
+                assert_eq!(host.marker, Some(original));
+                assert_eq!(host.log, ["create reply", "marker write"]);
+                assert!(host.sent.is_empty());
+                assert_eq!(captured.frozen_destination(), 7);
+                assert_eq!(
+                    placement_caller_marker(command, captured, owner(), ID).unwrap(),
+                    original
+                );
+            }
         }
     }
 }
