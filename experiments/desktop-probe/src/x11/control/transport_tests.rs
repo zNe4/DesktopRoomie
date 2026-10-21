@@ -1315,6 +1315,37 @@ fn recover_synthetic_destroy_and_unrelated_lifecycle_events_preserve_every_snaps
 }
 
 #[test]
+fn recover_closing_lookup_replacement_is_proven_loss_without_publication() {
+    for (phase, operation) in crate::here_service_tests::recover_tests::lifecycle_snapshots() {
+        let mut endpoint = recover_lifecycle_endpoint(operation);
+        let descriptor = endpoint.descriptor;
+        let mut queries = 0;
+        endpoint
+            .closing_with(
+                || {
+                    queries += 1;
+                    Ok(CONTROL + 1)
+                },
+                |_| panic!("must not publish to the replacement owner"),
+            )
+            .unwrap();
+        assert_eq!(queries, 1);
+        assert!(!endpoint.owns_selection);
+        assert_eq!(endpoint.descriptor, descriptor);
+        assert_eq!(endpoint.active(), Some(&operation));
+        // Reuse F-T1a's history, correlation, no-reacquisition and one-terminal
+        // assertions. A successful mismatch takes ordinary OwnershipLost.
+        assert_recover_lifecycle_terminal(
+            &mut endpoint,
+            phase,
+            operation,
+            Reason::OwnershipLost,
+            0,
+        );
+    }
+}
+
+#[test]
 fn bring_top_shutdown_retains_history_and_clears_stale_current_confirmations() {
     for restored in [false, true] {
         let mut h = Fake::new();
@@ -2798,6 +2829,19 @@ pub(crate) struct HereOwner {
     peer: Fake,
 }
 impl HereOwner {
+    pub(crate) fn descriptor(&self) -> OwnerDescriptor {
+        self.endpoint.descriptor
+    }
+    pub(crate) fn closing_with(
+        &mut self,
+        owner: impl FnOnce() -> Result<u32>,
+        write: impl FnOnce(OwnerDescriptor) -> Result<()>,
+    ) -> Result<()> {
+        self.endpoint.closing_with(owner, write)
+    }
+    pub(crate) fn finish_remote(&mut self) -> Result<()> {
+        self.endpoint.finish_remote_with(&mut self.peer)
+    }
     /// Internal pre-admission only: never calls the public request router.
     pub(crate) fn recover(now: Instant, destination: u32) -> Self {
         let mut endpoint = ControlWindow::candidate(0, CONTROL, 77, 50, 51, 52);

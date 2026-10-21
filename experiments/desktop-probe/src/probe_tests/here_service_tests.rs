@@ -3171,6 +3171,283 @@ pub(crate) mod recover_tests {
         .unwrap_err()
     }
 
+    /// Follow run_probe's Closing -> ordinary finish ordering, using the actual
+    /// endpoint seams. An error must leave the sole slot for the fatal boundary.
+    fn closing_error(owner: &mut HereOwner, publication: bool, original: HostError) -> HostError {
+        let descriptor = owner.descriptor();
+        let operation = *owner.active().unwrap();
+        let address = error_address(&original);
+        let original = RefCell::new(Some(original));
+        let calls = RefCell::new(Vec::new());
+        let result = owner
+            .closing_with(
+                || {
+                    calls.borrow_mut().push("lookup");
+                    if publication {
+                        Ok(descriptor.control_xid)
+                    } else {
+                        Err(original.borrow_mut().take().unwrap())
+                    }
+                },
+                |intended| {
+                    calls.borrow_mut().push("publish");
+                    assert!(publication, "failed lookup cannot publish");
+                    assert_eq!(
+                        intended,
+                        control::OwnerDescriptor {
+                            lifecycle: control::Lifecycle::Closing,
+                            ..descriptor
+                        }
+                    );
+                    // A checked write can fail after possible native dispatch.
+                    // This callback makes no claim about server/WM application.
+                    Err(original.borrow_mut().take().unwrap())
+                },
+            )
+            .and_then(|()| {
+                calls.borrow_mut().push("ordinary finish");
+                owner.finish_remote()
+            });
+        let error = result.unwrap_err();
+        assert_eq!(error_address(&error), address);
+        assert_eq!(
+            *calls.borrow(),
+            if publication {
+                vec!["lookup", "publish"]
+            } else {
+                vec!["lookup"]
+            }
+        );
+        assert_eq!(owner.descriptor(), descriptor, "no confirmed Closing");
+        assert_eq!(
+            owner.active(),
+            Some(&operation),
+            "fatal still owns the slot"
+        );
+        assert!(owner.replies().is_empty(), "no ordinary Closing terminal");
+        error
+    }
+
+    fn closing_fatal(
+        owner: &mut HereOwner,
+        h: &mut Host,
+        publication: bool,
+    ) -> control::TerminalResponse {
+        let operation = *owner.active().unwrap();
+        let prior = h.here.log.len();
+        let mutations = h.mutations.clone();
+        let needs_fence = operation.placement.baseline.is_some()
+            && (BringHereHost::input_active(h) || !BringHereHost::fence_settled(h));
+        let source = if publication {
+            "Closing write"
+        } else {
+            "Closing query"
+        };
+        let original: HostError = Box::new(NativeFault(source, 1));
+        let address = error_address(&original);
+        let error = closing_error(owner, publication, original);
+        assert_eq!(h.here.log.len(), prior, "Closing cannot progress Recover");
+        // external uses finish_probe_run_with -> ControlWindow's sole slot ->
+        // fail_here_owner_with -> finalize_bring_here_with -> complete_here_owner_with.
+        let error = external(owner, h, error);
+        assert_eq!(error_address(&error), address);
+        assert_eq!(
+            error.downcast_ref::<NativeFault>(),
+            Some(&NativeFault(source, 1))
+        );
+        let after = &h.here.log[prior..];
+        assert!(
+            !after.iter().any(|s| [
+                "desktop",
+                "zero",
+                "map",
+                "correct",
+                "enable",
+                "top_enable",
+                "shape",
+                "remove",
+                "above"
+            ]
+            .contains(s)),
+            "fatal teardown cannot retry recovery: {after:?}"
+        );
+        assert_eq!(h.mutations, mutations);
+        assert_eq!(
+            after.iter().filter(|&&s| s == "observe").count(),
+            usize::from(operation.placement.baseline.is_some()),
+            "one bounded history acquisition, even when it fails"
+        );
+        assert_eq!(
+            after.iter().filter(|&&s| s == "fence").count(),
+            usize::from(needs_fence),
+            "only mandatory safety cleanup is permitted"
+        );
+        if operation.placement.baseline.is_some() {
+            assert!(h.here.runtime.input_fence.blocked);
+        }
+        let reply = assert_terminal(owner, h, Reason::X11Failure);
+        assert_eq!(reply.request_id, operation.request.request_id);
+        assert_eq!(reply.control_xid, owner.descriptor().control_xid);
+        assert!(control::ReplyCorrelation {
+            control_xid: owner.descriptor().control_xid,
+            epoch: operation.request.epoch,
+            request_id: operation.request.request_id,
+            reply_xid: operation.request.reply_xid,
+        }
+        .matches(owner.descriptor(), operation.request.reply_xid, reply));
+        assert_eq!(reply.detail.stage, Stage::Shutdown);
+        assert_eq!(
+            reply.detail.progress,
+            control::Progress {
+                host_mutation_dispatched: operation.detail.progress.host_mutation_dispatched,
+                ..Default::default()
+            }
+        );
+        // Actual global error-priority helper, with an empty-slot ordinary finish
+        // and a later cleanup failure. Neither can produce another terminal.
+        let error = finish_probe_with(Err(error), || {
+            owner.finish_remote()?;
+            Err(Box::new(NativeFault("later cleanup", 1)))
+        })
+        .unwrap_err();
+        assert_eq!(error_address(&error), address);
+        let log = h.here.log.clone();
+        tick(owner, h).unwrap();
+        assert_eq!(h.here.log, log, "cleared slot cannot run again");
+        assert_eq!(
+            owner.replies(),
+            [reply],
+            "one attempt even if delivery failed"
+        );
+        reply
+    }
+
+    fn closing_failure_matrix(publication: bool) {
+        for phase in 0..8 {
+            for failures in 0..8 {
+                let (mut h, mut owner) = checkpoint(phase);
+                let history = owner.active().unwrap().placement.proof.history;
+                assert_eq!(history.relocation_confirmed, phase >= 2);
+                assert_eq!(history.restoration_confirmed, phase >= 4);
+                if failures & 1 != 0 {
+                    h.here.faults.push(("empty", h.here.count("empty") + 1));
+                }
+                if failures & 2 != 0 {
+                    h.here.faults.push(("observe", h.here.count("observe") + 1));
+                }
+                if failures & 4 != 0 {
+                    owner.fail_reply(true);
+                }
+                let reply = closing_fatal(&mut owner, &mut h, publication);
+                assert_eq!(reply.detail.placement.history, history, "snapshot {phase}");
+            }
+        }
+    }
+
+    #[test]
+    fn closing_query_failures_join_recover_fatal_policy_at_every_checkpoint() {
+        closing_failure_matrix(false);
+    }
+
+    #[test]
+    fn closing_publication_failures_join_recover_fatal_policy_at_every_checkpoint() {
+        closing_failure_matrix(true);
+    }
+
+    #[test]
+    fn closing_failure_history_read_can_confirm_transitions_without_retry() {
+        for publication in [false, true] {
+            for relocated in [false, true] {
+                for restored in [false, true] {
+                    let (mut h, mut owner) = checkpoint(1);
+                    assert_eq!(h.here.count("desktop"), 1, "acknowledgment alone");
+                    assert_eq!(
+                        owner.active().unwrap().placement.proof.history,
+                        control::RecoveryHistory::default()
+                    );
+                    if relocated {
+                        h.here.target();
+                    }
+                    if restored {
+                        h.restored();
+                    }
+                    let reply = closing_fatal(&mut owner, &mut h, publication);
+                    assert_eq!(
+                        reply.detail.placement.history,
+                        control::RecoveryHistory {
+                            relocation_confirmed: relocated,
+                            restoration_confirmed: restored,
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn closing_failure_noop_and_attempted_correction_cannot_authorize_partial() {
+        for publication in [false, true] {
+            for correction in [false, true] {
+                // Drive the local alternative through real service: either Here
+                // no-ops into Top layer work, or waits for its sole correction.
+                let mut h = Host::new(false, false, L::Below);
+                h.layer_changes = false;
+                if correction {
+                    h.here.actual.x = -100;
+                }
+                let mut owner = owner(&h);
+                tick(&mut owner, &mut h).unwrap();
+                assert!(owner.active().is_some());
+                assert_eq!(h.here.count("correct"), usize::from(correction));
+                assert_eq!(h.here.count("desktop"), 0);
+                assert_eq!(h.here.count("map"), 0);
+                let reply = closing_fatal(&mut owner, &mut h, publication);
+                assert_eq!(reply.status, Status::Failed);
+                assert_eq!(
+                    reply.detail.placement.history,
+                    control::RecoveryHistory::default()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn successful_closing_uses_ordinary_finish_without_fatal_policy() {
+        for termination in [ProbeTermination::WmClose, ProbeTermination::DurationExpired] {
+            let (h, mut owner) = checkpoint(3);
+            let descriptor = owner.descriptor();
+            let history = owner.active().unwrap().placement.proof.history;
+            let calls = RefCell::new(Vec::new());
+            let outcome = owner
+                .closing_with(
+                    || {
+                        calls.borrow_mut().push("lookup");
+                        Ok(descriptor.control_xid)
+                    },
+                    |intended| {
+                        calls.borrow_mut().push("publish");
+                        assert_eq!(intended.lifecycle, control::Lifecycle::Closing);
+                        Ok(())
+                    },
+                )
+                .and_then(|()| {
+                    calls.borrow_mut().push("ordinary finish");
+                    owner.finish_remote()
+                })
+                .and(Ok(Some(termination)));
+            finish_probe_run_with(outcome, |_| panic!("successful Closing is ordinary")).unwrap();
+            assert_eq!(*calls.borrow(), ["lookup", "publish", "ordinary finish"]);
+            assert_eq!(owner.descriptor().lifecycle, control::Lifecycle::Closing);
+            assert_eq!(
+                assert_terminal(&mut owner, &h, Reason::Closing)
+                    .detail
+                    .placement
+                    .history,
+                history
+            );
+        }
+    }
+
     #[test]
     fn external_fatal_matrix_preserves_original_error_history_and_one_bounded_read() {
         for phase in 0..8 {
