@@ -1799,7 +1799,7 @@ fn service_layer_bounded_with(
     outer_deadline: Option<Instant>,
     mut read: impl FnMut() -> Result<PropertyResult<ObservedLayer>, HostError>,
     support: impl FnMut() -> Result<PropertyResult<LayerSupport>, HostError>,
-    send: impl FnMut(Mutation) -> Result<(), HostError>,
+    mut send: impl FnMut(Mutation) -> Result<(), HostError>,
     now: impl FnMut() -> Instant,
 ) -> Result<LayerOutcome, HostError> {
     service_qualified_layer_with(
@@ -1816,7 +1816,7 @@ fn service_layer_bounded_with(
             })
         },
         support,
-        send,
+        |mutation| send(mutation).map(|()| true),
         now,
     )
 }
@@ -1831,7 +1831,7 @@ fn service_qualified_layer_with(
     remote: bool,
     mut read: impl FnMut() -> Result<Result<ObservedLayer, RemoteLayerIssue>, HostError>,
     mut support: impl FnMut() -> Result<PropertyResult<LayerSupport>, HostError>,
-    mut send: impl FnMut(Mutation) -> Result<(), HostError>,
+    mut send: impl FnMut(Mutation) -> Result<bool, HostError>,
     mut now: impl FnMut() -> Instant,
 ) -> Result<LayerOutcome, HostError> {
     if let Some(target) = request {
@@ -1893,7 +1893,10 @@ fn service_qualified_layer_with(
                         step = layers.observe(observed, now());
                         continue;
                     }
-                    send(mutation)?;
+                    if !send(mutation)? {
+                        layers.abort();
+                        return Ok(LayerOutcome::Unverifiable);
+                    }
                     println!("[LAYER] X11 checked {mutation:?}; awaiting fresh WM state");
                     let observed = match read_layer_with(layers, &mut read)? {
                         Ok(observed) => observed,
@@ -2126,6 +2129,28 @@ trait VisibilityHost {
         placement: &InputPlacement,
         deadline: Option<Instant>,
     ) -> Result<bool, HostError>;
+    /// Only the internal Recover composition uses strict Stage-B evidence.
+    fn recover_evidence(&mut self, _destination: u32) -> Result<HereEvidence, HostError> {
+        Err("Recover requires the strict destination adapter".into())
+    }
+    fn recover_geometry(
+        &mut self,
+        _layout: control::DestinationIdentity,
+    ) -> Result<geometry::Rect, HostError> {
+        Err("Recover requires actual root geometry".into())
+    }
+    fn restrict_recover_correction(&mut self) {}
+    fn recover_input_ready(&self) -> bool {
+        self.noop_ready()
+    }
+    fn restore_recover(
+        &mut self,
+        _operation: &mut control::ActiveOperation,
+        _deadline: Instant,
+        _dispatched: &mut bool,
+    ) -> Result<bool, HostError> {
+        Err("Recover requires guarded native restoration".into())
+    }
 }
 
 struct ShowPlacement {
@@ -2302,11 +2327,157 @@ fn service_visibility_with(
     }
 }
 
+fn recover_top(operation: &control::ActiveOperation) -> bool {
+    operation.request.command == control::Command::Recover
+        && operation.recover_phase == control::RecoverPhase::Top
+}
+
+fn destination_evidence(
+    evidence: &HereEvidence,
+) -> Result<control::DestinationIdentity, control::Reason> {
+    let layout = evidence.layout.as_ref().copied().map_err(|error| {
+        eprintln!("[HERE] Destination evidence: {error}");
+        here_destination_reason(error)
+    });
+    let sticky = evidence
+        .snapshot
+        .observation
+        .as_ref()
+        .is_some_and(|o| o.desktop == control::Evidence::Readable(u32::MAX));
+    if sticky || evidence.snapshot.candidate.reason == control::Reason::Unsupported {
+        layout.and(Err(control::Reason::Unsupported))
+    } else {
+        layout
+    }
+}
+
+fn read_recover_top(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl VisibilityHost,
+) -> Result<(HereEvidence, control::HereDecision), HostError> {
+    let evidence = host.recover_evidence(operation.placement.destination_desktop)?;
+    let decision =
+        operation.observe_recover_top(destination_evidence(&evidence), evidence.observation);
+    if decision == control::HereDecision::Destination && operation.show.baseline.is_none() {
+        operation.show.baseline = Some(control::VisibilityBaseline {
+            desktop: operation.placement.destination_desktop,
+            current_desktop: operation.placement.destination_desktop,
+            layer: evidence.observation.layer,
+        });
+    }
+    Ok((evidence, decision))
+}
+
+fn reject_recover(operation: &mut control::ActiveOperation, reason: control::Reason) {
+    operation.placement.invalidate_here(reason);
+    operation.detail.reason = reason;
+    operation.detail.progress.input_ready = false;
+}
+
+/// A guard veto is ordinary evidence failure, never a fabricated HostError.
+fn recover_visibility_guard(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl VisibilityHost,
+) -> Result<bool, HostError> {
+    let (_, decision) = read_recover_top(operation, host)?;
+    if decision != control::HereDecision::Destination {
+        let reason = match decision {
+            control::HereDecision::Invalid(reason) => reason,
+            _ => control::Reason::Unverifiable,
+        };
+        reject_recover(operation, reason);
+        return Ok(false);
+    }
+    // A minimized origin remains deferred, but restoration must not be used to
+    // learn whether an externally resized body still has the fixed canvas.
+    let layout = operation
+        .placement
+        .layout()
+        .ok_or("Recover has no admitted destination")?;
+    let geometry = host.recover_geometry(layout)?;
+    let (_, after) = read_recover_top(operation, host)?;
+    if after != control::HereDecision::Destination
+        || !operation
+            .placement
+            .layout()
+            .is_some_and(|layout| layout.body_size == geometry.size())
+    {
+        let reason = operation
+            .placement
+            .invalidation_reason()
+            .unwrap_or(control::Reason::Unverifiable);
+        reject_recover(operation, reason);
+        return Ok(false);
+    }
+    if !operation.recover_visibility_mutation_eligible(host.now()) {
+        operation.detail.reason = control::Reason::ConfirmationTimeout;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn visibility_placement(
+    operation: &control::ActiveOperation,
+    host: &mut impl VisibilityHost,
+) -> Result<ShowPlacement, HostError> {
+    if !recover_top(operation) {
+        return host.placement();
+    }
+    let layout = operation
+        .placement
+        .layout()
+        .ok_or("Recover has no admitted destination")?;
+    Ok(ShowPlacement {
+        area: layout.usable_area,
+        current_desktop: layout.current_desktop,
+        input: InputPlacement {
+            selected_monitor: layout.monitor_name,
+            observed_monitor: layout.monitor_name,
+            geometry: host.recover_geometry(layout)?,
+            bounds: layout.valid_origins,
+        },
+    })
+}
+
+/// Read-only geometry bracket shared by input enable, each layer dispatch and
+/// final proof. Calling it at expiry cannot grant mutation authority.
+fn recover_readiness(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl VisibilityHost,
+    input_ready: bool,
+) -> Result<Option<(x11::visibility::VisibilitySnapshot, InputPlacement)>, HostError> {
+    let (_, before) = read_recover_top(operation, host)?;
+    if before != control::HereDecision::Destination {
+        return Ok(None);
+    }
+    let placement = visibility_placement(operation, host)?;
+    let (fresh, after) = read_recover_top(operation, host)?;
+    if after != control::HereDecision::Destination
+        || fresh.observation.visibility != control::Visibility::NotMinimizedHere
+        || !operation.confirm_recover_top_readiness(
+            placement.input.geometry.origin(),
+            placement.input.geometry.size(),
+            input_ready && host.recover_input_ready(),
+        )
+    {
+        return Ok(None);
+    }
+    Ok(Some((fresh.snapshot, placement.input)))
+}
+
 fn observe_visibility(
     operation: &mut control::ActiveOperation,
     host: &mut impl VisibilityHost,
 ) -> Result<(x11::visibility::VisibilitySnapshot, Option<control::Reason>), HostError> {
     use control::{Evidence, LayerObservation, Reason, Visibility, VisibilityBaseline};
+    if recover_top(operation) {
+        let (evidence, decision) = read_recover_top(operation, host)?;
+        let reason = match decision {
+            control::HereDecision::Invalid(reason) => Some(reason),
+            _ => visibility_layer_issue(host, &evidence.snapshot),
+        };
+        return Ok((evidence.snapshot, reason));
+    }
     operation.detail.reason = Reason::X11Failure;
     let snapshot = host.observe()?;
     operation.detail.visibility = snapshot.candidate.visibility;
@@ -2433,6 +2604,14 @@ fn visibility_observation_eligible(
     operation: &control::ActiveOperation,
     snapshot: &x11::visibility::VisibilitySnapshot,
 ) -> bool {
+    if recover_top(operation) {
+        return operation.placement.invalidation_reason().is_none()
+            && operation.placement.proof.current.destination
+            && matches!(
+                snapshot.candidate.visibility,
+                control::Visibility::Minimized | control::Visibility::NotMinimizedHere
+            );
+    }
     let baseline = match operation.request.command {
         control::Command::Hide => operation.hide.baseline,
         control::Command::Show | control::Command::BringTop => operation.show.baseline,
@@ -2462,6 +2641,17 @@ fn validate_show_placement(
     placement: &ShowPlacement,
 ) -> Result<Option<control::Reason>, HostError> {
     let input = &placement.input;
+    if recover_top(operation) {
+        let valid = operation.placement.layout().is_some_and(|layout| {
+            input.selected_monitor == layout.monitor_name
+                && input.observed_monitor == layout.monitor_name
+                && input.geometry.size() == layout.body_size
+                && input.bounds == layout.valid_origins
+                && placement.area == layout.usable_area
+                && placement.current_desktop == layout.destination_desktop
+        });
+        return Ok((!valid).then_some(control::Reason::Unverifiable));
+    }
     if input.selected_monitor == 0 || input.selected_monitor != input.observed_monitor {
         return Err(
             "Retained monitor disappeared during Show; automatic migration is unsupported".into(),
@@ -2509,7 +2699,7 @@ fn visibility_completion(
 }
 
 fn visibility_cutoff(operation: &control::ActiveOperation) -> Instant {
-    if operation.request.command == control::Command::BringTop {
+    if operation.request.command == control::Command::BringTop || recover_top(operation) {
         operation
             .bring_top
             .visibility_cutoff
@@ -2636,6 +2826,12 @@ fn service_visibility_stage_with(
                 )));
             }
             if operation.show.phase == ShowPhase::Fenced {
+                if recover_top(operation) && !recover_visibility_guard(operation, host)? {
+                    return service_visibility_stage_final(operation, host);
+                }
+                if recover_top(operation) && operation.detail.visibility != Visibility::Minimized {
+                    return service_visibility_stage_final(operation, host);
+                }
                 operation.detail.reason = Reason::X11Failure;
                 // Never retry, including on a checked native failure.
                 let elsewhere = snapshot.evidence.workspace == control::Workspace::Other;
@@ -2644,7 +2840,16 @@ fn service_visibility_stage_with(
                 } else {
                     ShowPhase::RestoreAttempted
                 };
-                let requested = if elsewhere {
+                let requested = if recover_top(operation) {
+                    let mut dispatched = false;
+                    let result = host.restore_recover(
+                        operation,
+                        visibility_cutoff(operation),
+                        &mut dispatched,
+                    );
+                    operation.detail.progress.host_mutation_dispatched |= dispatched;
+                    result?
+                } else if elsewhere {
                     host.hidden(
                         false,
                         visibility_cutoff(operation),
@@ -2701,7 +2906,7 @@ fn service_visibility_stage_with(
             operation.stage = Stage::Geometry;
             operation.detail.stage = Stage::Geometry;
             operation.detail.reason = Reason::X11Failure;
-            let placement = host.placement()?;
+            let placement = visibility_placement(operation, host)?;
             if let Some(reason) = validate_show_placement(operation, &placement)? {
                 return Ok(Some(visibility_completion(
                     operation,
@@ -2719,6 +2924,14 @@ fn service_visibility_stage_with(
                     return Ok(None);
                 }
                 if placement.input.geometry.origin() != target {
+                    if recover_top(operation) {
+                        return Ok(Some(visibility_completion(
+                            operation,
+                            Status::Failed,
+                            Reason::Unverifiable,
+                            None,
+                        )));
+                    }
                     return Err(
                         "WM refused necessary Show bounds correction; will not retry".into(),
                     );
@@ -2741,6 +2954,14 @@ fn service_visibility_stage_with(
                     )));
                 }
                 if operation.show.correction_sent {
+                    if recover_top(operation) {
+                        return Ok(Some(visibility_completion(
+                            operation,
+                            Status::Failed,
+                            Reason::Unverifiable,
+                            None,
+                        )));
+                    }
                     return Err("Show bounds correction no longer valid; will not retry".into());
                 }
                 // A Ready no-op never cancels or moves an ongoing gesture.
@@ -2756,13 +2977,29 @@ fn service_visibility_stage_with(
                     .input
                     .bounds
                     .clamp(placement.input.geometry.origin());
+                if recover_top(operation) {
+                    if !recover_visibility_guard(operation, host)? {
+                        return service_visibility_stage_final(operation, host);
+                    }
+                    if !operation.consume_recover_top_correction(target, host.now()) {
+                        return Ok(Some(visibility_completion(
+                            operation,
+                            Status::Failed,
+                            Reason::ConfirmationTimeout,
+                            None,
+                        )));
+                    }
+                    host.restrict_recover_correction();
+                }
                 if let Some(confirmation) = host.correct(
                     target,
                     visibility_cutoff(operation),
                     &mut operation.detail.progress.host_mutation_dispatched,
                 )? {
                     operation.show.correction_sent = true;
-                    operation.show.correction = Some((target, confirmation));
+                    if !recover_top(operation) {
+                        operation.show.correction = Some((target, confirmation));
+                    }
                 } else {
                     return service_visibility_stage_final(operation, host);
                 }
@@ -2798,7 +3035,7 @@ fn service_visibility_stage_with(
                     return service_visibility_stage_final(operation, host);
                 }
                 operation.detail.reason = Reason::X11Failure;
-                let verified = host.placement()?;
+                let verified = visibility_placement(operation, host)?;
                 if let Some(reason) = validate_show_placement(operation, &verified)? {
                     return Ok(Some(visibility_completion(
                         operation,
@@ -2816,7 +3053,27 @@ fn service_visibility_stage_with(
                     )));
                 }
                 operation.show.phase = ShowPhase::EnablingInput;
-                if !host.enable(&fresh, &verified.input, Some(visibility_cutoff(operation)))? {
+                let enabled = if recover_top(operation) {
+                    let Some((snapshot, input)) = recover_readiness(operation, host, false)? else {
+                        reject_recover(operation, Reason::Unverifiable);
+                        return service_visibility_stage_final(operation, host);
+                    };
+                    if input.geometry != verified.input.geometry
+                        || !host.fence_settled()
+                        || !operation.recover_visibility_mutation_eligible(host.now())
+                    {
+                        return service_visibility_stage_final(operation, host);
+                    }
+                    let enabled =
+                        host.enable(&snapshot, &input, Some(visibility_cutoff(operation)))?;
+                    if operation.placement.correction().is_some() {
+                        host.restrict_recover_correction();
+                    }
+                    enabled
+                } else {
+                    host.enable(&fresh, &verified.input, Some(visibility_cutoff(operation)))?
+                };
+                if !enabled {
                     operation.show.phase = ShowPhase::Fenced;
                     return service_visibility_stage_final(operation, host);
                 }
@@ -2842,6 +3099,28 @@ fn service_visibility_stage_final(
     host: &mut impl VisibilityHost,
 ) -> Result<Option<VisibilityCompletion>, HostError> {
     use control::{ConfirmedVisibility, Reason, Status, Visibility};
+    if recover_top(operation) {
+        let ready = recover_readiness(operation, host, true)?.is_some()
+            && host.recover_input_ready()
+            && operation.show.correction.is_none();
+        return Ok(Some(if ready {
+            visibility_completion(
+                operation,
+                Status::Success,
+                Reason::None,
+                Some(ConfirmedVisibility::NotMinimizedHere),
+            )
+        } else {
+            let reason = operation.placement.invalidation_reason().unwrap_or(
+                if host.now() >= visibility_cutoff(operation) {
+                    Reason::ConfirmationTimeout
+                } else {
+                    Reason::Unverifiable
+                },
+            );
+            visibility_completion(operation, Status::Failed, reason, None)
+        }));
+    }
     let (snapshot, reason) = observe_visibility(operation, host)?;
     if let Some(reason) = reason {
         return Ok(Some(visibility_completion(
@@ -2864,7 +3143,7 @@ fn service_visibility_stage_final(
         }
         if snapshot.candidate.visibility == Visibility::NotMinimizedHere && host.noop_ready() {
             operation.detail.reason = Reason::X11Failure;
-            let placement = host.placement()?;
+            let placement = visibility_placement(operation, host)?;
             if let Some(reason) = validate_show_placement(operation, &placement)? {
                 return Ok(Some(visibility_completion(
                     operation,
@@ -3011,6 +3290,35 @@ fn finish_bring_top_observed_with(
     allow_success: bool,
 ) -> Result<(control::OperationResult, Option<RemoteLayerIssue>), HostError> {
     use control::{ConfirmedVisibility as C, Reason};
+    if recover_top(operation) {
+        let ready = recover_readiness(operation, host, true)?.is_some()
+            && host.recover_input_ready()
+            && operation.show.correction.is_none();
+        let success = allow_success
+            && ready
+            && operation.detail.progress.above_confirmed
+            && operation.placement.invalidation_reason().is_none()
+            && !operation.show.layout_interrupted;
+        if success {
+            operation.stage = control::Stage::Layer;
+            return Ok((
+                operation
+                    .recover_result(Reason::None, control::Stage::Layer)
+                    .expect("Recover success requires the E1 fresh proof validator"),
+                None,
+            ));
+        }
+        let reason =
+            operation
+                .placement
+                .invalidation_reason()
+                .unwrap_or(if reason == Reason::None {
+                    Reason::Unverifiable
+                } else {
+                    reason
+                });
+        return Ok((incomplete_recover(operation, reason), None));
+    }
     let (mut snapshot, issue) = observe_visibility(operation, host)?;
     let mut reason = issue.unwrap_or(reason);
     let mut visibility = bring_top_confirmation(&snapshot);
@@ -3022,7 +3330,7 @@ fn finish_bring_top_observed_with(
         && operation.show.correction.is_none()
     {
         operation.detail.reason = Reason::X11Failure;
-        let placement = host.placement()?;
+        let placement = visibility_placement(operation, host)?;
         if let Some(issue) = validate_show_placement(operation, &placement)? {
             reason = issue;
         } else if placement
@@ -3136,6 +3444,9 @@ fn service_bring_top_with(
         match outcome? {
             None => return Ok(None),
             Some(VisibilityCompletion::Failed(Status::Busy, reason)) => {
+                if recover_top(operation) {
+                    return Ok(Some(incomplete_recover(operation, Reason::Unverifiable)));
+                }
                 if operation.detail.progress.host_mutation_dispatched
                     || operation.show.phase != control::ShowPhase::Observe
                     || operation.bring_top.restoration_confirmed
@@ -3169,10 +3480,22 @@ fn service_bring_top_with(
                     )
                     .map(Some);
                 }
-                operation.stage = Stage::Layer;
-                operation.detail.stage = Stage::Layer;
-                operation.bring_top.layer_admitted = Some(host.now());
-                operation.bring_top.layer_observe = true;
+                if recover_top(operation) {
+                    if !operation.admit_recover_layer(host.now()) {
+                        return finish_bring_top_with(
+                            operation,
+                            host,
+                            Reason::ConfirmationTimeout,
+                            true,
+                        )
+                        .map(Some);
+                    }
+                } else {
+                    operation.stage = Stage::Layer;
+                    operation.detail.stage = Stage::Layer;
+                    operation.bring_top.layer_admitted = Some(host.now());
+                    operation.bring_top.layer_observe = true;
+                }
             }
         }
     }
@@ -3253,9 +3576,11 @@ fn unsupported_placement(operation: &control::ActiveOperation) -> control::Opera
 fn service_remote_layer_with(
     layers: &mut LayerController,
     operation: &mut control::ActiveOperation,
-    mut read: impl FnMut() -> Result<Result<ObservedLayer, RemoteLayerIssue>, HostError>,
+    mut read: impl FnMut(
+        &mut control::ActiveOperation,
+    ) -> Result<Result<ObservedLayer, RemoteLayerIssue>, HostError>,
     support: impl FnMut() -> Result<PropertyResult<LayerSupport>, HostError>,
-    mut send: impl FnMut(Mutation, &mut bool) -> Result<(), HostError>,
+    mut send: impl FnMut(Mutation, &mut control::ActiveOperation, &mut bool) -> Result<bool, HostError>,
     now: impl FnMut() -> Instant,
 ) -> Result<(LayerOutcome, Option<RemoteLayerIssue>), HostError> {
     let admitted = operation
@@ -3268,24 +3593,26 @@ fn service_remote_layer_with(
         return Ok((LayerOutcome::Interrupted(layer::Phase::AwaitFinal), None));
     }
     let request = layers.pending().is_none().then_some(Layer::Above);
+    let operation = std::cell::RefCell::new(operation);
     let result = service_qualified_layer_with(
         layers,
         request,
         Some(outer),
         true,
         || {
-            let result = read()?;
+            let result = read(&mut operation.borrow_mut())?;
             issue.set(result.as_ref().err().copied());
             Ok(result)
         },
         support,
         |mutation| {
+            let mut operation = operation.borrow_mut();
             operation.bring_top.layer_attempted = true;
             let mut dispatched = false;
-            let result = send(mutation, &mut dispatched);
+            let result = send(mutation, &mut operation, &mut dispatched);
             operation.bring_top.layer_dispatched |= dispatched;
             operation.detail.progress.host_mutation_dispatched |= dispatched;
-            operation.bring_top.layer_checked |= result.is_ok();
+            operation.bring_top.layer_checked |= matches!(result, Ok(true));
             result
         },
         now,
@@ -3357,32 +3684,21 @@ fn here_destination_reason(
     }
 }
 
-fn read_here(
-    operation: &mut control::ActiveOperation,
-    host: &mut impl BringHereHost,
-) -> Result<(HereEvidence, control::HereDecision), HostError> {
-    let evidence = host.evidence(operation.placement.destination_desktop)?;
-    let layout = evidence.layout.as_ref().copied().map_err(|error| {
-        eprintln!("[HERE] Destination evidence: {error}");
-        here_destination_reason(error)
-    });
-    let sticky = evidence
-        .snapshot
-        .observation
-        .as_ref()
-        .is_some_and(|o| o.desktop == control::Evidence::Readable(u32::MAX));
-    let layout = if sticky || evidence.snapshot.candidate.reason == control::Reason::Unsupported {
-        layout.and(Err(control::Reason::Unsupported))
-    } else {
-        layout
-    };
-    let decision = operation
-        .placement
-        .observe_here(layout, evidence.observation);
-    Ok((evidence, decision))
+/// Function outcome only; the existing ActiveOperation remains the sole owner.
+#[derive(Debug, Clone, Copy)]
+enum HereCompletion {
+    Ready(control::Confirmation),
+    Incomplete(control::Reason),
+    Busy,
 }
 
-fn incomplete_here(
+/// Borrowed access to the same body's existing Show/layer mechanisms.
+trait RecoverHost: BringHereHost {
+    type Top: BringTopHost;
+    fn top(&mut self) -> &mut Self::Top;
+}
+
+fn incomplete_recover(
     operation: &mut control::ActiveOperation,
     reason: control::Reason,
 ) -> control::OperationResult {
@@ -3391,16 +3707,201 @@ fn incomplete_here(
     operation.detail = control::preflight_detail(reason, operation.stage);
     operation.detail.progress.host_mutation_dispatched = dispatched;
     operation
-        .placement
-        .here_result(operation.detail, control::Confirmation::default())
-        .expect("Incomplete Here clears current claims and retains genuine history")
+        .recover_result(reason, operation.stage)
+        .expect("Incomplete Recover retains only independently confirmed history")
+}
+
+/// E2 internal entry only. E3 owns production routing and cross-phase fatal
+/// finalization; neither production Unsupported guard calls this composition.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Production Recover routing is separately gated on E3/E4"
+    )
+)]
+fn service_recover_with(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl RecoverHost,
+) -> Result<Option<control::OperationResult>, HostError> {
+    let mut outcome = step_recover_with(operation, host);
+    let failed = match &outcome {
+        Err(_) => true,
+        Ok(Some(result)) => !matches!(
+            result.status(),
+            control::Status::Success | control::Status::Busy
+        ),
+        Ok(None) => false,
+    };
+    // Borrowed mechanism safety only: no reply, slot clearing, shutdown result
+    // or fatal-history round here. E3 must integrate those owner obligations.
+    if failed
+        && host.live()
+        && operation.placement.baseline.is_some()
+        && (host.input_active() || !host.fence_settled())
+    {
+        if operation.placement.correction().is_some() {
+            host.restrict_automatic_correction();
+        }
+        let cleanup = host
+            .owned()
+            .and_then(|owned| if owned { host.fence() } else { Ok(()) });
+        if let Err(cleanup) = cleanup {
+            if outcome.is_ok() {
+                outcome = Err(cleanup);
+            } else {
+                eprintln!("[RECOVER] Input safety cleanup: {cleanup}");
+            }
+        }
+    }
+    outcome
+}
+
+fn step_recover_with(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl RecoverHost,
+) -> Result<Option<control::OperationResult>, HostError> {
+    if operation.request.command != control::Command::Recover {
+        return Err("Internal Recover requires its original request identity".into());
+    }
+    if operation.recover_phase == control::RecoverPhase::Here {
+        match step_bring_here_with(operation, host)? {
+            None => return Ok(None),
+            Some(HereCompletion::Ready(confirmed)) => {
+                if !operation.handoff_recover_top(host.now(), operation.detail, confirmed) {
+                    return Ok(Some(incomplete_recover(
+                        operation,
+                        control::Reason::ConfirmationTimeout,
+                    )));
+                }
+                if operation.placement.correction().is_some() {
+                    host.restrict_automatic_correction();
+                }
+            }
+            Some(HereCompletion::Incomplete(reason)) => {
+                return Ok(Some(incomplete_recover(operation, reason)));
+            }
+            Some(HereCompletion::Busy) => {
+                return Ok(Some(
+                    control::OperationResult::placement(
+                        control::Command::Recover,
+                        control::Status::Busy,
+                        control::preflight_detail(control::Reason::Busy, control::Stage::Preflight),
+                        control::Confirmation::default(),
+                        &operation.placement,
+                    )
+                    .expect("Unstarted Recover cannot take existing placement ownership"),
+                ));
+            }
+        }
+    }
+    // The handoff is immediately actionable; no new notification is needed.
+    service_bring_top_with(operation, host.top())
+}
+
+fn here_cutoff(operation: &control::ActiveOperation) -> Instant {
+    operation.here_cutoff().unwrap_or(operation.deadline)
+}
+
+fn stop_here(operation: &mut control::ActiveOperation, reason: control::Reason) -> HereCompletion {
+    operation.stage = control::Stage::Shutdown;
+    incomplete_here(operation, reason)
+}
+
+fn standalone_here_result(
+    operation: &mut control::ActiveOperation,
+    completion: HereCompletion,
+) -> control::OperationResult {
+    match completion {
+        HereCompletion::Ready(confirmed) => operation
+            .placement
+            .here_result(operation.detail, confirmed)
+            .expect("Here Success requires complete fresh placement/input proof"),
+        HereCompletion::Incomplete(reason) => {
+            operation.detail.reason = reason;
+            operation
+                .placement
+                .here_result(operation.detail, control::Confirmation::default())
+                .expect("Incomplete Here clears current claims and retains genuine history")
+        }
+        HereCompletion::Busy => control::OperationResult::placement(
+            control::Command::BringHere,
+            control::Status::Busy,
+            control::preflight_detail(control::Reason::Busy, control::Stage::Preflight),
+            control::Confirmation::default(),
+            &operation.placement,
+        )
+        .expect("Unstarted Here does not steal existing placement ownership"),
+    }
+}
+
+fn read_here(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl BringHereHost,
+) -> Result<(HereEvidence, control::HereDecision), HostError> {
+    let evidence = host.evidence(operation.placement.destination_desktop)?;
+    let layout = destination_evidence(&evidence);
+    let decision = if operation.request.command == control::Command::Recover {
+        let stage = operation.stage;
+        let decision = operation.observe_recover_here(layout, evidence.observation);
+        if stage == control::Stage::Geometry {
+            operation.stage = stage;
+            operation.detail.stage = stage;
+        }
+        decision
+    } else {
+        operation
+            .placement
+            .observe_here(layout, evidence.observation)
+    };
+    Ok((evidence, decision))
+}
+
+/// Ownership queries are synchronous too. Recover revalidates the complete
+/// identity after them, immediately before consuming each mutation allowance.
+fn guard_recover_here(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl BringHereHost,
+    expected: control::HereDecision,
+    geometry: Option<geometry::Rect>,
+) -> Result<Option<control::Reason>, HostError> {
+    if operation.request.command != control::Command::Recover {
+        return Ok(None);
+    }
+    let (_, decision) = read_here(operation, host)?;
+    if decision != expected {
+        return Ok(Some(match decision {
+            control::HereDecision::Invalid(reason) => reason,
+            _ => control::Reason::Unverifiable,
+        }));
+    }
+    if let Some(actual) = geometry {
+        if !operation
+            .placement
+            .confirm_here_geometry(actual.origin(), actual.size())
+        {
+            return Ok(Some(control::Reason::Unverifiable));
+        }
+    }
+    Ok(None)
+}
+
+fn incomplete_here(
+    operation: &mut control::ActiveOperation,
+    reason: control::Reason,
+) -> HereCompletion {
+    operation.placement.invalidate_here(reason);
+    let dispatched = operation.detail.progress.host_mutation_dispatched;
+    operation.detail = control::preflight_detail(reason, operation.stage);
+    operation.detail.progress.host_mutation_dispatched = dispatched;
+    HereCompletion::Incomplete(reason)
 }
 
 fn complete_here(
     operation: &mut control::ActiveOperation,
     evidence: &HereEvidence,
     input_ready: bool,
-) -> control::OperationResult {
+) -> HereCompletion {
     use control::{ConfirmedVisibility, GeometryProof, LayerObservation, Visibility};
     let minimized = evidence.observation.visibility == Visibility::Minimized;
     let above = !minimized && evidence.observation.layer == LayerObservation::Above;
@@ -3419,20 +3920,14 @@ fn complete_here(
         placement: operation.placement.proof,
         ..control::preflight_detail(control::Reason::None, operation.stage)
     };
-    operation
-        .placement
-        .here_result(
-            operation.detail,
-            control::Confirmation {
-                visibility: Some(if minimized {
-                    ConfirmedVisibility::Minimized
-                } else {
-                    ConfirmedVisibility::NotMinimizedHere
-                }),
-                above,
-            },
-        )
-        .expect("Here Success requires complete fresh placement/input proof")
+    HereCompletion::Ready(control::Confirmation {
+        visibility: Some(if minimized {
+            ConfirmedVisibility::Minimized
+        } else {
+            ConfirmedVisibility::NotMinimizedHere
+        }),
+        above,
+    })
 }
 
 /// Read-only final visible proof brackets actual geometry with fresh strict
@@ -3441,7 +3936,7 @@ fn complete_here(
 fn verify_here_visible(
     operation: &mut control::ActiveOperation,
     host: &mut impl BringHereHost,
-) -> Result<control::OperationResult, HostError> {
+) -> Result<HereCompletion, HostError> {
     use control::{HereDecision, Reason, Visibility};
     let (_, before) = read_here(operation, host)?;
     if let HereDecision::Invalid(reason) = before {
@@ -3465,7 +3960,22 @@ fn verify_here_visible(
         return Ok(incomplete_here(operation, Reason::Unverifiable));
     }
     if !host.owned()? {
-        return Ok(operation.here_shutdown(Reason::OwnershipLost).unwrap());
+        return Ok(stop_here(operation, Reason::OwnershipLost));
+    }
+    if operation.request.command == control::Command::Recover {
+        let (fresh, decision) = read_here(operation, host)?;
+        if let HereDecision::Invalid(reason) = decision {
+            return Ok(incomplete_here(operation, reason));
+        }
+        if decision != HereDecision::Destination
+            || !host.visible_ready()
+            || !operation
+                .placement
+                .confirm_here_geometry(actual.origin(), actual.size())
+        {
+            return Ok(incomplete_here(operation, Reason::Unverifiable));
+        }
+        return Ok(complete_here(operation, &fresh, true));
     }
     Ok(complete_here(operation, &fresh, true))
 }
@@ -3475,25 +3985,17 @@ fn verify_here_visible(
 fn step_bring_here_with(
     operation: &mut control::ActiveOperation,
     host: &mut impl BringHereHost,
-) -> Result<Option<control::OperationResult>, HostError> {
+) -> Result<Option<HereCompletion>, HostError> {
     use control::{HereDecision as D, HerePhase as P, Reason as R, Stage, Visibility as V};
     if !host.owned()? {
-        return Ok(Some(operation.here_shutdown(R::OwnershipLost).unwrap()));
+        return Ok(Some(stop_here(operation, R::OwnershipLost)));
     }
     if !host.live() {
-        return Ok(Some(operation.here_shutdown(R::BodyDestroyed).unwrap()));
+        return Ok(Some(stop_here(operation, R::BodyDestroyed)));
     }
     if operation.placement.here_phase() == P::Observe && host.placement_busy() {
-        return Ok(Some(
-            control::OperationResult::placement(
-                control::Command::BringHere,
-                control::Status::Busy,
-                control::preflight_detail(R::Busy, Stage::Preflight),
-                control::Confirmation::default(),
-                &operation.placement,
-            )
-            .expect("Unstarted Here does not steal existing placement ownership"),
-        ));
+        operation.stage = Stage::Preflight;
+        return Ok(Some(HereCompletion::Busy));
     }
     let (mut evidence, mut decision) = read_here(operation, host)?;
     if let D::Invalid(reason) = decision {
@@ -3511,16 +4013,29 @@ fn step_bring_here_with(
     {
         return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
     }
-    // At total expiry there is only this bounded final read (plus geometry for
+    // At phase expiry there is only this bounded final read (plus geometry for
     // already enabled input). No mutation authority is renewed by a late read.
-    if host.now() >= operation.deadline {
+    if host.now() >= here_cutoff(operation) {
         if decision == D::Destination {
             if evidence.observation.visibility == V::Minimized
                 && host.fence_settled()
                 && operation.placement.defer_here_geometry()
             {
                 if !host.owned()? {
-                    return Ok(Some(operation.here_shutdown(R::OwnershipLost).unwrap()));
+                    return Ok(Some(stop_here(operation, R::OwnershipLost)));
+                }
+                if operation.request.command == control::Command::Recover {
+                    let (fresh, decision) = read_here(operation, host)?;
+                    if let D::Invalid(reason) = decision {
+                        return Ok(Some(incomplete_here(operation, reason)));
+                    }
+                    if decision != D::Destination
+                        || !host.fence_settled()
+                        || !operation.placement.defer_here_geometry()
+                    {
+                        return Ok(Some(incomplete_here(operation, R::Unverifiable)));
+                    }
+                    return Ok(Some(complete_here(operation, &fresh, false)));
                 }
                 return Ok(Some(complete_here(operation, &evidence, false)));
             }
@@ -3543,13 +4058,13 @@ fn step_bring_here_with(
                 return verify_here_visible(operation, host).map(Some);
             }
         }
-        if host.now() >= operation.deadline {
+        if host.now() >= here_cutoff(operation) {
             return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
         }
         if !host.owned()? {
-            return Ok(Some(operation.here_shutdown(R::OwnershipLost).unwrap()));
+            return Ok(Some(stop_here(operation, R::OwnershipLost)));
         }
-        if host.now() >= operation.deadline {
+        if host.now() >= here_cutoff(operation) {
             return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
         }
         if !host.fence_settled() {
@@ -3569,7 +4084,7 @@ fn step_bring_here_with(
             // The fresh pre-send round must still prove the original body,
             // including preservation. Transitional evidence grants no send.
             if decision != D::Original {
-                if decision == D::Pending && host.now() < operation.deadline {
+                if decision == D::Pending && host.now() < here_cutoff(operation) {
                     return Ok(None);
                 }
                 return Ok(Some(incomplete_here(operation, R::LayoutChanged)));
@@ -3579,11 +4094,14 @@ fn step_bring_here_with(
     if operation.placement.here_phase() == P::Fenced
         && operation.placement.baseline.unwrap().desktop != operation.placement.destination_desktop
     {
-        if decision == D::Pending && host.now() < operation.deadline {
+        if decision == D::Pending && host.now() < here_cutoff(operation) {
             return Ok(None);
         }
         if !host.owned()? {
-            return Ok(Some(operation.here_shutdown(R::OwnershipLost).unwrap()));
+            return Ok(Some(stop_here(operation, R::OwnershipLost)));
+        }
+        if let Some(reason) = guard_recover_here(operation, host, D::Original, None)? {
+            return Ok(Some(incomplete_here(operation, reason)));
         }
         if !host.fence_settled() || !operation.consume_here_desktop_attempt(host.now()) {
             return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
@@ -3591,7 +4109,7 @@ fn step_bring_here_with(
         let mut dispatched = false;
         let transport = host.desktop(
             operation.placement.destination_desktop,
-            operation.deadline,
+            here_cutoff(operation),
             &mut dispatched,
         );
         operation.detail.progress.host_mutation_dispatched |= dispatched;
@@ -3617,7 +4135,20 @@ fn step_bring_here_with(
             && operation.placement.defer_here_geometry()
         {
             if !host.owned()? {
-                return Ok(Some(operation.here_shutdown(R::OwnershipLost).unwrap()));
+                return Ok(Some(stop_here(operation, R::OwnershipLost)));
+            }
+            if operation.request.command == control::Command::Recover {
+                let (fresh, decision) = read_here(operation, host)?;
+                if let D::Invalid(reason) = decision {
+                    return Ok(Some(incomplete_here(operation, reason)));
+                }
+                if decision != D::Destination
+                    || !host.fence_settled()
+                    || !operation.placement.defer_here_geometry()
+                {
+                    return Ok(Some(incomplete_here(operation, R::Unverifiable)));
+                }
+                return Ok(Some(complete_here(operation, &fresh, false)));
             }
             return Ok(Some(complete_here(operation, &fresh, false)));
         }
@@ -3666,7 +4197,10 @@ fn step_bring_here_with(
             };
         }
         if !host.owned()? {
-            return Ok(Some(operation.here_shutdown(R::OwnershipLost).unwrap()));
+            return Ok(Some(stop_here(operation, R::OwnershipLost)));
+        }
+        if let Some(reason) = guard_recover_here(operation, host, D::Destination, None)? {
+            return Ok(Some(incomplete_here(operation, reason)));
         }
         let target = layout.valid_origins.clamp(actual.origin());
         if !host.fence_settled() || !operation.consume_here_correction(target, host.now()) {
@@ -3675,7 +4209,7 @@ fn step_bring_here_with(
         // Consume runtime's automatic budget before even a failing native call.
         host.restrict_automatic_correction();
         let mut dispatched = false;
-        let correction = host.correct(target, operation.deadline, &mut dispatched);
+        let correction = host.correct(target, here_cutoff(operation), &mut dispatched);
         operation.detail.progress.host_mutation_dispatched |= dispatched;
         return match correction? {
             Some(_) => Ok(None), // D1's earlier immutable deadline governs
@@ -3683,14 +4217,17 @@ fn step_bring_here_with(
         };
     }
     if !host.owned()? {
-        return Ok(Some(operation.here_shutdown(R::OwnershipLost).unwrap()));
+        return Ok(Some(stop_here(operation, R::OwnershipLost)));
+    }
+    if let Some(reason) = guard_recover_here(operation, host, D::Destination, Some(actual))? {
+        return Ok(Some(incomplete_here(operation, reason)));
     }
     if !host.fence_settled() || !operation.consume_here_input_enable(host.now()) {
         return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
     }
     // Attempt consumed before checked SHAPE. The wrapper re-fences even when a
     // failing check may already have enabled native input.
-    if !host.enable(&evidence, actual, operation.deadline)? {
+    if !host.enable(&evidence, actual, here_cutoff(operation))? {
         return Ok(Some(incomplete_here(operation, R::ConfirmationTimeout)));
     }
     assert!(operation.here_input_restored());
@@ -3704,7 +4241,8 @@ fn service_bring_here_with(
     operation: &mut control::ActiveOperation,
     host: &mut impl BringHereHost,
 ) -> Result<Option<control::OperationResult>, HostError> {
-    let outcome = step_bring_here_with(operation, host);
+    let outcome = step_bring_here_with(operation, host)
+        .map(|outcome| outcome.map(|completion| standalone_here_result(operation, completion)));
     finalize_bring_here_with(operation, host, outcome)
 }
 
@@ -3943,6 +4481,13 @@ impl<C: Connection> BringHereHost for NativeHere<'_, '_, C> {
             bounds: layout.valid_origins,
         };
         h.enable(&evidence.snapshot, &input, Some(deadline))
+    }
+}
+
+impl<'b, C: Connection> RecoverHost for NativeHere<'_, 'b, C> {
+    type Top = NativeVisibility<'b, C>;
+    fn top(&mut self) -> &mut Self::Top {
+        self.visibility
     }
 }
 
@@ -4895,6 +5440,59 @@ impl<C: Connection> VisibilityHost for NativeVisibility<'_, C> {
             .restore_visibility_input(self.conn, self.window, snapshot, placement)?;
         Ok(true)
     }
+    fn recover_evidence(&mut self, destination: u32) -> Result<HereEvidence, HostError> {
+        self.here_observe(destination)
+    }
+    fn recover_geometry(
+        &mut self,
+        layout: control::DestinationIdentity,
+    ) -> Result<geometry::Rect, HostError> {
+        // Match ordinary placement's borrowed resource updates, using only the
+        // already admitted strict identity rather than a new legacy layout.
+        *self.bounds = layout.valid_origins;
+        *self.area = layout.usable_area;
+        self.window.query_actual_root_geometry(self.conn, self.root)
+    }
+    fn recover_input_ready(&self) -> bool {
+        here_runtime_ready(self.runtime, self.window)
+    }
+    fn restrict_recover_correction(&mut self) {
+        self.runtime.input_fence.automatic_correction_blocked = true;
+    }
+    fn restore_recover(
+        &mut self,
+        operation: &mut control::ActiveOperation,
+        deadline: Instant,
+        dispatched: &mut bool,
+    ) -> Result<bool, HostError> {
+        if !self.runtime.visibility_dispatch_eligible() {
+            return Err("Recover restoration requires a settled input fence".into());
+        }
+        let (atoms, conn, body) = (self.atoms, self.conn, self.window.window);
+        atoms.request_restore_guarded_before(conn, body, deadline, dispatched, || {
+            Ok(recover_visibility_guard(operation, self)?
+                && operation.detail.visibility == control::Visibility::Minimized)
+        })
+    }
+}
+
+fn recover_layer_dispatch_eligible(
+    operation: &mut control::ActiveOperation,
+    host: &mut impl VisibilityHost,
+) -> Result<bool, HostError> {
+    if recover_readiness(operation, host, true)?.is_none() || !host.recover_input_ready() {
+        let reason = operation
+            .placement
+            .invalidation_reason()
+            .unwrap_or(control::Reason::Unverifiable);
+        reject_recover(operation, reason);
+        return Ok(false);
+    }
+    if !operation.recover_layer_mutation_eligible(host.now()) {
+        reject_recover(operation, control::Reason::ConfirmationTimeout);
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 impl<C: Connection> BringTopHost for NativeVisibility<'_, C> {
@@ -4914,30 +5512,42 @@ impl<C: Connection> BringTopHost for NativeVisibility<'_, C> {
             .show
             .baseline
             .expect("visibility readiness establishes baseline");
-        service_remote_layer_with(
-            &mut self.runtime.layers,
+        let mut layers = std::mem::take(&mut self.runtime.layers);
+        let host = std::cell::RefCell::new(&mut *self);
+        let result = service_remote_layer_with(
+            &mut layers,
             operation,
-            || {
-                atoms.read_remote(
-                    self.atoms,
-                    self.conn,
-                    self.root,
-                    self.window.window,
-                    baseline,
-                )
+            |operation| {
+                let mut h = host.borrow_mut();
+                if recover_top(operation) {
+                    let (evidence, decision) = read_recover_top(operation, &mut **h)?;
+                    return Ok(match decision {
+                        control::HereDecision::Destination => {
+                            atoms.qualify_remote(&evidence.snapshot, baseline)
+                        }
+                        control::HereDecision::Pending => Err(RemoteLayerIssue::Waiting),
+                        _ => Err(RemoteLayerIssue::WorkspaceChanged),
+                    });
+                }
+                atoms.read_remote(h.atoms, h.conn, h.root, h.window.window, baseline)
             },
-            || atoms.read_support(self.conn, self.root),
-            |mutation, dispatched| {
-                atoms.send_marked(
-                    self.conn,
-                    self.root,
-                    self.window.window,
-                    mutation,
-                    dispatched,
-                )
+            || {
+                let h = host.borrow();
+                atoms.read_support(h.conn, h.root)
+            },
+            |mutation, operation, dispatched| {
+                let mut h = host.borrow_mut();
+                if recover_top(operation) && !recover_layer_dispatch_eligible(operation, &mut **h)?
+                {
+                    return Ok(false);
+                }
+                atoms.send_marked(h.conn, h.root, h.window.window, mutation, dispatched)?;
+                Ok(true)
             },
             Instant::now,
-        )
+        );
+        self.runtime.layers = layers;
+        result
     }
     fn abort_above(&mut self) {
         abort_layer(&mut self.runtime.layers, "remote operation ended");
@@ -9793,7 +10403,7 @@ mod show_tests {
             let result = service_remote_layer_with(
                 &mut layers,
                 operation,
-                || {
+                |_| {
                     let mut h = host.borrow_mut();
                     h.step("layer_read")?;
                     if let Some(issue) = h.layer_issue {
@@ -9811,7 +10421,7 @@ mod show_tests {
                     let default = h.layer_support;
                     Ok(h.support_reads.pop_front().unwrap_or(Ok(default)))
                 },
-                |mutation, dispatched| {
+                |mutation, _, dispatched| {
                     let mut h = host.borrow_mut();
                     if h.fail_before_layer_dispatch {
                         return Err("injected before layer dispatch".into());
@@ -9829,7 +10439,7 @@ mod show_tests {
                         Mutation::AddAbove if h.layer_mode == 0 => h.current.layer = L::Above,
                         _ => {}
                     }
-                    Ok(())
+                    Ok(true)
                 },
                 || host.borrow().now,
             );
@@ -17023,5 +17633,1019 @@ mod here_service_tests {
                 < service.find("owner.verify_active_ownership").unwrap()
         );
         assert_eq!(service.matches("owner.verify_active_ownership").count(), 1);
+    }
+
+    mod recover_tests {
+        use super::*;
+        use control::{RecoverPhase, Visibility};
+        use std::cell::{Cell, RefCell};
+
+        struct Host {
+            here: Fake,
+            layer_changes: bool,
+            mutations: Vec<Mutation>,
+            fail_before_cookie: Option<&'static str>,
+        }
+        impl Host {
+            fn new(remote: bool, minimized: bool, layer: L) -> Self {
+                Self {
+                    here: Fake::new(remote, minimized, layer),
+                    layer_changes: true,
+                    mutations: vec![],
+                    fail_before_cookie: None,
+                }
+            }
+            fn operation(&self) -> ActiveOperation {
+                let mut active = None;
+                assert_eq!(
+                    control::admit(
+                        &mut active,
+                        control::Request {
+                            command: Command::Recover,
+                            request_id: 99,
+                            reply_xid: 9,
+                            epoch: 11
+                        },
+                        2,
+                        control::Lifecycle::Ready,
+                        false,
+                        self.here.now,
+                    ),
+                    control::Admission::Admitted
+                );
+                active.unwrap()
+            }
+            fn run(&mut self, op: &mut ActiveOperation) -> Option<control::OperationResult> {
+                service_recover_with(op, self).unwrap()
+            }
+            fn restored(&mut self) {
+                self.here.current.minimized = false;
+                self.here.current.transitional = false;
+            }
+            fn atoms() -> LayerAtoms {
+                LayerAtoms {
+                    state: 12,
+                    supported: 18,
+                    above: 14,
+                    below: 15,
+                }
+            }
+        }
+        impl BringHereHost for Host {
+            fn now(&self) -> Instant {
+                self.here.now
+            }
+            fn owned(&mut self) -> Result<bool, HostError> {
+                self.here.owned()
+            }
+            fn live(&self) -> bool {
+                self.here.live()
+            }
+            fn evidence(&mut self, destination: u32) -> Result<HereEvidence, HostError> {
+                self.here.evidence(destination)
+            }
+            fn placement_busy(&self) -> bool {
+                self.here.placement_busy()
+            }
+            fn input_active(&self) -> bool {
+                self.here.input_active()
+            }
+            fn visible_ready(&self) -> bool {
+                self.here.visible_ready()
+            }
+            fn fence_settled(&self) -> bool {
+                self.here.fence_settled()
+            }
+            fn fence(&mut self) -> Result<(), HostError> {
+                self.here.fence()
+            }
+            fn desktop(
+                &mut self,
+                destination: u32,
+                deadline: Instant,
+                dispatched: &mut bool,
+            ) -> Result<bool, HostError> {
+                self.here.desktop(destination, deadline, dispatched)
+            }
+            fn geometry(&mut self) -> Result<Rect, HostError> {
+                self.here.geometry()
+            }
+            fn restrict_automatic_correction(&mut self) {
+                self.here.restrict_automatic_correction();
+            }
+            fn correct(
+                &mut self,
+                target: Point,
+                deadline: Instant,
+                dispatched: &mut bool,
+            ) -> Result<Option<Instant>, HostError> {
+                self.here.correct(target, deadline, dispatched)
+            }
+            fn enable(
+                &mut self,
+                evidence: &HereEvidence,
+                geometry: Rect,
+                deadline: Instant,
+            ) -> Result<bool, HostError> {
+                self.here.enable(evidence, geometry, deadline)
+            }
+        }
+        impl RecoverHost for Host {
+            type Top = Self;
+            fn top(&mut self) -> &mut Self {
+                self
+            }
+        }
+        impl VisibilityHost for Host {
+            fn now(&self) -> Instant {
+                self.here.now
+            }
+            fn layer_atoms(&self) -> LayerAtoms {
+                Self::atoms()
+            }
+            fn observe(&mut self) -> Result<x11::visibility::VisibilitySnapshot, HostError> {
+                self.here.step("top_observe")?;
+                Ok(self.here.current.snapshot())
+            }
+            fn noop_ready(&self) -> bool {
+                self.here.visible_ready()
+            }
+            fn placement_busy(&self) -> bool {
+                self.here.placement_busy()
+            }
+            fn fenced(&self) -> bool {
+                self.here.runtime.input_fence.blocked
+            }
+            fn fence_settled(&self) -> bool {
+                self.here.fence_settled()
+            }
+            fn deferred_placement(&mut self, _: &ShowPlacement) -> Result<bool, HostError> {
+                panic!("Recover never defers local readiness")
+            }
+            fn fence(&mut self) -> Result<(), HostError> {
+                self.here.fence()
+            }
+            fn iconify(&mut self, _: Instant, _: &mut bool) -> Result<bool, HostError> {
+                panic!("Recover never hides")
+            }
+            fn restore(&mut self, _: Instant, _: &mut bool) -> Result<bool, HostError> {
+                panic!("Recover requires guarded restore")
+            }
+            fn hidden(&mut self, _: bool, _: Instant, _: &mut bool) -> Result<bool, HostError> {
+                panic!("Recover never accepts off-workspace Top")
+            }
+            fn placement(&mut self) -> Result<ShowPlacement, HostError> {
+                panic!("Recover must not use legacy placement")
+            }
+            fn correct(
+                &mut self,
+                target: Point,
+                deadline: Instant,
+                dispatched: &mut bool,
+            ) -> Result<Option<Instant>, HostError> {
+                self.here.correct(target, deadline, dispatched)
+            }
+            fn enable(
+                &mut self,
+                snapshot: &x11::visibility::VisibilitySnapshot,
+                input: &InputPlacement,
+                deadline: Option<Instant>,
+            ) -> Result<bool, HostError> {
+                self.here.step("top_enable")?;
+                if deadline.is_some_and(|dl| self.here.now >= dl) {
+                    return Ok(false);
+                }
+                let shape = self.here.step("shape");
+                self.here.window.confirmed_origin = input.geometry.origin();
+                self.here.window.cancel_in_flight_moves();
+                self.here.runtime.body = BodyAvailability::Ready;
+                self.here.runtime.restore_visibility_input_with(
+                    &self.here.window,
+                    snapshot.evidence,
+                    input,
+                    || shape.map(|()| 2000),
+                )?;
+                Ok(true)
+            }
+            fn recover_evidence(&mut self, destination: u32) -> Result<HereEvidence, HostError> {
+                self.here.evidence(destination)
+            }
+            fn recover_geometry(
+                &mut self,
+                _: control::DestinationIdentity,
+            ) -> Result<Rect, HostError> {
+                self.here.geometry()
+            }
+            fn restrict_recover_correction(&mut self) {
+                self.here.restrict_automatic_correction();
+            }
+            fn restore_recover(
+                &mut self,
+                op: &mut ActiveOperation,
+                deadline: Instant,
+                dispatched: &mut bool,
+            ) -> Result<bool, HostError> {
+                let clock = Cell::new(self.here.now);
+                let host = RefCell::new(&mut *self);
+                let atoms = x11::visibility::VisibilityAtoms {
+                    wm_state: 10,
+                    change_state: 11,
+                    state: 12,
+                    hidden: 13,
+                    above: 14,
+                    below: 15,
+                    desktop: 16,
+                    current_desktop: 17,
+                    supported: 18,
+                    user_time: 19,
+                };
+                atoms.restore_guarded_before_with(
+                    1,
+                    deadline,
+                    dispatched,
+                    || clock.get(),
+                    |request, sent| {
+                        let mut h = host.borrow_mut();
+                        let name = match request {
+                            x11::visibility::VisibilityRequest::UserTime { .. } => "zero",
+                            x11::visibility::VisibilityRequest::Map { .. } => "map",
+                            _ => panic!("Unexpected restoration mutation"),
+                        };
+                        if h.fail_before_cookie != Some(name) {
+                            *sent = true;
+                        }
+                        let result = h.here.step(name);
+                        clock.set(h.here.now);
+                        result
+                    },
+                    Some(|| {
+                        let mut h = host.borrow_mut();
+                        h.here.step("restore_guard")?;
+                        let allowed = recover_visibility_guard(op, &mut **h)?
+                            && op.detail.visibility == Visibility::Minimized;
+                        clock.set(h.here.now);
+                        Ok(allowed)
+                    }),
+                )
+            }
+        }
+        impl BringTopHost for Host {
+            fn qualify_layer(
+                &self,
+                snapshot: &x11::visibility::VisibilitySnapshot,
+                baseline: control::VisibilityBaseline,
+            ) -> Result<ObservedLayer, RemoteLayerIssue> {
+                Self::atoms().qualify_remote(snapshot, baseline)
+            }
+            fn service_above(
+                &mut self,
+                op: &mut ActiveOperation,
+            ) -> Result<(LayerOutcome, Option<RemoteLayerIssue>), HostError> {
+                let baseline = op.show.baseline.unwrap();
+                let mut layers = std::mem::take(&mut self.here.runtime.layers);
+                let host = RefCell::new(&mut *self);
+                let result = service_remote_layer_with(
+                    &mut layers,
+                    op,
+                    |op| {
+                        let mut h = host.borrow_mut();
+                        h.here.step("layer_read")?;
+                        let (evidence, decision) = read_recover_top(op, &mut **h)?;
+                        Ok(match decision {
+                            control::HereDecision::Destination => {
+                                Self::atoms().qualify_remote(&evidence.snapshot, baseline)
+                            }
+                            control::HereDecision::Pending => Err(RemoteLayerIssue::Waiting),
+                            _ => Err(RemoteLayerIssue::WorkspaceChanged),
+                        })
+                    },
+                    || {
+                        host.borrow_mut().here.step("support")?;
+                        Ok(Ok(LayerSupport {
+                            state: true,
+                            above: true,
+                            below: true,
+                        }))
+                    },
+                    |mutation, op, dispatched| {
+                        let mut h = host.borrow_mut();
+                        h.here.step("layer_guard")?;
+                        if !recover_layer_dispatch_eligible(op, &mut **h)? {
+                            return Ok(false);
+                        }
+                        let step = match mutation {
+                            Mutation::Remove(_) => "remove",
+                            _ => "above",
+                        };
+                        if h.fail_before_cookie != Some(step) {
+                            *dispatched = true;
+                        }
+                        h.here.step(match mutation {
+                            Mutation::Remove(_) => "remove",
+                            Mutation::AddAbove => "above",
+                            _ => panic!("Above only"),
+                        })?;
+                        h.mutations.push(mutation);
+                        if h.layer_changes {
+                            h.here.current.layer = match mutation {
+                                Mutation::Remove(_) => L::Normal,
+                                _ => L::Above,
+                            };
+                        }
+                        Ok(true)
+                    },
+                    || host.borrow().here.now,
+                );
+                self.here.runtime.layers = layers;
+                result
+            }
+            fn abort_above(&mut self) {
+                self.here.runtime.layers.abort();
+            }
+            fn layer_deadline(&self) -> Option<Instant> {
+                self.here.runtime.layers.deadline()
+            }
+        }
+
+        fn assert_result(
+            op: &ActiveOperation,
+            result: control::OperationResult,
+            status: Status,
+            relocation: bool,
+            restoration: bool,
+        ) {
+            assert_eq!(
+                op.recover_result(result.detail().reason, result.detail().stage),
+                Ok(result)
+            );
+            assert_eq!(result.status(), status);
+            assert_eq!(
+                result.detail().placement.history,
+                control::RecoveryHistory {
+                    relocation_confirmed: relocation,
+                    restoration_confirmed: restoration,
+                }
+            );
+            assert_eq!(
+                op.request,
+                control::Request {
+                    command: Command::Recover,
+                    request_id: 99,
+                    reply_xid: 9,
+                    epoch: 11
+                }
+            );
+            assert_eq!(op.placement.destination_desktop, 2);
+            if status == Status::Success {
+                assert_eq!(op.recover_phase, RecoverPhase::Top);
+                assert_eq!(result.detail().stage, Stage::Layer);
+                assert!(result.detail().progress.input_ready);
+                assert_eq!(result.detail().visibility, Visibility::NotMinimizedHere);
+            }
+        }
+
+        fn drive(
+            h: &mut Host,
+            op: &mut ActiveOperation,
+        ) -> Result<control::OperationResult, HostError> {
+            for _ in 0..4 {
+                if let Some(result) = service_recover_with(op, h)? {
+                    return Ok(result);
+                }
+                if op.recover_phase == RecoverPhase::Here && h.here.count("desktop") > 0 {
+                    h.here.target();
+                } else if op.recover_phase == RecoverPhase::Top && h.here.count("map") > 0 {
+                    h.restored();
+                }
+            }
+            panic!("scripted WM evidence did not settle");
+        }
+
+        #[test]
+        fn invalid_here_never_enters_top_and_safe_above_noop_has_fresh_top_proof() {
+            let mut h = Host::new(false, false, L::Above);
+            let mut op = h.operation();
+            let result = h.run(&mut op).unwrap();
+            assert_result(&op, result, Status::Success, false, false);
+            h.here.assert_no_mutation();
+            assert!(
+                h.here.count("geometry") >= 3,
+                "Here geometry cannot substitute for Top proof"
+            );
+            assert!(!op.handoff_recover_top(
+                h.here.now,
+                op.detail,
+                control::Confirmation::default()
+            ));
+            assert_eq!(op.recover_phase, RecoverPhase::Top);
+            let mut h = Host::new(false, false, L::Below);
+            h.here.current.transitional = true;
+            let mut op = h.operation();
+            let result = h.run(&mut op).unwrap();
+            assert_result(&op, result, Status::Failed, false, false);
+            assert_eq!(op.recover_phase, RecoverPhase::Here);
+            assert_eq!(h.here.count("map"), 0);
+            assert!(h.mutations.is_empty());
+        }
+
+        #[test]
+        fn history_partitions_survive_layout_failure_without_current_readiness() {
+            for remote in [false, true] {
+                for restored in [false, true] {
+                    let mut h = Host::new(remote, true, L::Below);
+                    let mut op = h.operation();
+                    assert!(h.run(&mut op).is_none());
+                    if remote {
+                        h.here.target();
+                        assert!(h.run(&mut op).is_none());
+                    }
+                    assert_eq!(op.recover_phase, RecoverPhase::Top);
+                    if restored {
+                        h.restored();
+                    }
+                    h.here.layout = Err(DestinationError::Changed);
+                    let result = h.run(&mut op).unwrap();
+                    assert_result(
+                        &op,
+                        result,
+                        if remote || restored {
+                            Status::Partial
+                        } else {
+                            Status::Failed
+                        },
+                        remote,
+                        restored,
+                    );
+                    assert_eq!(result.detail().reason, Reason::LayoutChanged);
+                    assert!(!result.detail().progress.input_ready);
+                    assert_eq!(
+                        result.detail().placement.current,
+                        control::PlacementConfirmation::default()
+                    );
+                    assert!(h.mutations.is_empty());
+                }
+            }
+        }
+
+        #[test]
+        fn every_strict_read_veto_latches_before_any_later_recovery_mutation() {
+            let mut reference = Host::new(true, true, L::Below);
+            let mut op = reference.operation();
+            assert_eq!(
+                drive(&mut reference, &mut op).unwrap().status(),
+                Status::Success
+            );
+            let reads = reference.here.count("layout");
+            assert!(reads > 20);
+            for index in 1..=reads {
+                let mut h = Host::new(true, true, L::Below);
+                h.here
+                    .layouts
+                    .extend(std::iter::repeat_n(Ok(layout()), index - 1));
+                h.here.layouts.push_back(Err(DestinationError::Changed));
+                let mut op = h.operation();
+                let result = drive(&mut h, &mut op).unwrap();
+                assert_ne!(result.status(), Status::Success, "layout read {index}");
+                let invalid = h
+                    .here
+                    .log
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, step)| **step == "layout")
+                    .nth(index - 1)
+                    .unwrap()
+                    .0;
+                for step in &h.here.log[invalid + 1..] {
+                    assert!(
+                        !["desktop", "zero", "map", "correct", "shape", "remove", "above"]
+                            .contains(step),
+                        "mutation {step} after invalid layout read {index}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn top_rejects_each_frozen_identity_component_and_invalid_destination_policy() {
+            for case in 0..12 {
+                let mut h = Host::new(false, true, L::Below);
+                let mut op = h.operation();
+                assert!(h.run(&mut op).is_none());
+                h.restored();
+                let mut changed = layout();
+                match case {
+                    0 => changed.desktop_count += 1,
+                    1 => changed.destination_desktop = 3,
+                    2 => changed.current_desktop = 3,
+                    3 => changed.target_workarea = Some(Rect::new(0, 0, 700, 600)),
+                    4 => changed.viewport = control::DestinationViewport::Absent,
+                    5 => changed.monitor_name += 1,
+                    6 => changed.monitor_bounds.x += 1,
+                    7 => changed.usable_area.width -= 1,
+                    8 => changed.body_size = Size::new(161, 160),
+                    9 => changed.valid_origins = geometry::ValidOriginBounds::new(1, 500, 0, 500),
+                    10 => {}
+                    _ => {}
+                }
+                h.here.layout = match case {
+                    10 => Err(DestinationError::UnsupportedViewport),
+                    11 => Err(DestinationError::Unverifiable(
+                        "invalid count or workarea".into(),
+                    )),
+                    _ => Ok(changed),
+                };
+                let result = h.run(&mut op).unwrap();
+                assert_result(&op, result, Status::Partial, false, true);
+                assert_eq!(
+                    result.detail().reason,
+                    match case {
+                        10 => Reason::Unsupported,
+                        11 => Reason::Unverifiable,
+                        _ => Reason::LayoutChanged,
+                    }
+                );
+                assert_eq!(h.here.count("shape"), 0);
+                assert!(h.mutations.is_empty());
+            }
+        }
+
+        #[test]
+        fn guard_after_user_time_veto_retains_dispatch_and_never_maps() {
+            let mut reference = Host::new(false, true, L::Normal);
+            let mut op = reference.operation();
+            assert!(reference.run(&mut op).is_none());
+            let guard = reference
+                .here
+                .log
+                .iter()
+                .position(|&step| step == "restore_guard")
+                .unwrap();
+            let before = reference.here.log[..guard]
+                .iter()
+                .filter(|&&step| step == "layout")
+                .count();
+            let mut h = Host::new(false, true, L::Normal);
+            h.here
+                .layouts
+                .extend(std::iter::repeat_n(Ok(layout()), before));
+            h.here.layouts.push_back(Err(DestinationError::Changed));
+            let mut op = h.operation();
+            let result = h.run(&mut op).unwrap();
+            assert_result(&op, result, Status::Failed, false, false);
+            assert!(result.detail().progress.host_mutation_dispatched);
+            assert_eq!(h.here.count("zero"), 1);
+            assert_eq!(h.here.count("map"), 0);
+            assert_eq!(h.here.count("restore_guard"), 1);
+        }
+
+        #[test]
+        fn layer_addition_has_its_own_guard_after_successful_below_removal() {
+            let mut reference = Host::new(false, false, L::Below);
+            let mut op = reference.operation();
+            assert_eq!(reference.run(&mut op).unwrap().status(), Status::Success);
+            let addition = reference
+                .here
+                .log
+                .iter()
+                .rposition(|&step| step == "layer_guard")
+                .unwrap();
+            let before = reference.here.log[..addition]
+                .iter()
+                .filter(|&&step| step == "layout")
+                .count();
+            let mut h = Host::new(false, false, L::Below);
+            h.here
+                .layouts
+                .extend(std::iter::repeat_n(Ok(layout()), before));
+            h.here.layouts.push_back(Err(DestinationError::Changed));
+            let mut op = h.operation();
+            let result = h.run(&mut op).unwrap();
+            assert_result(&op, result, Status::Failed, false, false);
+            assert_eq!(h.here.count("remove"), 1);
+            assert_eq!(h.here.count("above"), 0);
+            assert_eq!(result.detail().reason, Reason::LayoutChanged);
+        }
+
+        #[test]
+        fn here_cutoff_is_exact_and_handoff_visibility_budget_uses_actual_time() {
+            for remote in [false, true] {
+                let mut h = Host::new(remote, true, L::Normal);
+                let mut op = h.operation();
+                let start = h.here.now;
+                if remote {
+                    assert!(h.run(&mut op).is_none());
+                    h.here.target();
+                }
+                h.here.now = start + Duration::from_millis(3500);
+                let result = h.run(&mut op).unwrap();
+                assert_result(
+                    &op,
+                    result,
+                    if remote {
+                        Status::Partial
+                    } else {
+                        Status::Failed
+                    },
+                    remote,
+                    false,
+                );
+                assert_eq!(op.recover_phase, RecoverPhase::Here);
+                assert_eq!(h.here.count("zero"), 0);
+            }
+            let mut h = Host::new(true, true, L::Normal);
+            let mut op = h.operation();
+            let start = h.here.now;
+            assert!(h.run(&mut op).is_none());
+            h.here.target();
+            h.here.now = start + Duration::from_millis(3400);
+            assert!(h.run(&mut op).is_none());
+            assert_eq!(
+                op.bring_top.visibility_cutoff,
+                start + Duration::from_millis(5900)
+            );
+            assert_eq!(op.deadline, start + Duration::from_millis(7000));
+            h.restored();
+            h.here.now = op.bring_top.visibility_cutoff;
+            let result = h.run(&mut op).unwrap();
+            assert_result(&op, result, Status::Partial, true, true);
+            assert_eq!(h.here.count("shape"), 0);
+            assert!(h.mutations.is_empty());
+        }
+
+        #[test]
+        fn synchronous_restore_and_guard_reads_cannot_spend_past_visibility_cutoff() {
+            for step in ["zero", "restore_guard"] {
+                let mut h = Host::new(false, true, L::Normal);
+                h.here
+                    .advances
+                    .push_back((step, Duration::from_millis(2500)));
+                let mut op = h.operation();
+                let result = h.run(&mut op).unwrap();
+                assert_result(&op, result, Status::Failed, false, false);
+                assert_eq!(h.here.count("zero"), 1);
+                assert_eq!(h.here.count("map"), 0);
+                assert!(h.mutations.is_empty());
+            }
+        }
+
+        #[test]
+        fn layer_deadline_and_final_read_never_authorize_late_addition() {
+            let mut h = Host::new(false, false, L::Below);
+            h.layer_changes = false;
+            let mut op = h.operation();
+            assert!(h.run(&mut op).is_none());
+            let admitted = op.bring_top.layer_admitted.unwrap();
+            assert_eq!(
+                op.recover_layer_cutoff(),
+                Some(admitted + Duration::from_millis(1000))
+            );
+            assert_eq!(h.here.count("remove"), 1);
+            h.here.current.layer = L::Normal;
+            h.here.now = op.recover_layer_cutoff().unwrap();
+            let result = h.run(&mut op).unwrap();
+            assert_result(&op, result, Status::Failed, false, false);
+            assert_eq!(h.here.count("above"), 0);
+            assert_eq!(h.here.count("remove"), 1);
+        }
+
+        #[test]
+        fn minimized_here_leaves_one_top_correction_with_actual_confirmation() {
+            let mut h = Host::new(false, true, L::Normal);
+            let mut op = h.operation();
+            assert!(h.run(&mut op).is_none());
+            assert!(op.placement.correction().is_none());
+            h.restored();
+            h.here.actual.x = -100;
+            assert!(h.run(&mut op).is_none());
+            let consumed = op.placement.correction().unwrap();
+            assert_eq!(h.here.count("correct"), 1);
+            assert_eq!(h.here.count("shape"), 0);
+            h.here.now = consumed.1;
+            let result = h.run(&mut op).unwrap();
+            assert_result(&op, result, Status::Success, false, true);
+            assert_eq!(op.placement.correction(), Some(consumed));
+            assert_eq!(h.here.count("correct"), 1);
+            assert!(h.here.runtime.input_fence.automatic_correction_blocked);
+        }
+
+        #[test]
+        fn consumed_here_correction_blocks_top_correction_and_cannot_be_replenished() {
+            let mut h = Host::new(false, false, L::Normal);
+            h.here.actual.x = -100;
+            let mut op = h.operation();
+            assert!(h.run(&mut op).is_none());
+            let consumed = op.placement.correction().unwrap();
+            h.here.now = consumed.1;
+            let actual = h.here.actual;
+            h.here
+                .geometries
+                .extend([actual, actual, Rect::new(-100, 100, 160, 160)]);
+            let result = h.run(&mut op).unwrap();
+            assert_result(&op, result, Status::Failed, false, false);
+            assert_eq!(op.recover_phase, RecoverPhase::Top);
+            assert_eq!(op.placement.correction(), Some(consumed));
+            assert_eq!(h.here.count("correct"), 1);
+            assert!(h.here.runtime.input_fence.automatic_correction_blocked);
+            assert!(h.mutations.is_empty());
+        }
+
+        #[test]
+        fn top_correction_needs_full_interval_and_refused_correction_never_retries() {
+            for enough_time in [false, true] {
+                let mut h = Host::new(false, true, L::Normal);
+                let mut op = h.operation();
+                assert!(h.run(&mut op).is_none());
+                h.restored();
+                h.here.actual.x = -100;
+                h.here.refuse_correction = true;
+                if !enough_time {
+                    h.here.now = op.bring_top.visibility_cutoff - Duration::from_millis(149);
+                }
+                let mut result = h.run(&mut op);
+                if enough_time {
+                    assert!(result.is_none());
+                    h.here.now = op.placement.correction().unwrap().1;
+                    result = h.run(&mut op);
+                }
+                assert_result(&op, result.unwrap(), Status::Partial, false, true);
+                assert_eq!(h.here.count("correct"), usize::from(enough_time));
+                assert_eq!(h.here.count("shape"), 0);
+                assert!(h.mutations.is_empty());
+            }
+        }
+
+        #[test]
+        fn strict_drift_at_here_and_top_correction_boundaries_prevents_dispatch() {
+            for top in [false, true] {
+                let mut reference = Host::new(false, top, L::Normal);
+                let mut op = reference.operation();
+                if top {
+                    assert!(reference.run(&mut op).is_none());
+                    reference.restored();
+                }
+                let prior = reference.here.count("layout");
+                reference.here.actual.x = -100;
+                assert!(reference.run(&mut op).is_none());
+                assert_eq!(reference.here.count("correct"), 1);
+                let last = reference.here.count("layout");
+                for index in prior + 1..=last {
+                    let mut h = Host::new(false, top, L::Normal);
+                    let mut op = h.operation();
+                    if top {
+                        assert!(h.run(&mut op).is_none());
+                        h.restored();
+                    }
+                    h.here.actual.x = -100;
+                    h.here
+                        .layouts
+                        .extend(std::iter::repeat_n(Ok(layout()), index - prior - 1));
+                    h.here.layouts.push_back(Err(DestinationError::Changed));
+                    let result = h.run(&mut op).unwrap();
+                    assert_result(
+                        &op,
+                        result,
+                        if top { Status::Partial } else { Status::Failed },
+                        false,
+                        top,
+                    );
+                    assert_eq!(h.here.count("correct"), 0, "Top={top} layout read={index}");
+                    assert_eq!(h.here.count("shape"), 0);
+                    assert!(h.mutations.is_empty());
+                }
+            }
+        }
+
+        #[test]
+        fn minimized_body_size_is_checked_before_any_restoration_mutation() {
+            let mut h = Host::new(false, true, L::Normal);
+            h.here.actual.width = 161;
+            let mut op = h.operation();
+            let result = h.run(&mut op).unwrap();
+            assert_result(&op, result, Status::Failed, false, false);
+            assert_eq!(result.detail().reason, Reason::Unverifiable);
+            assert_eq!(h.here.count("zero"), 0);
+            assert_eq!(h.here.count("map"), 0);
+            assert!(h.mutations.is_empty());
+        }
+
+        #[test]
+        fn wrong_actual_body_size_and_off_workspace_top_cannot_enable_or_raise() {
+            for elsewhere in [false, true] {
+                let mut h = Host::new(false, true, L::Below);
+                let mut op = h.operation();
+                assert!(h.run(&mut op).is_none());
+                h.restored();
+                if elsewhere {
+                    h.here.current.desktop = 3;
+                } else {
+                    h.here.actual.width = 161;
+                }
+                let result = h.run(&mut op).unwrap();
+                assert_result(&op, result, Status::Partial, false, true);
+                assert_eq!(h.here.count("shape"), 0);
+                assert!(h.mutations.is_empty());
+            }
+        }
+
+        #[test]
+        fn fence_pointer_and_popup_obligations_precede_restore_and_input_enable() {
+            let mut h = Host::new(false, true, L::Below);
+            h.here.runtime = visibility_fence_tests::runtime(4);
+            let mut op = h.operation();
+            assert!(h.run(&mut op).is_none());
+            let zero = h.here.log.iter().position(|&step| step == "zero").unwrap();
+            for step in ["empty", "release", "popup"] {
+                assert!(h.here.log.iter().position(|&item| item == step).unwrap() < zero);
+            }
+            assert!(h.here.runtime.visibility_dispatch_eligible());
+            h.restored();
+            assert_eq!(h.run(&mut op).unwrap().status(), Status::Success);
+            assert!(here_runtime_ready(&h.here.runtime, &h.here.window));
+        }
+
+        #[test]
+        fn original_native_errors_survive_each_internal_boundary_without_retry() {
+            let mut reference = Host::new(true, true, L::Below);
+            let mut op = reference.operation();
+            drive(&mut reference, &mut op).unwrap();
+            for step in [
+                "desktop", "zero", "map", "layout", "geometry", "shape", "remove", "above",
+            ] {
+                for before_cookie in [false, true] {
+                    let mut h = Host::new(true, true, L::Below);
+                    h.here.send_before_cookie = before_cookie && step == "desktop";
+                    h.fail_before_cookie = before_cookie.then_some(step);
+                    h.here.faults.push((step, 1));
+                    let mut op = h.operation();
+                    let result = drive(&mut h, &mut op);
+                    assert_eq!(
+                        result.unwrap_err().downcast_ref::<NativeFault>(),
+                        Some(&NativeFault(step, 1))
+                    );
+                    assert_eq!(h.here.count(step), 1);
+                    assert_eq!(
+                        h.here.count("map"),
+                        usize::from(!["desktop", "zero", "layout", "geometry"].contains(&step))
+                    );
+                    assert_eq!(op.request.command, Command::Recover);
+                }
+            }
+        }
+
+        #[test]
+        fn uncertain_correction_is_consumed_and_cleanup_cannot_replace_original_error() {
+            let mut h = Host::new(false, true, L::Normal);
+            let mut op = h.operation();
+            assert!(h.run(&mut op).is_none());
+            h.restored();
+            h.here.actual.x = -100;
+            h.here.faults.push(("correct", 1));
+            let error = service_recover_with(&mut op, &mut h).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<NativeFault>(),
+                Some(&NativeFault("correct", 1))
+            );
+            let consumed = op.placement.correction();
+            assert!(consumed.is_some());
+            h.here.now = consumed.unwrap().1;
+            let result = h.run(&mut op).unwrap();
+            assert_result(&op, result, Status::Partial, false, true);
+            assert_eq!(h.here.count("correct"), 1);
+            assert_eq!(op.placement.correction(), consumed);
+
+            let mut h = Host::new(false, true, L::Normal);
+            let mut op = h.operation();
+            assert!(h.run(&mut op).is_none());
+            h.restored();
+            h.here
+                .faults
+                .extend([("shape", 1), ("empty", 2), ("empty", 3)]);
+            let error = service_recover_with(&mut op, &mut h).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<NativeFault>(),
+                Some(&NativeFault("shape", 1))
+            );
+            assert!(h.here.runtime.input_fence.blocked);
+            assert_eq!(h.here.count("shape"), 1);
+            assert!(h.mutations.is_empty());
+        }
+
+        #[test]
+        fn pointer_release_or_popup_failure_prevents_handoff_and_restore() {
+            for step in ["release", "popup"] {
+                let mut h = Host::new(false, true, L::Below);
+                h.here.runtime = visibility_fence_tests::runtime(4);
+                h.here.faults.push((step, 1));
+                let mut op = h.operation();
+                let error = service_recover_with(&mut op, &mut h).unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<NativeFault>(),
+                    Some(&NativeFault(step, 1))
+                );
+                assert_eq!(op.recover_phase, RecoverPhase::Here);
+                assert_eq!(h.here.count("zero"), 0);
+                assert_eq!(h.here.count("map"), 0);
+                assert!(h.mutations.is_empty());
+            }
+        }
+
+        #[test]
+        fn delayed_geometry_and_layer_support_reads_cannot_authorize_mutation() {
+            let mut h = Host::new(false, true, L::Normal);
+            let mut op = h.operation();
+            assert!(h.run(&mut op).is_none());
+            h.restored();
+            h.here
+                .advances
+                .push_back(("geometry", Duration::from_millis(2500)));
+            let result = h.run(&mut op).unwrap();
+            assert_result(&op, result, Status::Partial, false, true);
+            assert_eq!(h.here.count("shape"), 0);
+            assert!(h.mutations.is_empty());
+
+            let mut h = Host::new(false, false, L::Normal);
+            h.here
+                .advances
+                .push_back(("support", Duration::from_millis(1000)));
+            let mut op = h.operation();
+            let result = h.run(&mut op).unwrap();
+            assert_result(&op, result, Status::Failed, false, false);
+            assert!(h.mutations.is_empty());
+        }
+
+        #[test]
+        fn final_read_can_confirm_already_completed_layer_but_not_checked_transport() {
+            let mut h = Host::new(false, false, L::Normal);
+            h.layer_changes = false;
+            let mut op = h.operation();
+            assert!(h.run(&mut op).is_none());
+            assert_eq!(h.here.count("above"), 1);
+            h.here.current.layer = L::Above;
+            h.here.now = op.recover_layer_cutoff().unwrap();
+            let result = h.run(&mut op).unwrap();
+            assert_result(&op, result, Status::Success, false, false);
+            assert_eq!(h.here.count("above"), 1);
+
+            let mut h = Host::new(false, true, L::Above);
+            let mut op = h.operation();
+            assert!(h.run(&mut op).is_none());
+            assert_eq!(h.here.count("map"), 1);
+            h.here.now = op.bring_top.visibility_cutoff;
+            let result = h.run(&mut op).unwrap();
+            assert_result(&op, result, Status::Failed, false, false);
+            assert_eq!(h.here.count("map"), 1);
+            assert_eq!(h.here.count("shape"), 0);
+        }
+
+        #[test]
+        fn composition_local_remote_visible_minimized_all_layers_retains_one_identity() {
+            for remote in [false, true] {
+                for minimized in [false, true] {
+                    for layer in [L::Normal, L::Above, L::Below] {
+                        let mut h = Host::new(remote, minimized, layer);
+                        let mut op = h.operation();
+                        let deadline = op.deadline;
+                        let initial = h.here.now;
+                        let mut result = h.run(&mut op);
+                        if remote {
+                            assert!(result.is_none());
+                            assert_eq!(op.recover_phase, RecoverPhase::Here);
+                            assert_eq!(h.here.count("map"), 0);
+                            assert!(h.mutations.is_empty());
+                            h.here.target();
+                            result = h.run(&mut op);
+                        }
+                        if minimized {
+                            assert!(result.is_none());
+                            assert_eq!(op.recover_phase, RecoverPhase::Top);
+                            assert_eq!(
+                                h.here.count("map"),
+                                1,
+                                "handoff must immediately start Show"
+                            );
+                            assert!(h.mutations.is_empty());
+                            assert!(!op.placement.proof.history.restoration_confirmed);
+                            h.restored();
+                            result = h.run(&mut op);
+                        }
+                        assert_result(&op, result.unwrap(), Status::Success, remote, minimized);
+                        assert_eq!(op.deadline, deadline);
+                        assert_eq!(
+                            op.bring_top.visibility_cutoff,
+                            initial + Duration::from_millis(2500)
+                        );
+                        assert_eq!(op.placement.layout(), Some(layout()));
+                        assert_eq!(op.placement.baseline.unwrap().layer, layer);
+                        assert_eq!(h.here.count("desktop"), usize::from(remote));
+                        assert_eq!(h.here.count("zero"), usize::from(minimized));
+                        assert_eq!(h.here.count("map"), usize::from(minimized));
+                        assert_eq!(h.here.count("above"), usize::from(layer != L::Above));
+                        assert_eq!(h.here.count("remove"), usize::from(layer == L::Below));
+                        assert_eq!(h.here.count("correct"), 0);
+                        assert!(!h.here.runtime.input_fence.blocked);
+                    }
+                }
+            }
+        }
     }
 }

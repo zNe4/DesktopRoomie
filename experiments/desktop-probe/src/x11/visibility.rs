@@ -271,7 +271,7 @@ fn workspace_relation(body: Evidence<u32>, current: Evidence<u32>) -> Workspace 
 /// Narrow request seam: every callback represents one checked protocol operation.
 /// Its success is only X processing acknowledgement, never a visibility result.
 #[derive(Debug)]
-enum VisibilityRequest {
+pub(crate) enum VisibilityRequest {
     Iconify {
         destination: Window,
         propagate: bool,
@@ -450,24 +450,73 @@ impl VisibilityAtoms {
         )
     }
 
+    /// Recover alone needs a fresh destination guard between the two checked
+    /// requests. The guard grants no extra time or retry authority.
+    pub fn request_restore_guarded_before(
+        &self,
+        conn: &impl Connection,
+        body: Window,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+        guard: impl FnOnce() -> Result<bool, HostError>,
+    ) -> Result<bool, HostError> {
+        self.restore_guarded_before_with(
+            body,
+            deadline,
+            dispatched,
+            std::time::Instant::now,
+            |request, dispatched| checked_request_marked(conn, request, dispatched),
+            Some(guard),
+        )
+    }
+
     fn restore_before_with(
+        &self,
+        body: Window,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+        now: impl FnMut() -> std::time::Instant,
+        checked: impl FnMut(VisibilityRequest, &mut bool) -> Result<(), HostError>,
+    ) -> Result<bool, HostError> {
+        self.restore_guarded_before_with(
+            body,
+            deadline,
+            dispatched,
+            now,
+            checked,
+            None::<fn() -> Result<bool, HostError>>,
+        )
+    }
+
+    pub(crate) fn restore_guarded_before_with(
         &self,
         body: Window,
         deadline: std::time::Instant,
         dispatched: &mut bool,
         mut now: impl FnMut() -> std::time::Instant,
         mut checked: impl FnMut(VisibilityRequest, &mut bool) -> Result<(), HostError>,
+        guard: Option<impl FnOnce() -> Result<bool, HostError>>,
     ) -> Result<bool, HostError> {
         let mut mapped = false;
+        let mut user_time_checked = false;
+        let mut guard = guard;
         self.restore_with(body, |request| {
             if now() >= deadline {
                 return Ok(());
             }
             let is_map = matches!(request, VisibilityRequest::Map { .. });
+            if is_map {
+                if let Some(guard) = guard.take() {
+                    if !user_time_checked || !guard()? || now() >= deadline {
+                        return Ok(());
+                    }
+                }
+            }
             let mut request_dispatched = false;
             let result = checked(request, &mut request_dispatched);
             *dispatched |= request_dispatched;
             mapped |= is_map && request_dispatched;
+            user_time_checked |= !is_map && request_dispatched && result.is_ok();
             result
         })?;
         Ok(mapped)
@@ -816,6 +865,84 @@ mod tests {
         assert!(dispatched);
         assert!(!mapped);
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn guarded_restore_preserves_order_dispatch_errors_veto_and_fixed_deadline() {
+        use std::cell::{Cell, RefCell};
+        use std::time::{Duration, Instant};
+        #[derive(Debug, PartialEq)]
+        struct Fault(&'static str);
+        impl std::fmt::Display for Fault {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Fault {}
+        for case in 0..10 {
+            let start = Instant::now();
+            let deadline = start + Duration::from_millis(2500);
+            let clock = Cell::new(if case == 0 { deadline } else { start });
+            let log = RefCell::new(vec![]);
+            let mut dispatched = false;
+            let result = atoms().restore_guarded_before_with(
+                100,
+                deadline,
+                &mut dispatched,
+                || clock.get(),
+                |request, sent| {
+                    let map = matches!(request, VisibilityRequest::Map { .. });
+                    log.borrow_mut()
+                        .push(if map { "map-send" } else { "zero-send" });
+                    if case == 1 || (case == 8 && map) {
+                        return Err(Box::new(Fault("send")));
+                    }
+                    *sent = true;
+                    log.borrow_mut()
+                        .push(if map { "map-check" } else { "zero-check" });
+                    if case == 2 || (case == 9 && map) {
+                        return Err(Box::new(Fault("check")));
+                    }
+                    if case == 3 {
+                        clock.set(deadline);
+                    }
+                    Ok(())
+                },
+                Some(|| {
+                    log.borrow_mut().push("guard");
+                    if case == 5 {
+                        return Err(Box::new(Fault("guard")) as HostError);
+                    }
+                    if case == 6 {
+                        clock.set(deadline);
+                    }
+                    Ok(case != 4)
+                }),
+            );
+            let expected = match case {
+                0 => vec![],
+                1 => vec!["zero-send"],
+                2 | 3 => vec!["zero-send", "zero-check"],
+                4..=6 => vec!["zero-send", "zero-check", "guard"],
+                8 => vec!["zero-send", "zero-check", "guard", "map-send"],
+                _ => vec!["zero-send", "zero-check", "guard", "map-send", "map-check"],
+            };
+            assert_eq!(*log.borrow(), expected, "case {case}");
+            assert_eq!(dispatched, case >= 2, "case {case}");
+            if matches!(case, 1 | 2 | 5 | 8 | 9) {
+                let expected = match case {
+                    1 | 8 => "send",
+                    5 => "guard",
+                    _ => "check",
+                };
+                assert_eq!(
+                    result.unwrap_err().downcast_ref::<Fault>(),
+                    Some(&Fault(expected))
+                );
+            } else {
+                assert_eq!(result.unwrap(), case == 7);
+            }
+        }
     }
 
     fn atoms() -> VisibilityAtoms {
