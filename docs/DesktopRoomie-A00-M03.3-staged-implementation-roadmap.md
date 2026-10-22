@@ -4,7 +4,7 @@
 **Repository/branch at approval:** `zNe4/DesktopRoomie` / `m03`.  
 **Planning base:** `46adda6a6dc1e25930c9656e7c84d125296c8691` (documentation-only handoff HEAD).  
 **Accepted executable foundation:** M03.2 `a46e432c1f97b03c576737b1fc0ac35d7f90c158`, matching CI 39098551853, 453 tests.  
-**Lifecycle update — 2026-10-21:** Stages A/B/H0/C/D/E are accepted; public Bring Here at D4.1 `4c67da0b09ffe7b69605ac4a415d256acf8abd23` and Recover at E4 `aa00f8e94aff1cf2ef1ff6a6cecf734f822d5603` have separately qualified acceptance. Later Stage F deterministic hardening is COMPLETE at `f3458549dbbdd4b9ef42ed85d3bfaeb6ed683863` ([CI 39688537222](https://github.com/zNe4/DesktopRoomie/actions/runs/39688537222), 760 tests; [closeout](DesktopRoomie-A00-M03.3-stage-F-closeout.md)). **Stage G pending and separately gated.** Original design requirements below remain binding.
+**Lifecycle update — through 2026-10-22:** Stages A/B/H0/C/D/E are accepted; public Bring Here at D4.1 `4c67da0b09ffe7b69605ac4a415d256acf8abd23` and Recover at E4 `aa00f8e94aff1cf2ef1ff6a6cecf734f822d5603` have separately qualified acceptance. Later Stage F deterministic hardening is COMPLETE at `f3458549dbbdd4b9ef42ed85d3bfaeb6ed683863` ([CI 39688537222](https://github.com/zNe4/DesktopRoomie/actions/runs/39688537222), 760 tests; [closeout](DesktopRoomie-A00-M03.3-stage-F-closeout.md)). **Stage G was separately executed and owner-accepted on 2026-10-22; see [Stage G closeout](DesktopRoomie-A00-M03.3-stage-G-acceptance.md).** Original design requirements below remain binding.
 **Historical RF sequencing (2026-10-21):** RF1/RF2a–d closed at RF2d `df5faa6ec17da464e1eeacfbb3c785688f60ea36` ([CI 39673542266](https://github.com/zNe4/DesktopRoomie/actions/runs/39673542266), 737 tests) with qualified [owner-native regressions](DesktopRoomie-A00-RF-modularization-plan.md#rf2d-owner-native-regression-evidence); RF2e/f remain deferred. The subsequent F-P audit and F-T1a/b, F-T2 and F-T3 test checkpoints were separately reviewed and accepted.
 **Historical Stage F-P audit (2026-10-21):** The [read-only 737-test audit](DesktopRoomie-A00-M03.3-stage-F-coverage-audit.md) proposed bounded G1/G2/G3 test-coverage closures without establishing product defects; subsequent checkpoints are now complete and recorded in the [Stage-F closeout](DesktopRoomie-A00-M03.3-stage-F-closeout.md).
 **Stage F current closeout (2026-10-21):** F-T1a (741), F-T1b (747), F-T2 (754), F-T3 (760) tests, all independently reviewed against matching successful CI; +23 tests, zero production changes or new host-native runs. [Formal evidence](DesktopRoomie-A00-M03.3-stage-F-closeout.md).
@@ -251,7 +251,7 @@ Required coverage:
 
 ## 12. Stage G — integrated M03.3 acceptance
 
-**Current status:** pending after completed Stage F deterministic hardening, separately authorized and not accepted by Stage E, RF, or Stage F.
+**Current status — OWNER-APPROVED 2026-10-22:** Stage G integrated native acceptance completed against the frozen F-T3 executable `f3458549dbbdd4b9ef42ed85d3bfaeb6ed683863` on Arch Linux/X11/Openbox/Picom. G0–G4 exercised/accepted with exact source, native CLI/X11 and user-observed evidence; [Stage G closeout](DesktopRoomie-A00-M03.3-stage-G-acceptance.md) documents limitations and signoff. The Stage F deterministic, RF2d and E4 acceptances remain historically separate.
 
 Freeze an exact executable SHA and perform:
 
@@ -307,5 +307,5 @@ Record executable code SHA separately from later documentation-only commits. Pre
 
 ## 16. Immediate next gate
 
-**Stage F deterministic hardening complete and independently reviewed:** F-T1a/b, F-T2 and F-T3 passed matching CI and preserve architecture; latest accepted executable `f3458549dbbdd4b9ef42ed85d3bfaeb6ed683863` has **760 passing tests** and no production changes. The [formal Stage-F closeout](DesktopRoomie-A00-M03.3-stage-F-closeout.md) records exact evidence and native/scheduler limits. Historical E4 Recover acceptance and RF2d native regressions remain distinct. **Next: separately plan/authorize Stage G integrated owner-native M03.3 acceptance on a frozen executable SHA.** This documentation update does not authorize Stage G, M03.4 or A01.
+**Stage G integrated acceptance owner-approved 2026-10-22:** The M03.3 accepted executable remains `f3458549dbbdd4b9ef42ed85d3bfaeb6ed683863` ([CI 39688537222](https://github.com/zNe4/DesktopRoomie/actions/runs/39688537222), 760 passing tests); Stage G started at clean documentation-only `ceedb0aec261531279a76f6dbf93950ac8837a20` with unchanged source. [Formal Stage G acceptance](DesktopRoomie-A00-M03.3-stage-G-acceptance.md) records G0–G4 host results, explicit owner signoff and limits. Stage F deterministic and E4/RF acceptance remain distinct. **M03.3 is closed; next is separately plan/authorize M03.4 integrated A00 closure.** No M03.4/A01 implementation, merge or host-change authorization is conferred.
 
