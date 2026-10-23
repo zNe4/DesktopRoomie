@@ -252,30 +252,33 @@ pub enum MenuHit {
 }
 
 /// The single-pixel outer border and separator are intentionally inert.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MenuLayout {
     pub size: Size,
-    pub rows: [Rect; 2],
+    pub rows: Vec<Rect>,
 }
 
 impl MenuLayout {
-    pub fn new(width: u32, row_height: u32) -> Result<Self, PlacementError> {
-        if width < 3 || row_height < 3 {
+    pub fn new(width: u32, row_height: u32, row_count: usize) -> Result<Self, PlacementError> {
+        if width < 3 || row_height < 3 || row_count == 0 {
             return Err(PlacementError::EmptyUsableArea);
         }
-        let height = row_height
-            .checked_mul(2)
-            .and_then(|h| h.checked_add(3))
+        let count = u32::try_from(row_count).map_err(|_| PlacementError::CoordinateOverflow)?;
+        let stride = row_height
+            .checked_add(1)
+            .ok_or(PlacementError::CoordinateOverflow)?;
+        let height = stride
+            .checked_mul(count)
+            .and_then(|h| h.checked_add(1))
             .ok_or(PlacementError::CoordinateOverflow)?;
         // Drawing coordinates as well as window dimensions must be representable.
         i16::try_from(width).map_err(|_| PlacementError::CoordinateOverflow)?;
         i16::try_from(height).map_err(|_| PlacementError::CoordinateOverflow)?;
         Ok(Self {
             size: Size::new(width, height),
-            rows: [
-                Rect::new(1, 1, width - 2, row_height),
-                Rect::new(1, (row_height + 2) as i32, width - 2, row_height),
-            ],
+            rows: (0..count)
+                .map(|row| Rect::new(1, (1 + stride * row) as i32, width - 2, row_height))
+                .collect(),
         })
     }
 
@@ -299,6 +302,37 @@ impl MenuLayout {
 #[cfg(test)]
 mod menu_tests {
     use super::*;
+
+    #[test]
+    fn five_rows_fit_at_every_corner_or_refuse_without_invalid_geometry() {
+        let layout = MenuLayout::new(120, 28, 5).unwrap();
+        assert_eq!(layout.size, Size::new(120, 146));
+        let area = Rect::new(-200, 48, 160, 160);
+        for anchor in [
+            Point::new(-200, 48),
+            Point::new(-40, 48),
+            Point::new(-200, 208),
+            Point::new(-40, 208),
+        ] {
+            let rect = place_menu(area, layout.size, anchor, 4).unwrap();
+            assert!(rect.x >= area.x && rect.y >= area.y);
+            assert!(rect.right().unwrap() <= area.right().unwrap());
+            assert!(rect.bottom().unwrap() <= area.bottom().unwrap());
+        }
+        for area in [Rect::new(0, 0, 119, 200), Rect::new(0, 0, 200, 145)] {
+            assert!(place_menu(area, layout.size, Point::new(0, 0), 4).is_err());
+        }
+        for count in [0, usize::MAX] {
+            assert!(MenuLayout::new(120, 28, count).is_err());
+        }
+        for (index, row) in layout.rows.iter().enumerate() {
+            assert_eq!(layout.hit(Point::new(row.x, row.y)), MenuHit::Row(index));
+            assert_eq!(
+                layout.hit(Point::new(row.x, row.y + row.height as i32)),
+                MenuHit::Background
+            );
+        }
+    }
 
     #[test]
     fn center_edges_and_four_corners_flip_independently() {
@@ -371,12 +405,12 @@ mod menu_tests {
             4
         )
         .is_err());
-        assert!(MenuLayout::new(120, u32::MAX).is_err());
+        assert!(MenuLayout::new(120, u32::MAX, 2).is_err());
     }
 
     #[test]
     fn rows_border_separator_and_exclusive_outer_edges() {
-        let layout = MenuLayout::new(120, 28).unwrap();
+        let layout = MenuLayout::new(120, 28, 2).unwrap();
         for (point, hit) in [
             ((1, 1), MenuHit::Row(0)),
             ((118, 28), MenuHit::Row(0)),

@@ -10,7 +10,6 @@ use crate::geometry::{place_menu, MenuHit, MenuLayout, Point, Rect};
 use crate::interaction::{InteractionState, MenuGesture, MenuItem};
 
 type HostError = Box<dyn std::error::Error>;
-const LABELS: [&[u8]; 2] = [b"Dismiss", b"Quit"];
 
 /// Input belongs to this popup only after its explicit acquisition request.
 #[derive(Debug, Clone, Copy)]
@@ -62,7 +61,8 @@ impl MenuPopup {
         let measured = (|| -> Result<_, HostError> {
             let metrics = conn.query_font(font)?.reply()?;
             let mut width = 0;
-            for label in LABELS {
+            for item in MenuItem::ALL {
+                let label = item.label();
                 let chars: Vec<_> = label
                     .iter()
                     .map(|byte| Char2b {
@@ -89,6 +89,7 @@ impl MenuPopup {
                     .checked_add(12)
                     .ok_or("Font height overflow")?
                     .max(28),
+                MenuItem::ALL.len(),
             );
             Ok((layout, metrics.font_ascent, metrics.font_descent))
         })();
@@ -294,13 +295,9 @@ impl MenuPopup {
             Rect::new(0, 0, self.rect.width, self.rect.height),
             self.black,
         )?;
-        for (index, label) in LABELS.iter().enumerate() {
+        for (index, item) in MenuItem::ALL.iter().copied().enumerate() {
+            let label = item.label();
             let row = self.layout.rows[index];
-            let item = if index == 0 {
-                MenuItem::Dismiss
-            } else {
-                MenuItem::Quit
-            };
             let highlighted = hover == Some(item);
             let (background, foreground) = if highlighted {
                 (self.black, self.white)
@@ -386,7 +383,7 @@ impl MenuPopup {
 
     #[cfg(test)]
     pub fn test_popup(window: Window, generation: u64) -> Self {
-        let layout = MenuLayout::new(120, 28).unwrap();
+        let layout = MenuLayout::new(120, 28, MenuItem::ALL.len()).unwrap();
         Self {
             window,
             window_resource: OwnedResource::default(),
@@ -414,6 +411,20 @@ impl MenuPopup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_render_labels_and_root_hits_correspond_for_all_five_rows() {
+        let popup = MenuPopup::test_popup(10, 1);
+        let expected: [&[u8]; 5] = [b"Above", b"Normal", b"Below", b"Dismiss", b"Quit"];
+        for (index, item) in MenuItem::ALL.iter().copied().enumerate() {
+            assert_eq!(item.label(), expected[index]);
+            let row = popup.layout.rows[index];
+            let hit = popup.hit(Point::new(popup.rect.x + row.x, popup.rect.y + row.y), true);
+            assert_eq!(hit, MenuHit::Row(index));
+            assert_eq!(MenuItem::from_hit(hit), Some(item));
+        }
+        assert_eq!(MenuItem::from_hit(MenuHit::Row(5)), None);
+    }
     use std::cell::RefCell;
 
     #[test]

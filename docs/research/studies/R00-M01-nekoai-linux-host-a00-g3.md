@@ -5,6 +5,8 @@
 **Roadmap gate:** A00-G3 — prove placement and select the host  
 **DesktopRoomie baseline:** native Rust + x11rb managed X11 probe, with A00-M02 accepted on Openbox/X11/Picom
 
+> Later approved design clarification (2026-10-09): the generic `--recover` behavior suggested in this completed study is **not** the M03.2 contract. The client separated M03.2 Bring Top (same workspace), M03.3 Bring Here (current workspace), and combined recovery as a composition in M03.3. Refer to [the active M03 mission design](../../DesktopRoomie-A00-M03-placement-recovery-host-selection.md#5-m032--preliminary-design-boundary-not-yet-implementation-authority). The historical findings below are preserved.
+
 ## Decision we are about to make
 
 A00-G3 must establish whether the current native X11 host can support the remaining presentation/recovery requirements without a framework change:

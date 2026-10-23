@@ -1,8 +1,13 @@
+pub mod control;
+pub mod desktop;
+pub(super) mod events;
 pub mod menu;
 pub mod monitors;
 pub mod pointer;
 pub mod render;
 pub mod resource;
 pub mod shape;
+pub mod state;
+pub mod visibility;
 pub mod visual;
 pub mod window;

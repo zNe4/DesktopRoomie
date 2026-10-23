@@ -55,6 +55,9 @@ pub enum CaptureOwner {
 #[derive(Debug, Default)]
 pub struct PointerCaptureTracker {
     owner: Option<CaptureOwner>,
+    // Same release owner, with an additional obligation for automatic/queued capture
+    // not represented by a logical gesture. Only a checked native release settles it.
+    transition_release_debt: bool,
 }
 
 impl PointerCaptureTracker {
@@ -65,11 +68,15 @@ impl PointerCaptureTracker {
         self.owner
     }
     pub fn is_grabbed(&self) -> bool {
-        self.owner.is_some()
+        self.owner.is_some() || self.transition_release_debt
+    }
+
+    pub fn require_transition_release(&mut self) {
+        self.transition_release_debt = true;
     }
 
     pub fn track_automatic_right(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.owner.is_some() {
+        if self.is_grabbed() {
             return Err("Pointer already has an owner".into());
         }
         self.owner = Some(CaptureOwner::OpeningRight);
@@ -92,7 +99,7 @@ impl PointerCaptureTracker {
         owner: CaptureOwner,
         acquire: impl FnOnce() -> Result<(GrabStatus, u64), Box<dyn std::error::Error>>,
     ) -> Result<(GrabStatus, u64), Box<dyn std::error::Error>> {
-        if self.owner.is_some() {
+        if self.is_grabbed() {
             return Err("Pointer already has an owner".into());
         }
         self.owner = Some(owner);
@@ -113,16 +120,28 @@ impl PointerCaptureTracker {
         conn: &impl Connection,
         time: u32,
     ) -> Result<bool, Box<dyn std::error::Error>> {
+        // An older gesture timestamp can make UngrabPointer a successful no-op.
+        // Transition debt must also be settled by ordinary shutdown cleanup.
+        let time = self.release_time(time);
         self.release_with(|| ungrab_pointer(conn, time))
+    }
+
+    fn release_time(&self, gesture_time: u32) -> u32 {
+        if self.transition_release_debt {
+            x11rb::CURRENT_TIME
+        } else {
+            gesture_time
+        }
     }
 
     pub fn release_with(
         &mut self,
         release: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        if self.owner.is_some() {
+        if self.is_grabbed() {
             release()?;
             self.owner = None;
+            self.transition_release_debt = false;
             Ok(true)
         } else {
             Ok(false)
@@ -145,6 +164,50 @@ pub fn button_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transition_debt_covers_untracked_automatic_grabs_and_survives_repeated_failure() {
+        for owner in [
+            None,
+            Some(CaptureOwner::BodyLeft),
+            Some(CaptureOwner::OpeningRight),
+            Some(CaptureOwner::Menu {
+                window: 10,
+                generation: 2,
+            }),
+        ] {
+            let mut tracker = PointerCaptureTracker {
+                owner,
+                transition_release_debt: false,
+            };
+            tracker.require_transition_release();
+            assert_eq!(tracker.release_time(123), x11rb::CURRENT_TIME);
+            for _ in 0..2 {
+                assert!(tracker
+                    .release_with(|| Err("checked ungrab failed".into()))
+                    .is_err());
+                assert!(tracker.is_grabbed());
+                assert_eq!(tracker.owner(), owner);
+                assert!(tracker.track_automatic_right().is_err());
+                assert!(tracker
+                    .acquire_with(CaptureOwner::BodyLeft, || panic!("debt blocks acquisition"))
+                    .is_err());
+            }
+            assert!(tracker.release_with(|| Ok(())).unwrap());
+            assert!(!tracker.is_grabbed());
+            assert_eq!(tracker.release_time(123), 123);
+            assert_eq!(tracker.owner(), None);
+            assert!(!tracker.release_with(|| panic!("already settled")).unwrap());
+        }
+    }
+    #[test]
+    fn logical_automatic_completion_cannot_clear_transition_release_debt() {
+        let mut tracker = PointerCaptureTracker::new();
+        tracker.track_automatic_right().unwrap();
+        tracker.require_transition_release();
+        tracker.automatic_right_finished().unwrap();
+        assert!(tracker.is_grabbed());
+        assert!(tracker.release_with(|| Ok(())).unwrap());
+    }
     #[test]
     fn failed_release_retains_obligation_and_confirmed_retry_is_idempotent() {
         let mut tracker = PointerCaptureTracker::new();

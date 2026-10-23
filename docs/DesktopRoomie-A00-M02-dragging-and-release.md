@@ -1,5 +1,7 @@
 # DesktopRoomie — A00-M02: Dragging, release, and pointer recovery
 
+> Lifecycle note (2026-10-08): ready-to-implement wording below describes the original brief, not current progress. Integrated M02 was subsequently accepted; see [M02 acceptance](../experiments/desktop-probe/ACCEPTANCE-M02.md) and [current checkpoint](STATUS.md). The original contract is preserved.
+
 Version 0.1 · 2026-10-06 · Detailed implementation roadmap
 
 **Status:** ready to implement; none of M02 is claimed implemented or tested by this document.

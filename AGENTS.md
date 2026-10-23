@@ -12,15 +12,31 @@ The project uses a supervised multi-agent workflow:
 
 - **ChatGPT, in a separate authoritative session:** external research and literature reviews; comparison of open-source implementations, technical approaches, and dependencies; research reports and architectural recommendations; research prerequisites, roadmaps, and high-level design decisions; bounded implementation specifications and Codex mission prompts; model and reasoning-effort selection per mission; independent review of completed work.
 - **Codex:** inspect existing code and interfaces, implement assigned missions, maintain meaningful tests, debug failures, perform applicable build/format/lint/test checks, update technical documentation required by the mission, and report risks and ambiguities.
-- **Human owner:** supervise, approve decisions and scope changes, perform manual desktop acceptance, and authorize commits and pushes. The owner is Codex's intermediary with the authoritative ChatGPT session.
+- **Human owner:** supervise, approve decisions and scope changes, perform manual desktop acceptance, and authorize mission-scoped Git publication where appropriate. The owner is Codex's intermediary with the authoritative ChatGPT session.
 
 Work on one assigned mission at a time. Read its specification and inspect existing code and Git status before editing. Respect explicit scope boundaries, preserve local changes and already verified behavior, and prefer small, auditable changes. Do not implement future roadmap features opportunistically or perform unrelated refactoring. Report ambiguities before consequential decisions. Alternatives may be proposed, but consequential architectural changes require approval.
 
-Do not commit, push, create branches, or discard changes without explicit authorization. Suggested commits or branch workflows in older documents are not authorization. Do not automatically advance to the next mission.
+### Mission-scoped Git authority
+
+By default, do not create branches, commit, push, merge, discard changes, or advance missions without explicit authorization. Older documents and example workflows are not standing authorization.
+
+The owner may authorize publication in a **specific assignment** that names the target mission branch (such as `m03`), expected starting branch/base SHA, and permission to commit/push. In that case, and only for that assignment, Codex may create/switch to the named branch when instructed, commit only verified mission-scoped work, and push that branch to `origin` with an ordinary non-force push.
+
+Codex may not push directly to `main`, merge, force-push, rewrite published history, delete branches, create releases/tags, or include unrelated local/owner changes. Inspect status, HEAD, diff, and intended paths before the commit; preserve existing work. On branch/base mismatch, divergence, unexpected remote movement, unrelated dirty owner changes, or a normal push rejection, stop and report; do not automatically merge, rebase, force, discard, or reconcile. Never treat a successful push or CI run as owner acceptance.
+
+Report the authorized branch, base SHA, new commit/pushed SHA, checks performed, push result, pending CI/manual acceptance, and final Git status. ChatGPT independently reviews the exact published diff and CI; the owner controls acceptance and merges. Follow the detailed process in [docs/WORKFLOW.md](docs/WORKFLOW.md).
 
 ## Documentation and authority
 
 The current mission specification and explicitly approved decisions determine implementation scope. Planning documents provide context; their proposals and historical status labels are not proof of current implementation or acceptance. Inspect code and verification evidence.
+
+**Cold-start reading order:** this file → [current checkpoint](docs/STATUS.md) → [implemented architecture](docs/ARCHITECTURE.md) → [accepted invariants](docs/INVARIANTS.md) → the assigned approved mission specification. Use [docs/INDEX.md](docs/INDEX.md) for relevant deeper contracts, evidence, historical explanation, plans, and research; do not load all history by default.
+
+STATUS is a checkpoint, not execution authority. ARCHITECTURE describes implemented source ownership. INVARIANTS are accepted review obligations. Acceptance records distinguish tested executable code from later documentation-only HEADs. The accepted D00-M01 contract established this context layer.
+
+**Current checkpoint (2026-10-23): A00 technical acceptance OWNER-APPROVED; M03.4 closeout decision recorded.** The [integrated acceptance](docs/DesktopRoomie-A00-M03.4-integrated-acceptance.md) and [owner-ratified host ADR](docs/DesktopRoomie-A00-M03.4-host-architecture-decision.md) select the existing Rust/x11rb managed X11 host on Archcraft/Openbox 3.6.1/Picom v13. Frozen accepted F-T3 executable `f3458549dbbdd4b9ef42ed85d3bfaeb6ed683863`, [CI 39688537222](https://github.com/zNe4/DesktopRoomie/actions/runs/39688537222), **760 tests**, is unchanged. The owner accepted the explicitly untested display-scaling qualification and all disclosed native-host/deterministic limits without additional host tests; this is not arbitrary-scaling, mixed-DPI, other-WM or Wayland validation. A00 proves the technical host, not the complete companion. ChatGPT approved the C2 documents for their reviewed scope. A00-M03.4-C3 documentation changes were independently reviewed and approved by ChatGPT on 2026-10-23. C4 documentation was published as [`ba85fdb…`](https://github.com/zNe4/DesktopRoomie/commit/ba85fdb110190c21c581b48f462319e7e360c6d3); [matching CI 40012131509](https://github.com/zNe4/DesktopRoomie/actions/runs/40012131509) succeeded with 760 passed, 0 failed, and formatting/build/Clippy PASS. That CI applies to C4; it does not verify later documentation changes.
+
+The [Stage G closeout](docs/DesktopRoomie-A00-M03.3-stage-G-acceptance.md), [Stage F closeout](docs/DesktopRoomie-A00-M03.3-stage-F-closeout.md), [Stage-E feature acceptance](experiments/desktop-probe/M03.3-E-ACCEPTANCE.md) and [RF architectural closeout](docs/DesktopRoomie-A00-RF-modularization-plan.md#current-closeout-2026-10-21) retain their separate evidence identities; RF2e/f remain deferred. [STATUS](docs/STATUS.md) and [ARCHITECTURE](docs/ARCHITECTURE.md) contain the current checkpoint and unchanged source owners. **A01 is the next adventure and requires separate owner authorization**, including its monitor/workspace and presentation/behavior decisions; this pointer grants none.
 
 Relevant implementation references:
 

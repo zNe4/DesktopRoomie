@@ -1,6 +1,10 @@
 # DesktopRoomie — A00-M03: Placement, Recovery and Host Selection
 
-Status: architecture/design contract approved for **M03.1 read-only Codex planning**. No M03 implementation or real-host acceptance is claimed.
+**Lifecycle update — 2026-10-21:** M03.3 Stages A/B/H0/C/D and E1–E4 are accepted. Public `--recover` is implemented and owner-tested on Openbox/X11 at frozen E4 `aa00f8e94aff1cf2ef1ff6a6cecf734f822d5603`, [CI 39529051360](https://github.com/zNe4/DesktopRoomie/actions/runs/39529051360), **737 tests**, with [qualified Stage-E native evidence](../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md). Documentation HEADs are distinct from that executable. **Next: separately authorized Stage F, then Stage G**; M03.4 and other-WM/Wayland acceptance remain separate. See [STATUS](STATUS.md). The dated 2026-10-09/13/18 design and checkpoint statements below are preserved history, not current implementation status or authorization.
+
+**Historical mission checkpoint, 2026-10-18:** M03.1 and M03.2 are accepted on the target Openbox/X11/Picom host. M03.2 received explicit owner H-A sign-off after H-D publication; accepted executable `a46e432c1f97b03c576737b1fc0ac35d7f90c158` (453-test CI), with H14 unobserved, H23 conditional/not exercised and H28 optional/not exercised. The dated 2026-10-13 statement below is historical. **Next: M03.3 read-only design** of Bring Here and composed Recover; no Rust change or Openbox config edit is authorized.
+
+Status (recorded 2026-10-13): **M03.1 and M03.2 stages A–G accepted** on the target Openbox/X11/Picom host. The client-approved recovery separation was clarified 2026-10-09. The full [M03.2 read-only implementation design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md) subsequently passed independent review; the approved [A–H staged roadmap](DesktopRoomie-A00-M03.2-staged-implementation-roadmap.md) remains the stage contract. Latest accepted executable: `80d7df4aa1524122bd7c232f5aa09a4e39c8dd9f` (owner-tested G3), following accepted Stage-F revision `ccd01915bef13850067391f70f1524362a6440dc` and substantive visibility correction `5ed75d7124c10bde0a72a1bc14b4075c09633922` and a help-only final correction. Historical candidate `2424c8887d83d1e503caba326cd512d036639c3e` failed H15 after source/CI review and initial local checks; that failure remains preserved. [STATUS](STATUS.md) and [Stage-F acceptance](host/OPENBOX.md#stage-f-acceptance-recorded-2026-10-13) distinguish exact revisions, independent review/CI and owner native evidence. The owner-approved [Stage-G plan](DesktopRoomie-A00-M03.2-stage-G-approved-plan.md) was implemented through independently reviewed G1/G2/G3 and [accepted on Openbox](host/OPENBOX.md#stage-g-acceptance-recorded-2026-10-13); Bring Top is supported on the body's existing workspace. H is **unblocked but not started**; no final M03.2 acceptance exists. M03.3 remains design-only.
 Prepared against main revision 614dfb22b944e5f9ec0d30a1dcfcf15e3ca41223 (2026-10-08).
 Owner authority: owner runs target-host acceptance and authorizes implementation, commits, pushes and merges. Codex may not silently advance.
 Roadmap mapping: A00-G3.1 (layers, fullscreen, hide/recovery); A00-G3.2 (workspaces); A00-G3.3 (final host decision).
@@ -29,8 +33,8 @@ A00-M03 retains native Rust + x11rb + a managed X11 body unless real-host eviden
 | Mission | Scope and run state | Gate |
 | --- | --- | --- |
 | M03.1 | Above / Normal / Below state and fullscreen experiment; body remains directly controllable through its existing mouse menu. | Approved read-only plan, bounded implementation, deterministic tests and owner layer/fullscreen checks. |
-| M03.2 | Managed hide/show and independent same-instance recovery/control channel. | No orphan grab, hidden/covered recovery, no focus theft, duplicate and stale process handling. |
-| M03.3 | Same-instance workspace placement and destination workarea reconciliation; recover to current desktop. | Valid bounded placement, no change of _NET_CURRENT_DESKTOP, tested invalid/racy destinations. |
+| M03.2 | Managed hide/show and independent same-instance control; explicit **Bring Top** within the body's existing workspace. | No orphan grab, safe hidden/covered control, no focus theft, duplicate/stale instance handling and verified Above/visible outcome within that workspace. |
+| M03.3 | Same-instance workspace placement and destination workarea reconciliation; explicit **Bring Here** plus combined recovery composed from Bring Here and Bring Top. | Valid bounded placement, no change of _NET_CURRENT_DESKTOP, preserved layer for Bring Here, tested invalid/racy destinations and partial composite outcomes. |
 | M03.4 | Integrated A00 acceptance and native-host architecture decision record. | Source/diff and CI review plus owner real-host acceptance and a documented capabilities matrix. |
 
 Do not implement a later mission in an earlier checkpoint. In particular, M03.1 has no independent second-invocation CLI; it can extend the already-tested short-lived mouse menu as the direct operator control.
@@ -107,17 +111,40 @@ Stop for ChatGPT/owner architecture review if Openbox cannot safely provide basi
 
 ## 5. M03.2 — preliminary design boundary (not yet implementation authority)
 
-Introduce managed iconification through WM_CHANGE_STATE / IconicState, followed by MapWindow restoration and actual-state confirmation. Cancel any gesture/popup and release ownership before hiding; never set _NET_WM_STATE_HIDDEN manually or withdraw the managed body as the default. Consider SKIP_TASKBAR / SKIP_PAGER only after real target-host observation.
+**Design approval update (2026-10-09):** [The full revised M03.2 read-only plan](DesktopRoomie-A00-M03.2-approved-implementation-plan.md) is approved as the detailed technical baseline. The preliminary constraints below remain valid context, but further ad-hoc replanning is not required before choosing staged implementation boundaries. No executable changes are authorized by design approval alone.
 
-Keep a dedicated never-mapped X11 control window, potentially InputOnly, independent of body visibility. Establish per-display/screen single-instance discovery with a private selection such as _DESKTOPROOMIE_INSTANCE_S0. A second invocation can query its owner and send a direct private ClientMessage; define message authorization/trust bounds, request IDs/acknowledgment, finite response deadlines, ownership races, dead-client handling, and duplicate-launch semantics during the M03.2 plan.
+**Approved client semantics (2026-10-09): recovery has independent, composable operations.** M03.2 owns visibility, an independently addressable control channel and **Bring Top on the body's existing workspace**. M03.3 alone owns explicit placement on the user's current workspace (**Bring Here**) and their eventual combination. Do not smuggle workspace movement into M03.2 under a generic Recover name.
 
-Candidate commands: --show, --hide, --recover, --layer [above|normal|below]. Show means restore visibility without an unrequested desktop or layer change; Recover is an explicitly stronger user action that may move body to current desktop, clamp position and choose Above, still without activation. A CLI send reply is not proof of confirmed state; record explicit confirmation/failure.
+Introduce managed minimization and actual-state confirmation. Under the owner-approved 2026-10-10 Openbox amendment, current/all-desktop Hide retains checked `WM_CHANGE_STATE` / `IconicState`, and local Show retains checked user-time-zero + `MapWindow`. Off-workspace Hide requires checked root-directed EWMH ADD-HIDDEN; genuinely minimized off-workspace Show requires REMOVE-HIDDEN and no MapWindow. These are WM-directed ClientMessages, never direct `_NET_WM_STATE` property writes. Cancel any gesture/popup and release ownership before hiding; never withdraw the managed body as the default. Fresh coherent observations prove success. The [host guide](host/OPENBOX.md#openbox-off-workspace-visibility-amendment-2026-10-10) records the failed executable H15, root cause and separate manual experiments; this split is verified only for Openbox, not all WMs. No deadlines, retries or reset policy change. Consider `SKIP_TASKBAR` / `SKIP_PAGER` only after real target-host observation.
 
-M03.2 must have its own detailed plan review, deterministic failure tests, manual acceptance and stop gate before coding.
+Keep a dedicated never-mapped X11 control window, potentially `InputOnly`, independent of body visibility. Establish per-display/screen single-instance discovery with a private selection such as `_DESKTOPROOMIE_INSTANCE_S0`. A second invocation can query its owner and send a direct private `ClientMessage`; the read-only plan must resolve versioned request/reply framing, request IDs, acknowledgment versus observed final outcome, deadlines, ownership races, stale/dead clients, duplicate-launch behavior and same-X-session trust limitations. Private X11 discovery is not a security boundary against another X11 client.
 
-## 6. M03.3 — preliminary design boundary (not yet implementation authority)
+**Candidate commands and contracts (spellings not yet fixed):**
 
-Move **the same instance** using the window's _NET_WM_DESKTOP, never the user's _NET_CURRENT_DESKTOP. Validate target index against _NET_NUMBER_OF_DESKTOPS, read that target's _NET_WORKAREA rectangle, intersect with selected monitor and checked body fit, and reconcile body position before allowing input. Observe effective destination desktop and resulting geometry; reject unsupported/stale destinations, changed desktop count, invalid workarea, or WM refusal with diagnostics. Design owner tests covering two real workspaces, no focus theft or switch, no duplicate, target-workarea bounds, recovery to current desktop, and workspace-count change via deterministic injection when live reproduction is unsafe.
+| Command | M03.2 behavior |
+| --- | --- |
+| `--hide` | Safely iconify the managed body; leave the same process and independent control channel available. |
+| `--show` | Restore a hidden/iconified body; do not implicitly change workspace or chosen presentation layer. |
+| `--bring-top` | Restore visibility if necessary and request/confirm **Above** using the existing M03.1 controller; do not move the body to the caller's current workspace or activate it. |
+| `--layer above\|normal\|below` | Optional remote access to the existing absolute layer operation, if narrowly justified in the plan; never reimplement the layer state machine. |
+
+If `--bring-top` acts on a body on another workspace, it must not report that the body is visible **to the caller on the current workspace**. Distinguish success on the body's workspace from not being present here. Do not automatically change `_NET_CURRENT_DESKTOP` or `_NET_WM_DESKTOP`. Commands received from a second invocation must settle to a truthful confirmed/failure outcome; successful transport alone is not completion.
+
+The read-only plan must also resolve iconification/restore ordering relative to pending layers, drag, popup, geometry correction, lifecycle events and shutdown without a focus steal or orphan grab. M03.2 must have its own detailed plan review, deterministic failure tests, manual acceptance and stop gate before coding.
+
+## 6. M03.3 — approved P0 architecture and staged roadmap
+
+**P0 approval update — 2026-10-18:** the owner approved the detailed Bring Here/Recover architecture after independent ChatGPT research and review. The frozen decisions are recorded in [the M03.3 staged implementation roadmap](DesktopRoomie-A00-M03.3-staged-implementation-roadmap.md), including caller-frozen destination semantics, preserved genuine minimization, sticky-window rejection, strict destination workarea validation, one-shot retained-monitor correction, Bring Here → Bring Top Recover ordering, verified-progress Partial semantics, private protocol v2, bounded deadlines and required owner-native Openbox evidence. This approval defines implementation boundaries but does not by itself authorize code changes. **Next separately authorized gate: M03.3 Stage A.**
+
+**Bring Here** moves **the same instance** to the caller-frozen current workspace while preserving its existing Above/Normal/Below policy. Request `_NET_WM_DESKTOP` on the body, never change `_NET_CURRENT_DESKTOP` to transport the user. Validate the target index against `_NET_NUMBER_OF_DESKTOPS`, read that target's `_NET_WORKAREA` rectangle, intersect with the selected monitor and checked body fit, and reconcile body position before enabling input. Observe the effective destination desktop and resulting geometry; reject unsupported/stale destinations, changed desktop count, invalid workarea or WM refusal. **Approved P0 behavior:** genuine minimization is preserved; a minimized Bring Here may succeed with placement/input explicitly deferred when trustworthy minimized-body geometry is unavailable, and must never become visible merely because its workspace changed.
+
+**Combined Recover** is an explicit **composition** of Bring Here and Bring Top, not a third recovery mechanism. Reuse the same-instance control channel and existing layer controller. Define execution order, confirmation and the honest **partial-success** result if one operation succeeds and the other fails. Candidate user commands are `--bring-here` and `--recover`; final syntax remains design-gated. M03.3 owner checks cover two real workspaces, no focus theft or user-workspace switch, no duplicate, preserved layer on Bring Here, destination workarea bounds, explicit combined recovery and partial failure/injected races.
+
+### Native host integration, not a duplicate window-manager service
+
+**Approved policy (2026-10-09): prefer reliable host facilities over reimplementing them.** DesktopRoomie owns correctness-critical lifecycle/state, second-instance request handling and truthful result reporting; the desktop environment may own optional keyboard shortcuts, launchers, menus and autostart. Do not implement global key capture, a custom shortcut daemon, a tray manager or silent edits to a user's dotfiles just to make A00 recovery convenient. Command-line control must work independently of any optional shortcut setup.
+
+The target-specific guide is [Openbox host integration](host/OPENBOX.md). It distinguishes required configuration from optional conveniences and describes user-controlled edits under `~/.config/openbox/`. No user configuration is changed by this documentation decision. Hide and local/off-workspace Show were accepted at `ccd0191…`; Bring Top is now accepted at `80d7df4…`, preserving body/current desktop positions and focus. Optional shortcuts stay user-managed, and other recovery conveniences await separately authorized implementation and acceptance. Other hosts can have separate integration guides later.
 
 ## 7. M03.4 — integrated evidence and exit gates
 
@@ -127,23 +154,16 @@ Reuse all accepted M02 contracts and record the combined implementation's exact 
 
 - Arbitrary per-window sandwich ordering (Vanilla between Window A and Window B) is **A01-W1.1** feasibility work, after stable global layer control and selected-window observation.
 - A01 window perching/climbing, selected-window moving/minimizing, character-driven layer policy, persisted settings, autonomous movement, renderer replacement, asset/Spine integration, cognition, sensor surveillance, and future Android/Wayland IPC architecture.
-- Unsolicited changes to host Openbox/Picom configuration, external app window placement, or user workspace.
+- Unsolicited changes to host Openbox/Picom configuration, external app window placement, or user workspace. Optional manual Openbox shortcut/launcher setup belongs in the host guide, not automatic probe code.
 - A general-purpose status daemon, tray dependency, global hotkey, permanent active-window polling, or repeated restack loop.
 
 A01-W1.1 differs from M03 global layers: it seeks relative z-order among selected managed ordinary windows and must establish compatibility with Openbox WM policy, re-raising/focus, window/group lifecycle and input isolation before any guarantee. If infeasible, explicitly fall back to proven Above/Normal/Below. Do not prebuild for it in M03.
 
-## 9. Next action: read-only Codex plan for M03.1
+## 9. Next action after M03.2 design approval
 
-Use a Codex-capable model with **High reasoning effort**. Read AGENTS.md, the mission document, M02 specification/acceptance, the host research and actual current code. Codex should:
-- report exact branch/HEAD and dirty state; do not overwrite or stash user changes;
-- map existing window atom/property handling, event loop, popup and pointer ownership, and test seams;
-- propose narrow file-by-file modifications for **M03.1 only** and exact WM request/verification protocol;
-- explain property observation, transition/timeout/failure handling and no-focus safeguards;
-- map L01–L13 and deterministic cases to implementation and verification;
-- flag deviations/architectural questions; do not change any files, run destructive commands, create branches, commit, push or implement;
-- provide an ordered bounded implementation plan for independent ChatGPT review.
+M03.1 source, CI and real-host acceptance and D00-M01 documentation acceptance are complete. The [full M03.2 revised read-only design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md) was independently reviewed and approved on 2026-10-09, with no executable changes. Use it with `AGENTS.md`, `docs/STATUS.md`, and the accepted invariants rather than repeating the completed research or design work.
 
-Only after the plan is reviewed and approved should the owner authorize M03.1 coding.
+**Current execution checkpoint (recorded 2026-10-13):** stages A–G are accepted. Latest executable `80d7df4aa1524122bd7c232f5aa09a4e39c8dd9f` passed [CI 38468930784](https://github.com/zNe4/DesktopRoomie/actions/runs/38468930784) (447 passed, 0 failed), independent G1/G2/G3 source/CI review, and [owner Stage-G native acceptance](host/OPENBOX.md#stage-g-acceptance-recorded-2026-10-13) (H10/H11/H13/H16/H17/H20/H22/H25 PASS; H14 not observed). Earlier Stage-F revision `ccd0191…` and its [native evidence](host/OPENBOX.md#stage-f-acceptance-recorded-2026-10-13) remain accepted historical checkpoints, including corrected `5ed75d7…` behavior and the unaccepted original F candidate. **Next gate:** H is unblocked for separately authorized planning, not started. No final M03.2 acceptance or M03.3 implementation is authorized by this docs-only checkpoint.
 
 ## 10. Primary references
 

@@ -1,0 +1,1342 @@
+//! Strict native visibility evidence and checked nonactivating requests.
+#![allow(dead_code)]
+
+use x11rb::connection::Connection;
+use x11rb::errors::ReplyError;
+use x11rb::protocol::xproto::{
+    Atom, AtomEnum, ClientMessageEvent, ConnectionExt, EventMask, GetPropertyReply,
+    MapState as NativeMapState, PropMode, Window,
+};
+use x11rb::protocol::ErrorKind;
+use x11rb::wrapper::ConnectionExt as _;
+
+use crate::control::{
+    classify, Capability, Evidence, LayerObservation as LayerValue, MapState, VisibilityCandidate,
+    VisibilityEvidence, WmState, Workspace,
+};
+
+type HostError = Box<dyn std::error::Error>;
+const MAX_ATOMS: u32 = 4096;
+
+pub struct VisibilityAtoms {
+    pub wm_state: Atom,
+    pub change_state: Atom,
+    pub state: Atom,
+    pub hidden: Atom,
+    pub above: Atom,
+    pub below: Atom,
+    pub desktop: Atom,
+    pub current_desktop: Atom,
+    pub supported: Atom,
+    pub user_time: Atom,
+}
+
+/// Complete decoded values retain unrelated state/support atoms for preservation checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observation {
+    pub wm_state: WmState,
+    pub map_state: Evidence<MapState>,
+    pub state: Evidence<Vec<Atom>>,
+    pub desktop: Evidence<u32>,
+    pub current_desktop: Evidence<u32>,
+    pub supported: Evidence<Vec<Atom>>,
+}
+
+#[derive(Debug)]
+pub struct VisibilitySnapshot {
+    pub observation: Option<Observation>,
+    pub evidence: VisibilityEvidence,
+    pub candidate: VisibilityCandidate,
+    /// Unknown unless the complete state and all M03.1 layer capabilities are verifiable.
+    pub layer: LayerValue,
+}
+
+impl VisibilityAtoms {
+    pub fn intern(conn: &impl Connection) -> Result<Self, HostError> {
+        let atom = |name: &[u8]| -> Result<Atom, HostError> {
+            Ok(conn.intern_atom(false, name)?.reply()?.atom)
+        };
+        Ok(Self {
+            wm_state: atom(b"WM_STATE")?,
+            change_state: atom(b"WM_CHANGE_STATE")?,
+            state: atom(b"_NET_WM_STATE")?,
+            hidden: atom(b"_NET_WM_STATE_HIDDEN")?,
+            above: atom(b"_NET_WM_STATE_ABOVE")?,
+            below: atom(b"_NET_WM_STATE_BELOW")?,
+            desktop: atom(b"_NET_WM_DESKTOP")?,
+            current_desktop: atom(b"_NET_CURRENT_DESKTOP")?,
+            supported: atom(b"_NET_SUPPORTED")?,
+            user_time: atom(b"_NET_WM_USER_TIME")?,
+        })
+    }
+
+    pub fn observe(
+        &self,
+        conn: &impl Connection,
+        root: Window,
+        body: Window,
+    ) -> Result<VisibilitySnapshot, HostError> {
+        self.observe_with(body, || {
+            let property = |window, atom, limit| -> Result<GetPropertyReply, HostError> {
+                Ok(conn
+                    .get_property(false, window, atom, AtomEnum::ANY, 0, limit)?
+                    .reply()?)
+            };
+            Ok(Observation {
+                wm_state: decode_wm_state(&property(body, self.wm_state, 2)?, self.wm_state),
+                map_state: decode_map_state(conn.get_window_attributes(body)?.reply()?.map_state),
+                state: decode_words(
+                    &property(body, self.state, MAX_ATOMS)?,
+                    AtomEnum::ATOM.into(),
+                    MAX_ATOMS,
+                ),
+                desktop: decode_desktop(&property(body, self.desktop, 1)?, false),
+                current_desktop: decode_desktop(&property(root, self.current_desktop, 1)?, true),
+                supported: decode_words(
+                    &property(root, self.supported, MAX_ATOMS)?,
+                    AtomEnum::ATOM.into(),
+                    MAX_ATOMS,
+                ),
+            })
+        })
+    }
+
+    /// Two bounded reads check agreement, not atomicity. Call afresh after notifications
+    /// and before future completion; no cache, polling, retry, or confirmation is implied.
+    fn observe_with(
+        &self,
+        body: Window,
+        mut read: impl FnMut() -> Result<Observation, HostError>,
+    ) -> Result<VisibilitySnapshot, HostError> {
+        let reads = (|| Ok::<_, HostError>((read()?, read()?)))();
+        match reads {
+            Ok((before, after)) => Ok(self.snapshot(after.clone(), before == after)),
+            Err(error) if is_bad_window(&error, body) => {
+                let evidence = VisibilityEvidence {
+                    destroyed: true,
+                    wm_state: WmState::Malformed,
+                    map_state: Evidence::Missing,
+                    hidden: Evidence::Missing,
+                    workspace: Workspace::Unknown,
+                    capability: Capability::Unverifiable,
+                    coherent: false,
+                };
+                Ok(VisibilitySnapshot {
+                    observation: None,
+                    candidate: classify(evidence),
+                    evidence,
+                    layer: LayerValue::Unknown,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn snapshot(&self, observation: Observation, coherent: bool) -> VisibilitySnapshot {
+        let capability = match &observation.supported {
+            Evidence::Readable(atoms) => {
+                if [self.state, self.hidden, self.desktop, self.current_desktop]
+                    .iter()
+                    .all(|a| atoms.contains(a))
+                {
+                    Capability::Supported
+                } else {
+                    Capability::Unsupported
+                }
+            }
+            Evidence::Missing | Evidence::Malformed => Capability::Unverifiable,
+        };
+        let hidden = match &observation.state {
+            Evidence::Readable(atoms) => Evidence::Readable(atoms.contains(&self.hidden)),
+            Evidence::Missing => Evidence::Missing,
+            Evidence::Malformed => Evidence::Malformed,
+        };
+        let layer = match (&observation.state, &observation.supported) {
+            (Evidence::Readable(state), Evidence::Readable(support))
+                if coherent
+                    && [self.state, self.above, self.below]
+                        .iter()
+                        .all(|a| support.contains(a)) =>
+            {
+                match (state.contains(&self.above), state.contains(&self.below)) {
+                    (false, false) => LayerValue::Normal,
+                    (true, false) => LayerValue::Above,
+                    (false, true) => LayerValue::Below,
+                    (true, true) => LayerValue::Conflict,
+                }
+            }
+            _ => LayerValue::Unknown,
+        };
+        let evidence = VisibilityEvidence {
+            destroyed: false,
+            wm_state: observation.wm_state,
+            map_state: observation.map_state,
+            hidden,
+            workspace: workspace_relation(observation.desktop, observation.current_desktop),
+            capability,
+            coherent,
+        };
+        VisibilitySnapshot {
+            observation: Some(observation),
+            candidate: classify(evidence),
+            evidence,
+            layer,
+        }
+    }
+}
+
+fn is_bad_window(error: &HostError, body: Window) -> bool {
+    matches!(error.downcast_ref::<ReplyError>(), Some(ReplyError::X11Error(e)) if e.error_kind == ErrorKind::Window && e.bad_value == body)
+}
+
+/// Exact bounded 32-bit property, including reply length and missing encoding.
+fn decode_words(reply: &GetPropertyReply, type_: Atom, maximum: u32) -> Evidence<Vec<u32>> {
+    if reply.type_ == x11rb::NONE {
+        return if reply.format == 0
+            && reply.length == 0
+            && reply.value_len == 0
+            && reply.value.is_empty()
+            && reply.bytes_after == 0
+        {
+            Evidence::Missing
+        } else {
+            Evidence::Malformed
+        };
+    }
+    if reply.type_ != type_
+        || reply.format != 32
+        || reply.bytes_after != 0
+        || reply.value_len > maximum
+        || reply.length != reply.value_len
+        || usize::try_from(reply.value_len)
+            .ok()
+            .and_then(|n| n.checked_mul(4))
+            != Some(reply.value.len())
+    {
+        return Evidence::Malformed;
+    }
+    match reply.value32() {
+        Some(values) => Evidence::Readable(values.collect()),
+        None => Evidence::Malformed,
+    }
+}
+
+fn decode_wm_state(reply: &GetPropertyReply, atom: Atom) -> WmState {
+    match decode_words(reply, atom, 2) {
+        Evidence::Missing => WmState::Absent,
+        Evidence::Readable(words) if words.len() == 2 => match words[0] {
+            0 => WmState::Withdrawn,
+            1 => WmState::Normal,
+            3 => WmState::Iconic,
+            _ => WmState::Malformed,
+        },
+        _ => WmState::Malformed,
+    }
+}
+
+fn decode_map_state(state: NativeMapState) -> Evidence<MapState> {
+    match state {
+        NativeMapState::UNMAPPED => Evidence::Readable(MapState::Unmapped),
+        NativeMapState::UNVIEWABLE => Evidence::Readable(MapState::Unviewable),
+        NativeMapState::VIEWABLE => Evidence::Readable(MapState::Viewable),
+        _ => Evidence::Malformed,
+    }
+}
+
+fn decode_desktop(reply: &GetPropertyReply, current: bool) -> Evidence<u32> {
+    match decode_words(reply, AtomEnum::CARDINAL.into(), 1) {
+        Evidence::Missing => Evidence::Missing,
+        Evidence::Readable(words) if words.len() == 1 && (!current || words[0] != u32::MAX) => {
+            Evidence::Readable(words[0])
+        }
+        _ => Evidence::Malformed,
+    }
+}
+
+fn workspace_relation(body: Evidence<u32>, current: Evidence<u32>) -> Workspace {
+    match (body, current) {
+        (Evidence::Readable(body), Evidence::Readable(current)) if current != u32::MAX => {
+            if body == u32::MAX {
+                Workspace::AllDesktops
+            } else if body == current {
+                Workspace::Current
+            } else {
+                Workspace::Other
+            }
+        }
+        _ => Workspace::Unknown,
+    }
+}
+
+/// Narrow request seam: every callback represents one checked protocol operation.
+/// Its success is only X processing acknowledgement, never a visibility result.
+#[derive(Debug)]
+pub(crate) enum VisibilityRequest {
+    Iconify {
+        destination: Window,
+        propagate: bool,
+        mask: EventMask,
+        event: ClientMessageEvent,
+    },
+    NetWmState {
+        destination: Window,
+        propagate: bool,
+        mask: EventMask,
+        event: ClientMessageEvent,
+    },
+    UserTime {
+        body: Window,
+        property: Atom,
+        mode: PropMode,
+        type_: Atom,
+        data: [u32; 1],
+    },
+    Map {
+        body: Window,
+    },
+}
+
+fn checked_request(conn: &impl Connection, request: VisibilityRequest) -> Result<(), HostError> {
+    checked_request_marked(conn, request, &mut false)
+}
+
+fn checked_request_marked(
+    conn: &impl Connection,
+    request: VisibilityRequest,
+    dispatched: &mut bool,
+) -> Result<(), HostError> {
+    let cookie = match request {
+        VisibilityRequest::Iconify {
+            destination,
+            propagate,
+            mask,
+            event,
+        }
+        | VisibilityRequest::NetWmState {
+            destination,
+            propagate,
+            mask,
+            event,
+        } => conn.send_event(propagate, destination, mask, event)?,
+        VisibilityRequest::UserTime {
+            body,
+            property,
+            mode,
+            type_,
+            data,
+        } => conn.change_property32(mode, body, property, type_, &data)?,
+        VisibilityRequest::Map { body } => conn.map_window(body)?,
+    };
+    *dispatched = true;
+    cookie.check()?;
+    Ok(())
+}
+
+impl VisibilityAtoms {
+    /// Openbox off-workspace minimization/deiconification, with no local map,
+    /// user-time write or direct state-property mutation. Acknowledgement is not
+    /// confirmation; the owner consumes the attempt before calling this helper.
+    pub fn request_hidden_before(
+        &self,
+        conn: &impl Connection,
+        root: Window,
+        body: Window,
+        hidden: bool,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+    ) -> Result<bool, HostError> {
+        self.hidden_before_with(
+            root,
+            body,
+            hidden,
+            deadline,
+            dispatched,
+            std::time::Instant::now,
+            |request, sent| checked_request_marked(conn, request, sent),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hidden_before_with(
+        &self,
+        root: Window,
+        body: Window,
+        hidden: bool,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+        now: impl FnOnce() -> std::time::Instant,
+        checked: impl FnOnce(VisibilityRequest, &mut bool) -> Result<(), HostError>,
+    ) -> Result<bool, HostError> {
+        if now() >= deadline {
+            return Ok(false);
+        }
+        let mut sent = false;
+        let result = checked(
+            VisibilityRequest::NetWmState {
+                destination: root,
+                propagate: false,
+                mask: EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+                event: ClientMessageEvent::new(
+                    32,
+                    body,
+                    self.state,
+                    [u32::from(hidden), self.hidden, 0, 1, 0],
+                ),
+            },
+            &mut sent,
+        );
+        *dispatched |= sent;
+        result?;
+        Ok(sent)
+    }
+
+    pub fn request_iconify_before(
+        &self,
+        conn: &impl Connection,
+        root: Window,
+        body: Window,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+    ) -> Result<bool, HostError> {
+        self.iconify_before_with(
+            root,
+            body,
+            deadline,
+            dispatched,
+            std::time::Instant::now,
+            |request, sent| checked_request_marked(conn, request, sent),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn iconify_before_with(
+        &self,
+        root: Window,
+        body: Window,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+        now: impl FnOnce() -> std::time::Instant,
+        checked: impl FnOnce(VisibilityRequest, &mut bool) -> Result<(), HostError>,
+    ) -> Result<bool, HostError> {
+        if now() >= deadline {
+            return Ok(false);
+        }
+        // Reuse the Stage-D envelope. Mark actual transport dispatch before its
+        // check; acknowledgement alone establishes no visibility confirmation.
+        let mut sent = false;
+        let result = self.iconify_with(root, body, |request| checked(request, &mut sent));
+        *dispatched |= sent;
+        result?;
+        Ok(sent)
+    }
+
+    /// One shared deadline, checked separately before both native mutations.
+    /// A checked acknowledgement is not WM confirmation. Mark dispatch before
+    /// checking, since a failed check cannot establish that the request had no effect.
+    /// Returns true only if MapWindow itself was dispatched and checked.
+    pub fn request_restore_before(
+        &self,
+        conn: &impl Connection,
+        body: Window,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+    ) -> Result<bool, HostError> {
+        self.restore_before_with(
+            body,
+            deadline,
+            dispatched,
+            std::time::Instant::now,
+            |request, dispatched| checked_request_marked(conn, request, dispatched),
+        )
+    }
+
+    /// Recover alone needs a fresh destination guard between the two checked
+    /// requests. The guard grants no extra time or retry authority.
+    pub fn request_restore_guarded_before(
+        &self,
+        conn: &impl Connection,
+        body: Window,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+        guard: impl FnOnce() -> Result<bool, HostError>,
+    ) -> Result<bool, HostError> {
+        self.restore_guarded_before_with(
+            body,
+            deadline,
+            dispatched,
+            std::time::Instant::now,
+            |request, dispatched| checked_request_marked(conn, request, dispatched),
+            Some(guard),
+        )
+    }
+
+    fn restore_before_with(
+        &self,
+        body: Window,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+        now: impl FnMut() -> std::time::Instant,
+        checked: impl FnMut(VisibilityRequest, &mut bool) -> Result<(), HostError>,
+    ) -> Result<bool, HostError> {
+        self.restore_guarded_before_with(
+            body,
+            deadline,
+            dispatched,
+            now,
+            checked,
+            None::<fn() -> Result<bool, HostError>>,
+        )
+    }
+
+    pub(crate) fn restore_guarded_before_with(
+        &self,
+        body: Window,
+        deadline: std::time::Instant,
+        dispatched: &mut bool,
+        mut now: impl FnMut() -> std::time::Instant,
+        mut checked: impl FnMut(VisibilityRequest, &mut bool) -> Result<(), HostError>,
+        guard: Option<impl FnOnce() -> Result<bool, HostError>>,
+    ) -> Result<bool, HostError> {
+        let mut mapped = false;
+        let mut user_time_checked = false;
+        let mut guard = guard;
+        self.restore_with(body, |request| {
+            if now() >= deadline {
+                return Ok(());
+            }
+            let is_map = matches!(request, VisibilityRequest::Map { .. });
+            if is_map {
+                if let Some(guard) = guard.take() {
+                    if !user_time_checked || !guard()? || now() >= deadline {
+                        return Ok(());
+                    }
+                }
+            }
+            let mut request_dispatched = false;
+            let result = checked(request, &mut request_dispatched);
+            *dispatched |= request_dispatched;
+            mapped |= is_map && request_dispatched;
+            user_time_checked |= !is_map && request_dispatched && result.is_ok();
+            result
+        })?;
+        Ok(mapped)
+    }
+
+    pub fn request_iconify(
+        &self,
+        conn: &impl Connection,
+        root: Window,
+        body: Window,
+    ) -> Result<(), HostError> {
+        self.iconify_with(root, body, |request| checked_request(conn, request))
+    }
+    fn iconify_with(
+        &self,
+        root: Window,
+        body: Window,
+        checked: impl FnOnce(VisibilityRequest) -> Result<(), HostError>,
+    ) -> Result<(), HostError> {
+        checked(VisibilityRequest::Iconify {
+            destination: root,
+            propagate: false,
+            mask: EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+            event: ClientMessageEvent::new(32, body, self.change_state, [3, 0, 0, 0, 0]),
+        })
+    }
+    pub fn request_restore(&self, conn: &impl Connection, body: Window) -> Result<(), HostError> {
+        self.restore_with(body, |request| checked_request(conn, request))
+    }
+    fn restore_with(
+        &self,
+        body: Window,
+        mut checked: impl FnMut(VisibilityRequest) -> Result<(), HostError>,
+    ) -> Result<(), HostError> {
+        checked(VisibilityRequest::UserTime {
+            body,
+            property: self.user_time,
+            mode: PropMode::REPLACE,
+            type_: AtomEnum::CARDINAL.into(),
+            data: [0],
+        })?;
+        checked(VisibilityRequest::Map { body })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::{Reason, Visibility};
+
+    #[test]
+    fn hidden_add_remove_envelopes_deadline_and_checked_dispatch_are_exact() {
+        use x11rb::x11_utils::Serialize;
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs(1);
+        for hidden in [true, false] {
+            // Expired, unsent failure, sent/check failure, successful send/check.
+            for case in 0..4 {
+                let mut dispatched = false;
+                let mut calls = 0;
+                let result = atoms().hidden_before_with(
+                    0x12345678,
+                    0x23456789,
+                    hidden,
+                    deadline,
+                    &mut dispatched,
+                    || if case == 0 { deadline } else { start },
+                    |request, sent| {
+                        calls += 1;
+                        let VisibilityRequest::NetWmState {
+                            destination,
+                            propagate,
+                            mask,
+                            event,
+                        } = request
+                        else {
+                            panic!("HIDDEN must use SendEvent, never ChangeProperty/map/iconify")
+                        };
+                        assert_eq!(destination, 0x12345678);
+                        assert!(!propagate);
+                        assert_eq!(u32::from(mask), (1 << 19) | (1 << 20));
+                        // Full 32-byte ClientMessage, including zero sequence/padding.
+                        let mut expected = vec![33, 32, 0, 0];
+                        for word in [
+                            0x23456789,
+                            12, // _NET_WM_STATE
+                            u32::from(hidden),
+                            13, // only HIDDEN, no Above/Below/DEMANDS_ATTENTION
+                            0,  // state2
+                            1,  // application source
+                            0,
+                        ] {
+                            expected.extend(word.to_ne_bytes());
+                        }
+                        assert_eq!(event.serialize().as_slice(), expected);
+                        if case == 1 {
+                            return Err("send failed before cookie".into());
+                        }
+                        *sent = true;
+                        if case == 2 {
+                            return Err("cookie check failed after send".into());
+                        }
+                        Ok(())
+                    },
+                );
+                assert_eq!(calls, usize::from(case != 0), "no fallback or retry");
+                assert_eq!(dispatched, case >= 2);
+                assert_eq!(result.is_err(), case == 1 || case == 2);
+                if case == 0 || case == 3 {
+                    assert_eq!(result.unwrap(), case == 3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_observations_preserve_unrelated_attention_and_layer_atoms() {
+        let atoms = atoms();
+        let attention = 99;
+        let mut observed = observation();
+        observed.desktop = Evidence::Readable(7);
+        observed.current_desktop = Evidence::Readable(2);
+        observed.wm_state = WmState::Iconic;
+        observed.map_state = Evidence::Readable(MapState::Unmapped);
+        for hidden in [false, true, false] {
+            let mut state = vec![atoms.above, attention];
+            if hidden {
+                state.push(atoms.hidden);
+            }
+            observed.state = Evidence::Readable(state.clone());
+            let snapshot = atoms.snapshot(observed.clone(), true);
+            assert_eq!(snapshot.layer, LayerValue::Above);
+            assert_eq!(
+                snapshot.candidate.visibility,
+                if hidden {
+                    Visibility::Minimized
+                } else {
+                    Visibility::NotMinimizedElsewhere
+                }
+            );
+            assert_eq!(
+                snapshot.observation.unwrap().state,
+                Evidence::Readable(state)
+            );
+        }
+    }
+
+    #[test]
+    fn iconification_deadline_and_dispatch_errors_keep_exact_envelope_and_no_retry() {
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(1000);
+        for case in 0..4 {
+            let mut sent = false;
+            let mut calls = 0;
+            let result = atoms().iconify_before_with(
+                100,
+                200,
+                deadline,
+                &mut sent,
+                || if case == 0 { deadline } else { start },
+                |request, dispatched| {
+                    calls += 1;
+                    let VisibilityRequest::Iconify {
+                        destination,
+                        propagate,
+                        mask,
+                        event,
+                    } = request
+                    else {
+                        panic!("unrelated mutation")
+                    };
+                    assert_eq!(destination, 100);
+                    assert!(!propagate);
+                    assert_eq!(
+                        mask,
+                        EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT
+                    );
+                    assert_eq!((event.window, event.type_, event.format), (200, 11, 32));
+                    assert_eq!(event.data.as_data32(), [3, 0, 0, 0, 0]);
+                    if case == 1 {
+                        return Err("unsent".into());
+                    }
+                    *dispatched = true;
+                    if case == 2 {
+                        return Err("checked error".into());
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(calls, usize::from(case != 0));
+            assert_eq!(sent, case >= 2);
+            assert_eq!(result.is_err(), case == 1 || case == 2);
+            if case == 0 {
+                assert!(!result.unwrap());
+            } else if case == 3 {
+                assert!(result.unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_restore_deadline_is_checked_before_each_native_request() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        for expire_after_user_time in [false, true] {
+            let start = Instant::now();
+            let clock = Cell::new(start);
+            let deadline = start + Duration::from_secs(1);
+            let mut dispatched = false;
+            let mut calls = vec![];
+            let mapped = atoms()
+                .restore_before_with(
+                    100,
+                    deadline,
+                    &mut dispatched,
+                    || clock.get(),
+                    |request, sent| {
+                        *sent = true;
+                        calls.push(match request {
+                            VisibilityRequest::UserTime { data: [0], .. } => "zero",
+                            VisibilityRequest::Map { body: 100 } => "map",
+                            _ => panic!("unexpected mutation"),
+                        });
+                        if expire_after_user_time {
+                            clock.set(deadline);
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert!(dispatched);
+            assert_eq!(mapped, !expire_after_user_time);
+            assert_eq!(
+                calls,
+                if expire_after_user_time {
+                    vec!["zero"]
+                } else {
+                    vec!["zero", "map"]
+                }
+            );
+        }
+        let deadline = Instant::now();
+        let mut dispatched = false;
+        assert!(!atoms()
+            .restore_before_with(
+                100,
+                deadline,
+                &mut dispatched,
+                || deadline,
+                |_, _| panic!("expired mutation")
+            )
+            .unwrap());
+        assert!(!dispatched);
+    }
+
+    #[test]
+    fn unsent_request_error_does_not_invent_host_dispatch_or_retry() {
+        let now = std::time::Instant::now();
+        let mut dispatched = false;
+        let mut calls = 0;
+        assert!(atoms()
+            .restore_before_with(
+                100,
+                now + std::time::Duration::from_secs(1),
+                &mut dispatched,
+                || now,
+                |_, _| {
+                    calls += 1;
+                    Err("send failed before native cookie".into())
+                }
+            )
+            .is_err());
+        assert_eq!(calls, 1);
+        assert!(!dispatched);
+    }
+
+    #[test]
+    fn restore_dispatch_marks_survive_checked_errors_without_retry() {
+        use std::time::{Duration, Instant};
+        for fail_map in [false, true] {
+            for sent_before_error in [false, true] {
+                let now = Instant::now();
+                let mut dispatched = false;
+                let mut attempts = vec![];
+                let mut sent = vec![];
+                let result = atoms().restore_before_with(
+                    100,
+                    now + Duration::from_millis(2500),
+                    &mut dispatched,
+                    || now,
+                    |request, mark| {
+                        let is_map = matches!(request, VisibilityRequest::Map { .. });
+                        attempts.push(is_map);
+                        if is_map == fail_map && !sent_before_error {
+                            return Err("send failed before native cookie".into());
+                        }
+                        *mark = true; // native cookie obtained, before check
+                        sent.push(is_map);
+                        if is_map == fail_map {
+                            return Err("injected cookie check failure".into());
+                        }
+                        Ok(())
+                    },
+                );
+                assert!(result.is_err());
+                assert_eq!(
+                    attempts,
+                    if fail_map {
+                        vec![false, true]
+                    } else {
+                        vec![false]
+                    }
+                );
+                assert_eq!(
+                    sent.len(),
+                    usize::from(fail_map) + usize::from(sent_before_error)
+                );
+                assert_eq!(sent.contains(&true), fail_map && sent_before_error);
+                assert_eq!(dispatched, fail_map || sent_before_error);
+            }
+        }
+    }
+
+    #[test]
+    fn user_time_dispatch_mark_alone_never_counts_as_map_dispatch() {
+        let now = std::time::Instant::now();
+        let mut dispatched = false;
+        let mut calls = 0;
+        let mapped = atoms()
+            .restore_before_with(
+                100,
+                now + std::time::Duration::from_millis(2500),
+                &mut dispatched,
+                || now,
+                |request, mark| {
+                    calls += 1;
+                    assert!(
+                        !*mark,
+                        "each native request needs its own dispatch evidence"
+                    );
+                    *mark = matches!(request, VisibilityRequest::UserTime { .. });
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(dispatched);
+        assert!(!mapped);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn guarded_restore_preserves_order_dispatch_errors_veto_and_fixed_deadline() {
+        use std::cell::{Cell, RefCell};
+        use std::time::{Duration, Instant};
+        #[derive(Debug, PartialEq)]
+        struct Fault(&'static str);
+        impl std::fmt::Display for Fault {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Fault {}
+        for case in 0..10 {
+            let start = Instant::now();
+            let deadline = start + Duration::from_millis(2500);
+            let clock = Cell::new(if case == 0 { deadline } else { start });
+            let log = RefCell::new(vec![]);
+            let mut dispatched = false;
+            let result = atoms().restore_guarded_before_with(
+                100,
+                deadline,
+                &mut dispatched,
+                || clock.get(),
+                |request, sent| {
+                    let map = matches!(request, VisibilityRequest::Map { .. });
+                    log.borrow_mut()
+                        .push(if map { "map-send" } else { "zero-send" });
+                    if case == 1 || (case == 8 && map) {
+                        return Err(Box::new(Fault("send")));
+                    }
+                    *sent = true;
+                    log.borrow_mut()
+                        .push(if map { "map-check" } else { "zero-check" });
+                    if case == 2 || (case == 9 && map) {
+                        return Err(Box::new(Fault("check")));
+                    }
+                    if case == 3 {
+                        clock.set(deadline);
+                    }
+                    Ok(())
+                },
+                Some(|| {
+                    log.borrow_mut().push("guard");
+                    if case == 5 {
+                        return Err(Box::new(Fault("guard")) as HostError);
+                    }
+                    if case == 6 {
+                        clock.set(deadline);
+                    }
+                    Ok(case != 4)
+                }),
+            );
+            let expected = match case {
+                0 => vec![],
+                1 => vec!["zero-send"],
+                2 | 3 => vec!["zero-send", "zero-check"],
+                4..=6 => vec!["zero-send", "zero-check", "guard"],
+                8 => vec!["zero-send", "zero-check", "guard", "map-send"],
+                _ => vec!["zero-send", "zero-check", "guard", "map-send", "map-check"],
+            };
+            assert_eq!(*log.borrow(), expected, "case {case}");
+            assert_eq!(dispatched, case >= 2, "case {case}");
+            if matches!(case, 1 | 2 | 5 | 8 | 9) {
+                let expected = match case {
+                    1 | 8 => "send",
+                    5 => "guard",
+                    _ => "check",
+                };
+                assert_eq!(
+                    result.unwrap_err().downcast_ref::<Fault>(),
+                    Some(&Fault(expected))
+                );
+            } else {
+                assert_eq!(result.unwrap(), case == 7);
+            }
+        }
+    }
+
+    fn atoms() -> VisibilityAtoms {
+        VisibilityAtoms {
+            wm_state: 10,
+            change_state: 11,
+            state: 12,
+            hidden: 13,
+            above: 14,
+            below: 15,
+            desktop: 16,
+            current_desktop: 17,
+            supported: 18,
+            user_time: 19,
+        }
+    }
+    fn property(type_: Atom, values: &[u32]) -> GetPropertyReply {
+        GetPropertyReply {
+            type_,
+            format: 32,
+            length: values.len() as u32,
+            value_len: values.len() as u32,
+            value: values.iter().flat_map(|v| v.to_ne_bytes()).collect(),
+            ..Default::default()
+        }
+    }
+    fn observation() -> Observation {
+        Observation {
+            wm_state: WmState::Normal,
+            map_state: Evidence::Readable(MapState::Viewable),
+            state: Evidence::Readable(vec![]),
+            desktop: Evidence::Readable(2),
+            current_desktop: Evidence::Readable(2),
+            supported: Evidence::Readable(vec![12, 13, 14, 15, 16, 17]),
+        }
+    }
+    fn corruptions(reply: GetPropertyReply) -> Vec<GetPropertyReply> {
+        let mut cases = vec![];
+        let mut r = reply.clone();
+        r.type_ = 999;
+        cases.push(r);
+        let mut r = reply.clone();
+        r.format = 8;
+        cases.push(r);
+        let mut r = reply.clone();
+        r.value_len += 1;
+        cases.push(r);
+        let mut r = reply.clone();
+        r.length += 1;
+        cases.push(r);
+        let mut r = reply.clone();
+        r.value.push(0);
+        cases.push(r);
+        let mut r = reply.clone();
+        r.value.pop();
+        cases.push(r);
+        let mut r = reply.clone();
+        r.bytes_after = 4;
+        cases.push(r);
+        let mut r = reply;
+        r.type_ = 0;
+        cases.push(r);
+        cases
+    }
+    #[test]
+    fn icccm_requires_exact_known_state_and_two_words() {
+        for (value, expected) in [
+            (0, WmState::Withdrawn),
+            (1, WmState::Normal),
+            (3, WmState::Iconic),
+            (2, WmState::Malformed),
+        ] {
+            assert_eq!(decode_wm_state(&property(10, &[value, 123]), 10), expected);
+        }
+        assert_eq!(
+            decode_wm_state(&GetPropertyReply::default(), 10),
+            WmState::Absent
+        );
+        for values in [vec![], vec![1], vec![1, 0, 0]] {
+            assert_eq!(
+                decode_wm_state(&property(10, &values), 10),
+                WmState::Malformed
+            );
+        }
+        for reply in corruptions(property(10, &[1, 0])) {
+            assert_eq!(decode_wm_state(&reply, 10), WmState::Malformed);
+        }
+    }
+    #[test]
+    fn complete_atom_payload_retains_unrelated_atoms_and_explicit_layer_flags() {
+        for (values, hidden, layer) in [
+            (vec![], false, LayerValue::Normal),
+            (vec![13], true, LayerValue::Normal),
+            (vec![14, 99], false, LayerValue::Above),
+            (vec![15], false, LayerValue::Below),
+            (vec![13, 14, 15, 99], true, LayerValue::Conflict),
+        ] {
+            let decoded = decode_words(
+                &property(AtomEnum::ATOM.into(), &values),
+                AtomEnum::ATOM.into(),
+                MAX_ATOMS,
+            );
+            assert_eq!(decoded, Evidence::Readable(values));
+            let snapshot = atoms().snapshot(
+                Observation {
+                    state: decoded,
+                    ..observation()
+                },
+                true,
+            );
+            assert_eq!(snapshot.evidence.hidden, Evidence::Readable(hidden));
+            assert_eq!(snapshot.layer, layer);
+        }
+        assert_eq!(
+            decode_words(
+                &GetPropertyReply::default(),
+                AtomEnum::ATOM.into(),
+                MAX_ATOMS
+            ),
+            Evidence::Missing
+        );
+        for reply in corruptions(property(AtomEnum::ATOM.into(), &[13]))
+            .into_iter()
+            .chain([property(
+                AtomEnum::ATOM.into(),
+                &vec![13; MAX_ATOMS as usize + 1],
+            )])
+        {
+            assert_eq!(
+                decode_words(&reply, AtomEnum::ATOM.into(), MAX_ATOMS),
+                Evidence::Malformed
+            );
+        }
+    }
+    #[test]
+    fn workspace_is_exact_cardinal_without_desktop_zero_fallback() {
+        for (body, current, expected) in [
+            (2, 2, Workspace::Current),
+            (3, 2, Workspace::Other),
+            (u32::MAX, 2, Workspace::AllDesktops),
+        ] {
+            assert_eq!(
+                workspace_relation(
+                    decode_desktop(&property(AtomEnum::CARDINAL.into(), &[body]), false),
+                    decode_desktop(&property(AtomEnum::CARDINAL.into(), &[current]), true)
+                ),
+                expected
+            );
+        }
+        assert_eq!(
+            decode_desktop(&GetPropertyReply::default(), true),
+            Evidence::Missing
+        );
+        for reply in corruptions(property(AtomEnum::CARDINAL.into(), &[2]))
+            .into_iter()
+            .chain([
+                property(AtomEnum::CARDINAL.into(), &[]),
+                property(AtomEnum::CARDINAL.into(), &[2, 3]),
+            ])
+        {
+            assert_eq!(decode_desktop(&reply, false), Evidence::Malformed);
+            assert_eq!(decode_desktop(&reply, true), Evidence::Malformed);
+        }
+        assert_eq!(
+            decode_desktop(&property(AtomEnum::CARDINAL.into(), &[u32::MAX]), true),
+            Evidence::Malformed
+        );
+        for missing in [Evidence::Missing, Evidence::Malformed] {
+            assert_eq!(
+                workspace_relation(missing, Evidence::Readable(0)),
+                Workspace::Unknown
+            );
+            assert_eq!(
+                workspace_relation(Evidence::Readable(u32::MAX), missing),
+                Workspace::Unknown
+            );
+        }
+    }
+    #[test]
+    fn capability_absence_partial_and_malformed_never_make_success() {
+        for omitted in [12, 13, 16, 17] {
+            let mut o = observation();
+            o.supported = Evidence::Readable(
+                vec![12, 13, 14, 15, 16, 17]
+                    .into_iter()
+                    .filter(|a| *a != omitted)
+                    .collect(),
+            );
+            let s = atoms().snapshot(o, true);
+            assert_eq!(s.candidate.reason, Reason::Unsupported);
+        }
+        for evidence in [Evidence::Missing, Evidence::Malformed] {
+            let s = atoms().snapshot(
+                Observation {
+                    supported: evidence.clone(),
+                    ..observation()
+                },
+                true,
+            );
+            assert_eq!(s.candidate.reason, Reason::Unverifiable);
+            assert_eq!(s.layer, LayerValue::Unknown);
+            let s = atoms().snapshot(
+                Observation {
+                    state: evidence,
+                    ..observation()
+                },
+                true,
+            );
+            assert_eq!(s.candidate.reason, Reason::Unverifiable);
+            assert_eq!(s.layer, LayerValue::Unknown);
+        }
+        let s = atoms().snapshot(
+            Observation {
+                supported: Evidence::Readable(vec![12, 13, 16, 17]),
+                ..observation()
+            },
+            true,
+        );
+        assert_eq!(s.layer, LayerValue::Unknown);
+    }
+    #[test]
+    fn native_decoded_combinations_use_stage_a_candidates() {
+        use MapState::*;
+        use Visibility::*;
+        use WmState::{Iconic, Normal};
+        for (wm, map, hidden, desktop, expected) in [
+            (Iconic, Unmapped, true, 2, Minimized),
+            (Iconic, Unmapped, true, 3, Minimized),
+            (Iconic, Unmapped, false, 3, NotMinimizedElsewhere),
+            (Normal, Unmapped, false, 3, NotMinimizedElsewhere),
+            (Normal, Unviewable, false, 3, NotMinimizedElsewhere),
+            (Normal, Viewable, false, 2, NotMinimizedHere),
+            (Normal, Viewable, false, u32::MAX, NotMinimizedHere),
+            (Iconic, Unmapped, false, 2, Transitional),
+            (Normal, Unmapped, false, 2, Transitional),
+            (Normal, Unviewable, false, 2, Transitional),
+            (Normal, Viewable, true, 2, Transitional),
+            (Iconic, Viewable, true, 2, Transitional),
+            (Iconic, Unviewable, true, 3, Transitional),
+            (Normal, Unmapped, true, 3, Transitional),
+            (Normal, Viewable, false, 3, Unknown),
+            (Iconic, Unviewable, false, 3, Unknown),
+            (WmState::Absent, Unmapped, false, 2, Withdrawn),
+            (WmState::Withdrawn, Unmapped, false, 2, Withdrawn),
+            (WmState::Malformed, Unmapped, false, 2, Unknown),
+        ] {
+            let s = atoms().snapshot(
+                Observation {
+                    wm_state: wm,
+                    map_state: Evidence::Readable(map),
+                    state: Evidence::Readable(if hidden { vec![13] } else { vec![] }),
+                    desktop: Evidence::Readable(desktop),
+                    ..observation()
+                },
+                true,
+            );
+            assert_eq!(
+                s.candidate.visibility, expected,
+                "{wm:?}/{map:?}/{hidden}/{desktop}"
+            );
+        }
+        for state in [Evidence::Missing, Evidence::Malformed] {
+            let s = atoms().snapshot(
+                Observation {
+                    wm_state: Iconic,
+                    map_state: Evidence::Readable(Unmapped),
+                    state,
+                    ..observation()
+                },
+                true,
+            );
+            assert_eq!(s.candidate.visibility, Unknown);
+        }
+    }
+    #[test]
+    fn rereads_detect_drift_and_fresh_observations_are_not_cached() {
+        let mut count = 0;
+        let s = atoms()
+            .observe_with(100, || {
+                count += 1;
+                Ok(Observation {
+                    desktop: Evidence::Readable(count),
+                    ..observation()
+                })
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(!s.evidence.coherent);
+        assert_eq!(s.candidate.visibility, Visibility::Transitional);
+        assert_eq!(s.layer, LayerValue::Unknown);
+        let s = atoms().observe_with(100, || Ok(observation())).unwrap();
+        assert_eq!(s.candidate.visibility, Visibility::NotMinimizedHere);
+        assert!(atoms()
+            .observe_with(100, || Err("connection lost".into()))
+            .is_err());
+    }
+    #[test]
+    fn map_states_are_distinct_and_bad_window_is_destroyed() {
+        for (native, decoded) in [
+            (NativeMapState::UNMAPPED, MapState::Unmapped),
+            (NativeMapState::UNVIEWABLE, MapState::Unviewable),
+            (NativeMapState::VIEWABLE, MapState::Viewable),
+        ] {
+            assert_eq!(decode_map_state(native), Evidence::Readable(decoded));
+        }
+        assert_eq!(
+            decode_map_state(NativeMapState::from(9)),
+            Evidence::Malformed
+        );
+        let s = atoms()
+            .observe_with(100, || {
+                Err(ReplyError::X11Error(x11rb::x11_utils::X11Error {
+                    error_kind: ErrorKind::Window,
+                    error_code: 3,
+                    sequence: 1,
+                    bad_value: 100,
+                    minor_opcode: 0,
+                    major_opcode: 3,
+                    extension_name: None,
+                    request_name: None,
+                })
+                .into())
+            })
+            .unwrap();
+        assert_eq!(s.candidate.visibility, Visibility::Destroyed);
+        assert!(s.observation.is_none());
+    }
+    #[test]
+    fn iconify_exact_envelope_and_checked_error_without_retry_or_confirmation() {
+        for fail in [false, true] {
+            let mut calls = 0;
+            let result = atoms().iconify_with(100, 200, |request| {
+                calls += 1;
+                let VisibilityRequest::Iconify {
+                    destination,
+                    propagate,
+                    mask,
+                    event,
+                } = request
+                else {
+                    panic!("unrelated operation")
+                };
+                assert_eq!(destination, 100);
+                assert!(!propagate);
+                assert_eq!(
+                    mask,
+                    EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT
+                );
+                assert_eq!((event.window, event.type_, event.format), (200, 11, 32));
+                assert_eq!(event.data.as_data32(), [3, 0, 0, 0, 0]);
+                if fail {
+                    Err("checked send failed".into())
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(result.is_err(), fail);
+        }
+    }
+    #[test]
+    fn restoration_checks_only_user_time_then_map_and_stops_at_first_error() {
+        for fail_at in [0, 1, 2] {
+            let mut calls = 0;
+            let result = atoms().restore_with(200, |request| {
+                calls += 1;
+                match request {
+                    VisibilityRequest::UserTime {
+                        body,
+                        property,
+                        mode,
+                        type_,
+                        data,
+                    } => {
+                        assert_eq!(calls, 1);
+                        assert_eq!((body, property), (200, 19));
+                        assert_eq!(mode, PropMode::REPLACE);
+                        assert_eq!(type_, AtomEnum::CARDINAL.into());
+                        assert_eq!(data, [0]);
+                    }
+                    VisibilityRequest::Map { body } => {
+                        assert_eq!(calls, 2);
+                        assert_eq!(body, 200);
+                    }
+                    _ => panic!("unrelated mutation"),
+                }
+                if calls == fail_at {
+                    Err("checked request failed".into())
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(calls, if fail_at == 1 { 1 } else { 2 });
+            assert_eq!(result.is_err(), fail_at != 0);
+        }
+    }
+}
