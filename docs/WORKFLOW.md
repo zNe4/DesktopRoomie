@@ -2,8 +2,8 @@
 
 ## Roles and scope
 
-- **ChatGPT in the separate authoritative session:** external research/comparison, architecture recommendations and decisions, bounded specifications/prompts, model/reasoning selection and independent review of exact completed work.
-- **Codex:** repository/API inspection, assigned implementation or documentation, meaningful tests/debugging, applicable verification, technical documentation and honest reporting of gaps/risks. No broad external research or architecture adoption on its own initiative.
+- **ChatGPT in the separate authoritative session:** external research/comparison, architecture recommendations and decisions, authoritative research/design/roadmap documentation, bounded specifications/prompts, model/reasoning selection and independent review of exact completed work.
+- **Codex:** repository/API inspection, read-only implementation planning when assigned, approved coding/tests/debugging and verification, technical evidence for our documentation, and honest reporting of gaps/risks. Broader research, architecture and roadmap documentation remain ChatGPT/owner responsibilities. No broad external research or architecture adoption on its own initiative.
 - **Owner:** intermediary with ChatGPT, scope/decision approval, real-host acceptance, mission-scoped publication authorization and merge authority.
 
 Work one assigned mission at a time. The active approved contract and explicit decisions determine scope; [AGENTS](../AGENTS.md) supplies mandatory operating restrictions. [INVARIANTS](INVARIANTS.md) captures accepted review obligations, [STATUS](STATUS.md) the current checkpoint, [ARCHITECTURE](ARCHITECTURE.md) implemented ownership, and [INDEX](INDEX.md) deeper evidence. Roadmaps, studies and historical next-action text are not authorization.

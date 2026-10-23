@@ -2,6 +2,8 @@
 
 Version 0.1 · 2026-10-04 · Planning draft based on the client's answers
 
+**Checkpoint reconciliation (2026-10-23):** The A00 part of this proposal is historical: A00-M01 through M03.4 are closed with owner technical acceptance on 2026-10-23. See [integrated acceptance](DesktopRoomie-A00-M03.4-integrated-acceptance.md), [host ADR](DesktopRoomie-A00-M03.4-host-architecture-decision.md) and [STATUS](STATUS.md). A01 sections remain proposed goals, not proof of implemented companion features or fresh authorization. Original gate descriptions are preserved as historical context.
+
 Parent: DesktopRoomie roadmap v0.1. This document expands the first adventure and proposes a short technical prelude. It records proposed defaults where the client delegated the choice. It is a roadmap for implementation on the client's machine, not a report of implemented or tested software.
 
 ## 1. Product agreement
@@ -10,11 +12,11 @@ Parent: DesktopRoomie roadmap v0.1. This document expands the first adventure an
 
 **A01 — First visit:** a recognizable, pleasant desktop Vanilla who can be moved, interact physically, perform a small repertoire, and coexist with normal work. A01 must feel like a companion even though its decision-making remains simple.
 
-The first supported environment is the client's current **Openbox on X11** session. The exact distribution/version, compositor, display geometry, and focus settings will be recorded in A00. There is no requirement to switch operating systems or desktops now. bspwm, KDE, and Wayland support remain separate compatibility work, without assuming that success on this target proves support elsewhere.
+The accepted target is **Archcraft/Arch Linux with Openbox 3.6.1 on X11 and Picom v13**, as documented by A00. Display scaling was not explicitly tested; arbitrary scaling, mixed DPI, monitor hotplug, other window managers and Wayland are not validated. bspwm and KDE remain separate potential compatibility work.
 
 Rust owns body state, movement/action execution, settings, and the desktop application where practical. Python may help prepare/validate assets. No Python runtime or second language is added solely to satisfy a polyglot checklist. Later model services retain their planned role.
 
-The client implements. The assistant prepares missions, designs interfaces, reviews evidence, and adjusts the plan. We do not begin coding the full adventure before its platform gate is resolved.
+The owner supervises and approves; ChatGPT owns research, architecture, roadmap documentation, bounded missions and independent review; Codex plans implementations and performs approved coding. The A00 platform gate is resolved; A01 code requires a separate mission under [WORKFLOW](WORKFLOW.md).
 
 ## 2. The boundaries we will build
 
@@ -55,6 +57,8 @@ Moving to the background is not moving off-screen, minimizing the character's in
 - A hidden or fully covered sprite must remain recoverable through a launcher/control command independent of right-clicking her. The exact mechanism is selected in A00; a custom global-hotkey system is unnecessary.
 
 These are proposed defaults, adjustable during the first interaction review. The non-negotiable requirements are no unsolicited keyboard focus, reliable user control, persistent settings, and keeping the complete body within valid bounds.
+
+**Accepted foundation:** The existing A00 probe already provides a single managed transparent X11 body, pointer capture/drag and focus safety, Above/Normal/Below, fullscreen coexistence on the recorded host, Hide/Show, Bring Top, Bring Here and Recover. A01 must preserve these, while character animation, dynamic body sizes, floor/gravity, autonomous movement, presentation-policy arbitration and persistent preferences remain future features. Bring Here explicitly relocates to the caller's frozen workspace; it is not automatic following or arbitrary selected-workspace placement.
 
 ## 3. A00 — Prove the desktop host
 
@@ -212,4 +216,4 @@ Before the first coding mission, obtain:
 2. Active monitor count, resolution/scaling, and any panel/dock reserving space. A01 will use one chosen monitor even if more are connected.
 3. The reference images when starting G2; they do not block A00.
 
-The A00-G1/G2 probe and integrated A00-M02 acceptance are complete, and **A00-M03.1 (global layers/fullscreen)** is accepted on the target Openbox/X11/Picom host. The D00-M01 documentation/context checkpoint is also accepted. The [A00-M03.2 revised read-only design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md) is independently approved; the next step is to agree on small evidence-gated implementation stages under [A00-M03: Placement, Recovery and Host Selection](DesktopRoomie-A00-M03-placement-recovery-host-selection.md), before separately authorizing code. The client's 2026-10-09 clarification separates Bring Top (M03.2) from Bring Here and composed Recover (M03.3); optional shortcuts belong to the host configuration guide, not a custom global hotkey. A01-W1.1 relative-window stacking remains deferred. No general architecture rewrite or complete sprite production is needed before M03.2.
+**Current disposition (2026-10-23):** All A00 host minigoals are complete and owner-approved for the recorded Openbox/X11/Picom target, with limitations in [M03.4 integrated acceptance](DesktopRoomie-A00-M03.4-integrated-acceptance.md). The [ratified ADR](DesktopRoomie-A00-M03.4-host-architecture-decision.md) preserves the Rust/x11rb host. Frozen accepted executable `f3458549dbbdd4b9ef42ed85d3bfaeb6ed683863` passed [matching CI (760 tests)](https://github.com/zNe4/DesktopRoomie/actions/runs/39688537222). A00 documentation was merged into `main` at `ea43dd21a01bbf78d8b8cb2129e0d7c429d411e7`. The original M03.2-next language above is superseded. Bring Top, Bring Here and Recover are distinct accepted controls; optional shortcuts remain Openbox configuration. A01-W1.1 relative-window stacking and all new A01 coding await separate authorization.

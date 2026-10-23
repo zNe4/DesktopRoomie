@@ -2,8 +2,10 @@
 
 **Status:** Research plan, not an implementation commitment  
 **Version:** 1.0 · 2026-10-06  
-**Suggested repository location:** `docs/research/R00-external-projects-research-roadmap.md`  
+**Repository location:** `docs/research/ProjectVanilla-R00-external-projects-research-roadmap.md`  
 **Companion references:** `docs/DesktopRoomie-roadmap-v0.1.md`, `docs/DesktopRoomie-A00-A01-plan-v0.1.md`
+
+**Checkpoint reconciliation (2026-10-23):** A00 is closed and the native Rust/x11rb Openbox/X11/Picom host ratified. The targeted R00-M01 A00 study is completed; R00-M12 and later movement studies remain proposed just-in-time research, not completed tasks or implementation permission. See [STATUS](../STATUS.md) and [host ADR](../DesktopRoomie-A00-M03.4-host-architecture-decision.md).
 
 > **Purpose.** Build DesktopRoomie from the ground up, but learn from existing implementations before we commit to architectural choices. Research should be **just in time**, tied to the next real mission and its acceptance test. We are gathering evidence, not choosing somebody else's codebase as the foundation.
 
@@ -66,9 +68,10 @@ The labels below refer to the existing [canonical roadmap](https://github.com/zN
 
 | When in our roadmap | Main external references | Question we must answer *then* | Depth | R00 mission |
 |---|---|---|---|---|
-| **Now / before finishing A00 host decisions** | NekoAI, shimeji-rs | Are there robust Linux/X11 patterns for non-activating transparent windows, click-through, compositor quirks, geometry, and workspace control? | Targeted code reading | R00-M01 |
-| **A01-G1 layer/workspace/bounds; A01-W follow-up** | NekoAI, shimeji-rs, ShimeLinux | How are stacking, active windows, focus safety, per-window geometry, and window lifecycle represented? | Targeted deep dive | R00-M01/M03 |
+| **A00 host decisions — completed** | NekoAI, shimeji-rs | Original Linux/X11 host-pattern questions, resolved for the accepted target; revisit only for a specific new gap. | Completed targeted A00 study | R00-M01 |
+| **A01-G1 companion policies/bounds; A01-W follow-up** | NekoAI, shimeji-rs, ShimeLinux | What new host interactions are needed beyond the accepted layers, geometry, focus protection and recovery? | Just-in-time revisit | R00-M01/M03 |
 | **A01-W1.1 (after stable host and W1)** | Openbox/EWMH/X11 references, shimeji-rs as relevant | Can Vanilla remain between two selected managed application windows in z-order without focus theft, unbounded restacking, or interference with normal window actions? How do raise/focus, transient groups, workspace changes, and target disappearance affect it? | Targeted Openbox/source + live-host experiment, not A00 scope | R00-M03 revisit / A01-W1.1 feasibility |
+| **A01-G2.1 asset/runtime feasibility** | Official Spine 2D references and compatible Rust/native runtimes | What animation route supports the private export without publishing assets or replacing the accepted host? | Just-in-time feasibility | R00-M12 |
 | **A01-G2/G3 body animation, drag/drop, physics, idles** | shimeji-rs, Desktop Virtual Buddy; Mochi's action layer | How do animation anchors, pointer capture, movement cancellation, platforms, and interruptions stay consistent? | Targeted deep dive | R00-M02/M03 |
 | **A02-G1–G3 needs/clock/activity/persistence** | Companion Emergence, OpenCrayFish, Mochi | Which state variables and update/cooldown rules produce legible life without punitive idle needs or constant LLM calls? | Deep dive before A02 design | R00-M04 |
 | **A03-G1–G3 offline dialogue, voice, performance** | Open-LLM-VTuber, Mana, AIRI | How do audio queues, synthesis adapters, emotions, playback, interruption, and offline fallback interact? | Targeted | R00-M07 |
@@ -80,7 +83,7 @@ The labels below refer to the existing [canonical roadmap](https://github.com/zN
 | **A10/A11 phone life, notifications, dreams, social events** | Companion Emergence, AIRI, OpenCrayFish | What makes background activity feel earned rather than spammy or fabricated? | Targeted | R00-M10 |
 | **A12/A13 multi-character/public reusable release** | AIRI, Shimeji pack ecosystems, multi-agent research | How do character packs share an engine safely without shared-memory confusion, license trouble, or runaway complexity? | Later | R00-M11 |
 
-**Important timing:** We need not complete R00 before continuing A00/A01. `R00-M01` is the one study with immediate value; `R00-M02/M03` should land shortly before their first relevant body/window mission. The deep cognitive studies are deliberately deferred until A02–A05.
+**Important timing (reconciled):** A00 is complete and its targeted R00-M01 study recorded. R00-M12 is the proposed next A01 asset/runtime feasibility study; R00-M02/M03 remain just-in-time movement and window studies. Later cognitive research stays deferred. Research timing does not authorize coding.
 
 ---
 
@@ -89,7 +92,7 @@ The labels below refer to the existing [canonical roadmap](https://github.com/zN
 ### R00-M01 — NekoAI: practical Linux desktop-host engineering
 
 **Repository:** [nucket/NekoAI](https://github.com/nucket/NekoAI)  
-**Best time:** before finalizing remaining A00 decisions; revisit at **A01-G1**.  
+**Timing:** targeted A00 research completed on 2026-10-08; revisit at **A01-G1** only for a newly relevant question.  
 **Why study it:** A Rust/Tauri-based AI desktop pet, with Linux/X11 mentioned in its public project materials. It provides a useful counterexample to our current rendering/host choices.
 
 **Research questions**
@@ -101,10 +104,10 @@ The labels below refer to the existing [canonical roadmap](https://github.com/zN
 - Are state ownership and host/UI responsibilities cleanly separated or tightly coupled?
 
 **Inspect:** executable/entrypoint, window creation, platform adapters, event loop, input hit regions, window geometry helpers, failure paths, tests and known issues.  
-**Output:** a small **A00/A01 host-pattern comparison** against our proven X11/bspwm/Picom behavior.  
+**Output:** a small **A00/A01 host-pattern comparison** against our recorded Openbox/X11/Picom behavior.  
 **Do not automatically adopt:** Tauri or the project's GUI stack just because it uses Rust. The host technology remains an evidence-driven decision.
 
-**A00 targeted pass completed 2026-10-08:** the source-level Linux-host refresh and the remaining A00-G3 standards research are recorded in [studies/R00-M01-nekoai-linux-host-a00-g3.md](studies/R00-M01-nekoai-linux-host-a00-g3.md). The current disposition is to retain the native Rust + x11rb managed X11 host for A00/A01 unless real-host A00-G3 evidence contradicts it. Revisit NekoAI at A01-G1 only for newly relevant host/recovery behavior; do not redo the completed A00 comparison by default.
+**A00 targeted pass completed 2026-10-08:** the source-level Linux-host refresh and the remaining A00-G3 standards research are recorded in [studies/R00-M01-nekoai-linux-host-a00-g3.md](studies/R00-M01-nekoai-linux-host-a00-g3.md). The later owner-ratified A00-M03.4 decision confirms the native Rust + x11rb managed X11 host for the recorded Openbox/Picom target. A01-specific integration remains separate. Revisit NekoAI at A01-G1 only for newly relevant host/recovery behavior; do not redo the completed A00 comparison by default.
 
 ### R00-M02 — shimeji-rs: clean Rust/X11 movement and sprite mechanics
 
@@ -293,9 +296,9 @@ The labels below refer to the existing [canonical roadmap](https://github.com/zN
 
 ## 5. Suggested execution order (do not front-load every study)
 
-### Immediate, lightweight work: current A00 → early A01
+### Immediate, lightweight work: A00 closed → early A01
 
-**Priority 1:** the targeted A00 pass of `R00-M01` is complete; use its recorded A00-G3 findings while finishing host selection, and revisit only if real-host evidence exposes a missing failure mode. **Priority 2:** immediately after A00-G3, run `R00-M12` before A01-G2.1 so the new private Spine 2D export is evaluated before committing to a custom frame-sheet pipeline. **Priority 3:** run `R00-M02` and `R00-M03` when A01 movement/animation/physics implementation is about to start. A *brief* look at Mochi's event-to-action flow may be useful when we introduce A01's replaceable idle scheduler, but the full brain/Spine *cognition* study (`R00-M05`) still waits for A04.
+**Completed A00 research:** R00-M01 is recorded and the host is now ratified. **Proposed next study:** R00-M12 before A01-G2.1, evaluating private Spine 2D export feasibility before a frame-sheet decision. **Later A01 studies:** R00-M02/M03 when movement, physics or further window mechanics become relevant. A brief look at Mochi's event-to-action flow may inform an idle scheduler; full cognition research R00-M05 remains deferred until A04.
 
 **Checkpoint:** a one-page note that answers “what implementation issue do we now understand better?” and records whether the lesson requires a code change. A note with no recommended change is a perfectly valid result.
 

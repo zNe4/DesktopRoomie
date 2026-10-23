@@ -2,6 +2,8 @@
 
 Version 0.1 · 2026-10-04 · Proposed, living roadmap
 
+**Checkpoint reconciliation (2026-10-23):** A00 is complete and owner-approved. The established host is Rust/x11rb managed X11 on the recorded Archcraft/Openbox 3.6.1/Picom v13 environment, with the limitations in [STATUS](STATUS.md) and the [ratified host ADR](DesktopRoomie-A00-M03.4-host-architecture-decision.md). The existing implementation is still a technical probe, not an animated companion. Earlier bspwm/host-selection wording below is historical; the original adventure IDs and product goals remain intact. A01 implementation requires separate authorization.
+
 Repository: [zNe4/DesktopRoomie](https://github.com/zNe4/DesktopRoomie)
 
 Source: *Project Vanilla — All Ideas / Design Inventory v0.1*, supplied for this planning pass. The repository was inspected on 2026-10-04; it contained the initial `README.md`. The user reports that TTS training is underway. Other implementation status has not been audited here.
@@ -52,7 +54,7 @@ The numbering is the suggested order for one programmer. The dependency column n
 
 | ID | Adventure | Product you can run at the end | Essential foundation |
 | --- | --- | --- | --- |
-| A01 | First visit | A small interactive desktop body | None |
+| A01 | First visit | A small interactive desktop companion | Accepted A00 desktop-host foundation |
 | A02 | A daily life | A persistent offline companion with needs and activities | A01 |
 | A03 | A familiar voice | An expressive companion using local speech and reactions | A02; a small usable content pack |
 | A04 | A body with a mind | Sleep, limited perception, reflexes, and belief revision | A02 |
@@ -83,13 +85,13 @@ Useful stopping points:
 
 **Connected goals**
 
-- **A01-G1: A viable desktop host.** Establish the smallest build/run path on the actual Arch Linux/bspwm setup. Test transparency, stacking, pointer handling, screen boundaries, and clean shutdown before choosing a rendering/window stack for broader use.
+- **A01-G1: A reliable desktop home.** Reuse the accepted Rust/x11rb managed Openbox/X11 host. Extend it with companion-level controls, body sizing/bounds, presentation and workspace policy, and settings, without repeating the proven transparency, stacking, focus-safe pointer input and recovery work.
 - **A01-G2: A readable body.** Render a few animations through semantic actions such as idle, walk, sit, and sleep. Define only the animation metadata currently needed: timing, loop behavior, anchors, direction, hit regions, and interruption/transition rules.
 - **A01-G3: A physical interaction loop.** Add hover/gaze, click, grab, hold, drag, and drop/fall behavior. Add a simple pet/poke response and a developer view of the current action. Save minimal settings and position.
 
 **Finish scene:** Launch, walk, pick up, move, drop, pet, quit, and reopen. The body stays usable and respects the current screen geometry. No AI service is required.
 
-**Choose here:** window/rendering approach and the first asset format, based on a small executable comparison if needed. Use placeholder assets if the private chibi pack is not ready. This adventure establishes no advanced cognition or full physics engine.
+**Choose here:** a character animation/rendering path and asset contract compatible with the accepted A00 host. Evaluate the private Spine export before committing to custom frame sheets; use publishable synthetic placeholders for public tests. The window host itself was selected in A00. This adventure establishes no advanced cognition or full physics engine.
 
 ### A02 — A daily life
 
@@ -330,7 +332,7 @@ The following is a responsibility proposal, not a framework selection.
 | State, clock, events, behavior, cognition, permissions, persistence | Rust as the meaningful portable core | Platform-neutral rules and explicit ownership |
 | Corpus processing, analysis, review/export, experiment orchestration, batch content | Python | Reproducible inputs/outputs and provenance |
 | TTS and other model execution | Python when the chosen ecosystem benefits from it | Replaceable requests/results; no ownership of character state |
-| Desktop host and renderer | Decide during A01; use Rust where suitable | Semantic actions/state views, independent of frame files |
+| Desktop host and renderer | A00 ratified Rust/x11rb managed X11; decide character animation/rendering compatibility in A01 | Semantic actions/state views, independent of private assets |
 | Android host/UI | Decide during A08; Kotlin/Java or another justified approach | Native lifecycle responsibilities; shared core rules |
 | Debug/review interfaces | Choose the smallest tool that serves the workflow | Developer visibility without duplicating simulation logic |
 | Content packs and contracts | Versioned declarative data; format chosen when needed | Data does not require rebuilding the engine for every new item |
@@ -345,7 +347,8 @@ A possible repository organization, created gradually, is `docs/`, `core/`, `des
 
 | Decision | When it becomes necessary | Evidence or small experiment |
 | --- | --- | --- |
-| Desktop rendering, input, stacking | A01 | Actual compositor/window-manager behavior and an interactive prototype |
+| Desktop host, input, global layers and recovery | A00 — accepted 2026-10-23 | Openbox/X11/Picom evidence and documented limitations |
+| Character animation, rendering, dynamic sizing and presentation policy | A01 | Safe integration with the accepted host and native companion acceptance |
 | Needs, mood variables, activity selection | A02; retune A05 | Short play sessions, understandable choices, no tedious care loop |
 | Persistence and elapsed-time semantics | A02 | Restart, suspend, long absence, interrupted save |
 | Spine complexity and observation uncertainty | A04 | Sleeping-lift, startle, stale-observation, and clock-correction scenes |
@@ -372,7 +375,7 @@ Each mission brief should state the observable result, relevant current code, al
 For example, the first planning session after this roadmap would develop **A01**, in this order:
 
 1. Describe the desktop behavior and constraints on the user's actual machine.
-2. Run the smallest rendering/input experiment needed to choose the host approach.
+2. Research the character animation/asset runtime that can use the accepted host; do not redo A00 host selection.
 3. Define the first semantic animation and pointer interaction slice.
 4. Prepare the initial implementation mission and its visible acceptance check.
 
@@ -392,7 +395,7 @@ No final asset collection, massive dialogue corpus, chosen cloud provider, or pe
 
 ## 10. Coverage of the original inventory
 
-Every numbered source section has a home below. A mapping preserves scope; it does not claim the idea is implemented or mandate every example. Alternatives and historical experiments remain in their supporting track or decision point.
+Every numbered source section has a home below. A mapping preserves scope; it does not claim the idea is implemented or mandate every example. Alternatives and historical experiments remain in their supporting track or decision point. The inventory's Arch/bspwm label is historical; the accepted A00 target is Openbox/X11/Picom.
 
 | Source § | Idea | Roadmap home |
 | --- | --- | --- |
@@ -478,4 +481,4 @@ Keep the inventory as the idea record and this roadmap as the current route. As 
 
 Keep adventure and goal IDs stable once work starts. A small active-adventure document can hold implementation detail without inflating this roadmap. Maintain a brief progress record containing the working checkpoint, completed goals, active mission, known limitations, and next decision.
 
-The next concrete step is to design A01 against the user's machine and prepare its first programming mission. Its success is a character on the desktop that can already be played with.
+With A00 accepted, first reconcile inherited documentation, then conduct targeted A01 research, and only afterward prepare a new approved A01 implementation roadmap and first Codex mission. The eventual success scene remains a character on the desktop that can already be played with.
