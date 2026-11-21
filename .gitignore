@@ -1,4 +1,6 @@
 /target
 **/target/
-.private-reviews
-.github
+
+# Private development and review artifacts
+/.private-reviews/
+/codex-session-reseach-PV.md
