@@ -10,7 +10,7 @@ Parent: DesktopRoomie roadmap v0.1. This document expands the first adventure an
 
 **A00 — Prove the desktop host:** a deliberately technical demonstration that resolves the platform risks.
 
-**A01 — First visit:** a recognizable, pleasant desktop Vanilla who can be moved, interact physically, perform a small repertoire, and coexist with normal work. A01 must feel like a companion even though its decision-making remains simple.
+**A01 — First visit:** a recognizable, pleasant desktop companion, first Vanilla (Spine 2D) and then Hina (GLB/glTF 3D), selectable one at a time. Both can be moved, interact physically, perform a small repertoire and coexist with normal work. A01 must feel like a companion even though its decision-making remains simple. This 2026-11-21 scope revision preserves A00 acceptance and the existing renderer checkpoints; it is a future plan, not execution authorization.
 
 The accepted target is **Archcraft/Arch Linux with Openbox 3.6.1 on X11 and Picom v13**, as documented by A00. Display scaling was not explicitly tested; arbitrary scaling, mixed DPI, monitor hotplug, other window managers and Wayland are not validated. bspwm and KDE remain separate potential compatibility work.
 
@@ -101,7 +101,7 @@ A00 ends when the capability matrix is resolved sufficiently to choose the A01 h
 
 ## 4. A01 — First visit
 
-**Runnable result:** a privately loaded chibi Vanilla who can be picked up, held, released, walk, sit, rest, react, and remain comfortably present while the user works.
+**Runnable result:** a privately loaded chibi Vanilla and Hina, one active at a time, who can be picked up, held, released, walk, sit/rest, react and remain comfortably present while the user works. Hina enters the sequence only after the usable Vanilla baseline. The two representations share movement, interaction, host and control logic; no dialogue, TTS, LLM, corpus or multiple active bodies are required.
 
 The parent roadmap's G1/G2/G3 labels are retained. Each minigoal leaves the current executable runnable. Visual and interaction feedback can trigger small revisions before proceeding.
 
@@ -113,7 +113,7 @@ The parent roadmap's G1/G2/G3 labels are retained. Each minigoal leaves the curr
 | A01-G1.2 — A bounded space | Define the selected display's usable area, three provisional sizes, body bounds, and user-defined floor. | Position and size changes never place part of the visible body outside the valid area. A floor too high to fit her is rejected or safely constrained. |
 | A01-G1.3 — Layer ownership | Implement the passing foreground/background capabilities, forced-user policy, character-request policy, and fullscreen behavior. | A scripted body request changes layers when allowed; a forced user choice blocks it. Keyboard focus remains unchanged. |
 | A01-G1.4 — Workspace placement | Add manual send-to-workspace and a recovery command that can bring the body to the current workspace deliberately. | The user can locate and move the same instance without an involuntary workspace switch. |
-| A01-G1.5 — Remember preferences | Persist size, floor, chosen movement mode, layer policy, workspace preference, and safe position. Validate stored values and recover from missing/invalid settings. | Restart restores valid preferences. A removed workspace or changed display geometry results in safe placement rather than an unreachable sprite. |
+| A01-G1.5 — Remember preferences | Persist size, floor, chosen movement mode, layer policy, workspace preference, and safe position. Add active-pack selection through G2.7. Validate stored values and recover from missing/invalid settings. | Restart restores valid preferences. A removed workspace or changed display geometry results in safe placement rather than an unreachable body. |
 
 **Order:** G1.1 → G1.2 → G1.3/G1.4 → G1.5. An A00 fallback applies explicitly to the corresponding minigoal.
 
@@ -123,18 +123,21 @@ The parent roadmap's G1/G2/G3 labels are retained. Each minigoal leaves the curr
 
 | Minigoal | Implementation outcome | Completion check |
 | --- | --- | --- |
-| A01-G2.1 — Visual and asset contract | Review the client's uploaded references; fix a small appearance sheet and consistent frame canvas/anchors. Define semantic animation names and necessary timing, loop, bounds, and interruption metadata. | One test animation loads through the same format intended for the private pack. Asset filenames are not hardcoded throughout behavior code. |
-| A01-G2.2 — First visual set | Produce and inspect a high-resolution master set for idle/look, walk, sit/rest, and a sleep pose. Generate consistent runtime sizes using a repeatable command-line process when those assets exist. | No visible foot sliding from anchor changes, clipped ears/tail, frame jitter, or unreadable result at the chosen sizes. |
-| A01-G2.3 — Interaction performances | Add held, falling, landing, and touch reactions as G3 needs them. Share suitable frames or use simple procedural motion when it looks good; every action does not require a large bespoke sheet. | Movement and animation agree in each interaction; transitions can be interrupted without broken poses or snapping. |
-| A01-G2.4 — Pack quality | Check the complete repertoire at every preset and keep private Vanilla assets separate from public code/sample assets. | The private pack can be loaded intentionally; a suitable test pack can still demonstrate the application independently. |
+| A01-G2.1 — Visual and asset contract | Reuse R00-M12 and the scoped R00-M13 offscreen renderer results; define a minimal backend-neutral presentation contract: semantic actions/capabilities, time, orientation, frames and alpha, dimensions, anchors, hit regions, completion and cancellation. Keep the procedural body as a public fixture. | The first animated fixture loads without hardcoded character names in host/behavior; frame and hit data have explicit identity and coordinate contracts. |
+| A01-G2.2 — First visual set | Prove Vanilla's existing Spine export offscreen, then present it through the accepted host. Map idle/look, walk, sit/rest and sleep to supported clips or reviewed fallbacks. | Correct alpha, scale and anchors, no clipped extremities or frame jitter; animated hit silhouette and focus-safe input demonstrated. |
+| A01-G2.3 — Interaction performances | Add held, falling, landing and touch reactions as G3 needs them. Use existing clips or simple reviewed procedural fallbacks. | Movement and animation agree; transitions can be interrupted without broken poses or snapping. |
+| A01-G2.4 — Pack quality | Check Vanilla's repertoire at each preset and keep private assets separate from code and sample assets. | Usable Vanilla baseline; suitable public fixtures remain independently runnable. |
+| A01-G2.5 — Second representation feasibility | After the usable Vanilla baseline, audit Hina's pinned GLB files and applicable rights; evaluate geometry, skinning, clips, materials, halo, camera, anchors and input coverage. Identify missing required assets and compare renderer options. | Inventory and bounded 3D implementation decision with a redistributable test fixture; no assumed animation coverage. |
+| A01-G2.6 — Second animated body | Prove 3D animation and rendering independently (depth, skinning, materials, transparency and orthographic framing as required), then load Hina through the common presentation contract. Extend that contract only for demonstrated gaps. | Hina works on the same X11 host with the same desktop movement, action and input code. Native animation, hit regions, alpha and resource use verified. |
+| A01-G2.7 — Character selection | Add explicit active-pack selection and safe replacement in the running owner. Validate candidate resources/geometry before activation; coordinate gesture cancellation, frame/input region, bounds and cleanup; persist valid selection. | Vanilla → Hina → Vanilla without an application restart or focus/workspace theft; failure preserves or safely restores a usable body; repeated switches and restart are tested. |
 
-**Dependencies:** G2.1 uses the host proven by A00 and can begin alongside G1. Runtime scaling needs G1.2. G2.3 is interleaved with G3 interaction work.
+**Dependencies:** finish separately authorized R00-M13 renderer increments needed for Vanilla; then G2.1 → G2.2 → G2.3/G3 interaction slices → G2.4 and the usable Vanilla checkpoint → G2.5 → G2.6 → G2.7 → G3.7. Runtime sizing needs G1.2. No Hina implementation or corpus task runs in parallel. The exact mission IDs and library choices are assigned only when each checkpoint is ready.
 
-References are required before producing final artwork. The existing ChatGPT pet may guide the visual discussion, but a new desktop-specific sheet is expected. A static placeholder can unblock code; it cannot satisfy the final companion presentation gate.
+The existing private Vanilla Spine export (.skel, .atlas, .png) is the initial asset candidate; evaluate its version, runtime/license compatibility and authored clips rather than assuming a frame-sheet pipeline. Hina's candidate models are in [BlueArchiveModels](https://github.com/lihaohong6/BlueArchiveModels), pinned for the initial filename inventory at `06bb8e91b0b93ce9f8bf26c80ee94046fd1cb734`: `Hina.glb`, `Hina (Swimsuit).glb`, `Hina (Dress).glb`. Actual contents and rights are not yet verified. Start with standard Hina; alternate appearances and any permitted extraction from the owner's Steam installation are follow-ups only when an asset gap warrants them. Do not modify the game, bypass access controls or publish its assets.
 
-Note: A private official chibi Vanilla Spine 2D export is now available (.skel, .atlas, .png) with multiple existing animations. Before designing a custom frame-sheet pipeline, A01-G2.1 should evaluate this asset's Spine runtime/version requirements and enumerate its usable animations, skins/attachments, origin/scale, and bounds. The copyrighted asset files remain private and must not be committed to the public DesktopRoomie repository.
+**Common boundary:** the runtime owns desktop-space position, velocity, action and interaction policy; each backend evaluates its own animation and provides visual output plus matching bounds/anchors and hit information. Keep the surface alpha convention and transport explicit (wgpu readback versus X11 pixel format). Define native SHAPE input regions from the committed presentation, excluding noninteractive effects where appropriate; preserve pointer grabs, cancellation and input fences. No requirement for one shader, a common skeleton, a full general-purpose 3D engine or a new window system. The common contract is tested before and refined by the second real backend. Spine 2D is distinct from A04's logical reflex Spine.
 
-**Checkpoint:** recognizable Vanilla with a small, coherent animation vocabulary.
+**Checkpoint:** usable Vanilla first, then usable Hina through the same contract, with a validated selector and public fixtures for both paths.
 
 ### A01-G3 — Physical interaction and a little independent life
 
@@ -146,9 +149,9 @@ Note: A private official chibi Vanilla Spine 2D export is now available (.skel, 
 | A01-G3.4 — Plane mode | Offer an optional user-selected bounded 2D plane without gravity, using the same movement executor. It is a desktop-plane illusion, not 3D perspective or real-window navigation. | She can remain where placed and move toward a valid 2D destination. Returning to ground mode resolves her position consistently and keeps her within bounds. |
 | A01-G3.5 — Deliberate touch | Connect the click/menu gestures to poke and pet performances, with hover/gaze where assets permit. | Petting and dragging cannot accidentally start each other; the visual response is immediate and coherent. |
 | A01-G3.6 — A small idle routine | Add a replaceable, simple scheduler for quiet idles, brief walks, looking, sitting, and a sleep pose. Manual actions and pause override it. | Let her run without developer controls. She varies her behavior and responds to interaction without constantly wandering or restarting actions. |
-| A01-G3.7 — Companion acceptance | Tune transitions and defaults during ordinary desktop use; exercise controls, layer policy, workspace placement, settings recovery, and display bounds together. Record resource use on the actual machine. | Complete the acceptance session below and resolve disruptive defects. |
+| A01-G3.7 — Cross-backend companion acceptance | Following G2.7, tune transitions and defaults; exercise shared controls, layer policy, workspace placement, settings recovery, display bounds, input safety and performance on both visual packs. | Complete the acceptance session below on Vanilla and Hina and resolve disruptive defects. |
 
-**Order:** G3.1 → G3.2 → G3.3 → G3.4/G3.5 → G3.6 → G3.7. G3 requires G1 controls/bounds and the corresponding G2 assets. Early interactions can use provisional poses while final art is prepared.
+**Order:** G3.1 → G3.2 → G3.3 → G3.4/G3.5 → G3.6 on Vanilla; then G2.5–G2.7; then G3.7 on both. G3 requires G1 controls/bounds and the corresponding G2 assets. Early interactions can use provisional poses. The same G3 code owns gestures, moving/gravity, floor and idle scheduling for both renderers; capability-aware mappings may differ, but behavior must not branch on character names or model formats.
 
 Plane mode is a proposed small extension because the client asked for it and it reuses movement capabilities. If it proves larger than that, it becomes a named follow-up minigoal rather than delaying the core interaction loop indefinitely.
 
@@ -158,14 +161,18 @@ The sleep pose here is a body action. Needs-driven sleep, reduced senses, fatigu
 
 | Checkpoint | Included work | What the client can try |
 | --- | --- | --- |
-| C0 | A00 | A technical body demonstrating verified platform capabilities |
-| C1 | G1.1–G1.2; G2.1 | A visible body with controls, sizes, and valid space |
-| C2 | G3.1–G3.2; first G2.2/G2.3 art | Pick up, hold, fall, and land on a chosen floor |
-| C3 | G3.3/G3.5; G2.2/G2.3 | Direct movement, sit/rest, pet, and poke |
-| C4 | G1.3–G1.5; G3.4 if retained | Layers, workspaces, plane mode, and restored preferences |
-| C5 | G2.4; G3.6–G3.7 | The A01 companion release |
+| C0 | A00 (accepted) | A technical body demonstrating verified platform capabilities |
+| Renderer prerequisite | R00-M13, remaining scoped increments | Independent 2D rendering evidence; no new host integration implied |
+| C1 | G1.1–G1.2; G2.1; initial G2.2 | First visible Vanilla slice with controls, size, anchors and valid input coverage |
+| C2 | G3.1–G3.2; G2.2/G2.3 | Pick up, hold, fall and land with Vanilla |
+| C3 | G3.3/G3.5; G2.2/G2.3 | Direct movement, sit/rest, pet and poke with Vanilla |
+| C4 | G1.3–G1.5; G3.4 if retained | Layers, workspaces, plane mode and restored preferences |
+| C5 | G2.4; G3.6 | Usable Vanilla baseline and repeatable host/input acceptance subset |
+| C6 | G2.5 then G2.6 independent 3D proof | Audited Hina pack and animated 3D prototype (offscreen) |
+| C7 | Remaining G2.6; G2.7 | Hina on the same host; safely switch between Vanilla and Hina |
+| C8 | G3.7 | A01 companion release: both packs pass the shared acceptance gates |
 
-This sequence deliberately interleaves the three parent goals. It prevents finishing a large infrastructure goal before the client can try a satisfying interaction. Each checkpoint receives a bounded programming mission or a short sequence of missions; exact files, libraries, and commands are determined from the repository when that checkpoint starts.
+These C labels are local to the A01 delivery sequence, not R00-M13 renderer checkpoints. C0 is historical; C1–C8 are future proposed checkpoints. Work through one checkpoint at a time. Within a checkpoint, interleave only the connected host/body/interaction slices necessary for the runnable result. C5 is now the Vanilla baseline, not A01 completion; C6–C8 are sequential additions. Each checkpoint receives a bounded approved mission or sequence of missions. Exact files, libraries, commands and acceptance thresholds are selected from evidence when that checkpoint starts.
 
 ## 6. A01 acceptance session
 
@@ -179,8 +186,10 @@ This sequence deliberately interleaves the three parent goals. It prevents finis
 8. Move her to another workspace and locate her deliberately. Test fullscreen behavior and return to ordinary windows.
 9. Quit/relaunch. Check saved preferences and safe restoration under an altered display/workspace setup.
 10. Leave her running during a normal work session. Judge whether she feels pleasantly present. Review observed idle/animation resource use and fix noticeable interference before calling A01 finished.
+11. Repeat the common interaction checks with each visual pack. Verify looping, non-loop completion, cancellation, facing and anchors; test moving silhouettes, clicks on body/transparent gaps, hover and semantic touch regions. Optional authored clips or gaze require an explicit capability/fallback disposition; core walk, pickup, drop and touch must work.
+12. Switch Vanilla → Hina → Vanilla repeatedly through the selector. Confirm one active managed owner, stable focus, workspace, layer and feasible placement, correct new dimensions, no stuck gestures or obsolete hit regions, and bounded resource use. Test switching during an active gesture (safe cancellation), failed candidate loading, hidden/recovered body behavior and saved selection on restart. If the old anchor cannot fit, constrain it safely under the shared bounds policy.
 
-Use a short repeatable smoke check at each checkpoint and the combined session for release. Focus, input release, bounds, and recovery are correctness gates; visual charm and pacing need the client's direct evaluation. Numeric performance targets are set from A00 measurements before optimizing speculatively.
+Use a short repeatable smoke check at each checkpoint and the combined session for release. Focus, input release, animated click-through, bounds, switching and recovery are correctness gates; visual charm and pacing need the client's direct evaluation. In particular, image and input region publication must have a documented consistency/failure policy: X11 requests are not presumed atomic. Measure frame time, readback/upload and SHAPE cost, input latency, CPU/GPU/RAM/VRAM and repeated-switch resource use on the actual supported host; set quantitative thresholds before the relevant native gate. No AI or dialogue service is needed.
 
 ## 7. Window interaction: preserved follow-up, not forgotten scope
 

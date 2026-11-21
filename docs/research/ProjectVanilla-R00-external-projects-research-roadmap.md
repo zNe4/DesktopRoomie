@@ -5,7 +5,9 @@
 **Repository location:** `docs/research/ProjectVanilla-R00-external-projects-research-roadmap.md`  
 **Companion references:** `docs/DesktopRoomie-roadmap-v0.1.md`, `docs/DesktopRoomie-A00-A01-plan-v0.1.md`
 
-**Checkpoint reconciliation (2026-10-23):** A00 is closed and the native Rust/x11rb Openbox/X11/Picom host ratified. The targeted R00-M01 A00 study is completed; R00-M12 and later movement studies remain proposed just-in-time research, not completed tasks or implementation permission. See [STATUS](../STATUS.md) and [host ADR](../DesktopRoomie-A00-M03.4-host-architecture-decision.md).
+**Checkpoint reconciliation (2026-10-23):** A00 is closed and the native Rust/x11rb Openbox/X11/Picom host ratified. The targeted R00-M01 A00 study is completed; see [STATUS](../STATUS.md) and [host ADR](../DesktopRoomie-A00-M03.4-host-architecture-decision.md) for evidence.
+
+**Sequencing update (2026-11-21):** R00-M13 C2-C1 is owner-accepted as documented in STATUS. Continue its remaining scoped prerequisites for the first Vanilla presentation. The A01-G2.5 Hina GLB study is scheduled only after the usable Vanilla baseline (A01 C5); its R00 mission ID will be assigned when authorized. Research remains just-in-time, not implementation permission.
 
 > **Purpose.** Build DesktopRoomie from the ground up, but learn from existing implementations before we commit to architectural choices. Research should be **just in time**, tied to the next real mission and its acceptance test. We are gathering evidence, not choosing somebody else's codebase as the foundation.
 
@@ -71,7 +73,8 @@ The labels below refer to the existing [canonical roadmap](https://github.com/zN
 | **A00 host decisions — completed** | NekoAI, shimeji-rs | Original Linux/X11 host-pattern questions, resolved for the accepted target; revisit only for a specific new gap. | Completed targeted A00 study | R00-M01 |
 | **A01-G1 companion policies/bounds; A01-W follow-up** | NekoAI, shimeji-rs, ShimeLinux | What new host interactions are needed beyond the accepted layers, geometry, focus protection and recovery? | Just-in-time revisit | R00-M01/M03 |
 | **A01-W1.1 (after stable host and W1)** | Openbox/EWMH/X11 references, shimeji-rs as relevant | Can Vanilla remain between two selected managed application windows in z-order without focus theft, unbounded restacking, or interference with normal window actions? How do raise/focus, transient groups, workspace changes, and target disappearance affect it? | Targeted Openbox/source + live-host experiment, not A00 scope | R00-M03 revisit / A01-W1.1 feasibility |
-| **A01-G2.1 asset/runtime feasibility** | Official Spine 2D references and compatible Rust/native runtimes | What animation route supports the private export without publishing assets or replacing the accepted host? | Just-in-time feasibility | R00-M12 |
+| **A01-G2.1 asset/runtime feasibility** | Official Spine 2D references and compatible Rust/native runtimes; existing R00-M13 work | What animation route and common presentation seam support the private export without publishing assets or replacing the accepted host? | Just-in-time feasibility | R00-M12/M13 |
+| **A01-G2.5 second representation, after Vanilla C5** | [BlueArchiveModels](https://github.com/lihaohong6/BlueArchiveModels), official glTF spec, compatible Rust/wgpu animation/rendering paths | Which Hina assets and clips are usable, what material/skin/animation support is required, and can the same presentation/input contract be used? | Sequential feasibility before G2.6 | R00 ID assigned at authorization |
 | **A01-G2/G3 body animation, drag/drop, physics, idles** | shimeji-rs, Desktop Virtual Buddy; Mochi's action layer | How do animation anchors, pointer capture, movement cancellation, platforms, and interruptions stay consistent? | Targeted deep dive | R00-M02/M03 |
 | **A02-G1–G3 needs/clock/activity/persistence** | Companion Emergence, OpenCrayFish, Mochi | Which state variables and update/cooldown rules produce legible life without punitive idle needs or constant LLM calls? | Deep dive before A02 design | R00-M04 |
 | **A03-G1–G3 offline dialogue, voice, performance** | Open-LLM-VTuber, Mana, AIRI | How do audio queues, synthesis adapters, emotions, playback, interruption, and offline fallback interact? | Targeted | R00-M07 |
@@ -83,7 +86,7 @@ The labels below refer to the existing [canonical roadmap](https://github.com/zN
 | **A10/A11 phone life, notifications, dreams, social events** | Companion Emergence, AIRI, OpenCrayFish | What makes background activity feel earned rather than spammy or fabricated? | Targeted | R00-M10 |
 | **A12/A13 multi-character/public reusable release** | AIRI, Shimeji pack ecosystems, multi-agent research | How do character packs share an engine safely without shared-memory confusion, license trouble, or runaway complexity? | Later | R00-M11 |
 
-**Important timing (reconciled):** A00 is complete and its targeted R00-M01 study recorded. R00-M12 is the proposed next A01 asset/runtime feasibility study; R00-M02/M03 remain just-in-time movement and window studies. Later cognitive research stays deferred. Research timing does not authorize coding.
+**Important timing (reconciled):** A00 is complete and its targeted R00-M01 study recorded. Reuse R00-M12 findings where available and continue the existing R00-M13 renderer sequence via separate assignments. R00-M02/M03 remain just-in-time movement and window studies. Audit the Hina GLB only at A01-G2.5, after C5 (Vanilla), not as a parallel project. Later cognitive research stays deferred. Research timing does not authorize coding.
 
 ---
 
@@ -292,15 +295,31 @@ The labels below refer to the existing [canonical roadmap](https://github.com/zN
 **Output:** a **Spine feasibility ADR + private animation inventory + public runtime smoke-test plan**, ending in an explicit choice among direct skeletal runtime, private offline bake, or deferral.  
 **Do not automatically adopt:** an unofficial reverse-engineered runtime, redistribution of official Vanilla assets, a renderer/framework rewrite merely to host Spine, or a frame extraction pipeline before the authored skeletal option is evaluated.
 
+### A01-G2.5 research gate — Hina GLB and second presentation backend (R00 ID to be assigned)
+
+**Best time:** after A01 C5 (usable Vanilla with the common presentation and interaction contract), before G2.6. This is an ordinary sequential A01 research mission.
+
+**Input:** [BlueArchiveModels](https://github.com/lihaohong6/BlueArchiveModels) at `06bb8e91b0b93ce9f8bf26c80ee94046fd1cb734` contains three candidate Hina GLBs by filename; their binary contents and use rights have not yet been verified. Start with `Hina.glb` and audit alternate variants only as useful. Inspect permitted local copies and official [glTF 2.0 specification](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html). Inspect the owner's Steam resources only if necessary and permitted, without modifying the game or bypassing access restrictions.
+
+**Questions:** Which nodes, meshes, skin weights, joints, inverse bind matrices, clip channels/durations/interpolations, morph targets, materials, images, extensions and effects are present? Which minimum semantic actions are supported or need a legitimate fallback? Do camera/projection, scale/ground anchors, root motion, alpha/depth/material passes, occlusion and hit regions fit the shared contract? Is the existing wgpu path appropriate, or is another scoped integration justified by evidence? What public synthetic fixture proves the same features without proprietary assets? What native performance and failure checks are necessary?
+
+**Output:** pinned private inventory (counts and metadata, no game assets in Git), reviewed capability/fallback matrix, minimal 3D feasibility decision, synthetic offscreen validation plan, and native integration/switching acceptance criteria. If required assets or permission are missing, report a blocker and seek an explicit scope decision; do not declare the Hina gate passed on a placeholder alone.
+
+**Excluded:** general 3D engine, full Unity reimplementation, corpus scraping, voice cloning, intelligence, alternate-outfit parity, multiple simultaneous bodies, and unsolicited implementation. Applicable asset and runtime rights must be checked independently of local/private storage.
+
 ---
 
 ## 5. Suggested execution order (do not front-load every study)
 
 ### Immediate, lightweight work: A00 closed → early A01
 
-**Completed A00 research:** R00-M01 is recorded and the host is now ratified. **Proposed next study:** R00-M12 before A01-G2.1, evaluating private Spine 2D export feasibility before a frame-sheet decision. **Later A01 studies:** R00-M02/M03 when movement, physics or further window mechanics become relevant. A brief look at Mochi's event-to-action flow may inform an idle scheduler; full cognition research R00-M05 remains deferred until A04.
+**Completed A00 research:** R00-M01 is recorded and the host is now ratified. **Current renderer sequence:** use the documented R00-M13 C2-C1 checkpoint and continue the next separately authorized prerequisite; reconcile R00-M12 asset/runtime findings before the first Vanilla integration. **Later A01 studies:** R00-M02/M03 when movement, physics or further window mechanics become relevant. A brief look at Mochi's event-to-action flow may inform an idle scheduler; full cognition research R00-M05 remains deferred until A04.
 
 **Checkpoint:** a one-page note that answers “what implementation issue do we now understand better?” and records whether the lesson requires a code change. A note with no recommended change is a perfectly valid result.
+
+### After usable Vanilla (A01 C5), before the second renderer
+
+Carry out the A01-G2.5 Hina GLB study above; then the separately authorized G2.6 3D offscreen and integration missions and G2.7 switching work. Close A01 only after the shared native acceptance (C8). No parallel Hina research/coding track or corpus prerequisite.
 
 ### Just before A02
 
@@ -436,4 +455,4 @@ The following repository identities and their README-level scope were checked on
 6. Re-run the relevant study if a later bug exposes an unexamined failure mode or the external project materially changes.
 7. Keep the playable companion advancing; external research is a tool, not a new multi-month dependency.
 
-**First practical research trigger:** complete `R00-M01` for Linux/X11 host behavior as the remaining A00/A01 platform choices arise. Deep work on Mochi's Spine/brain boundary should occur before **A04**, not before the first playable desktop body exists.
+**Next practical triggers:** the separately authorized continuation of R00-M13, the first usable Vanilla presentation, then the A01-G2.5 Hina feasibility study. A00 host selection is closed. Deep work on Mochi's logical Spine/brain boundary should occur before **A04**, not before the first playable desktop body exists.

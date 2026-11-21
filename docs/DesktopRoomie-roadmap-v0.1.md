@@ -1,6 +1,8 @@
 # DesktopRoomie — A roadmap toward Project Vanilla
 
-Version 0.1 · 2026-10-04 · Proposed, living roadmap
+Version 0.1 · 2026-10-04 · Proposed, living roadmap (presentation sequencing revised 2026-11-21)
+
+**Presentation scope revision (2026-11-21):** A01 now targets one active, interchangeable character with two private visual packs: Vanilla (Spine 2D) first, Hina (glTF 3D) second. Complete the existing R00-M13 offscreen-renderer work in its approved increments; the C2-C1 acceptance is recorded in [STATUS](STATUS.md). The second renderer is a sequential A01 validation step, not a parallel project. This revision changes future goals, not accepted evidence or implementation authority.
 
 **Checkpoint reconciliation (2026-10-23):** A00 is complete and owner-approved. The established host is Rust/x11rb managed X11 on the recorded Archcraft/Openbox 3.6.1/Picom v13 environment, with the limitations in [STATUS](STATUS.md) and the [ratified host ADR](DesktopRoomie-A00-M03.4-host-architecture-decision.md). The existing implementation is still a technical probe, not an animated companion. Earlier bspwm/host-selection wording below is historical; the original adventure IDs and product goals remain intact. A01 implementation requires separate authorization.
 
@@ -16,7 +18,7 @@ Build a persistent companion whose present behavior makes sense because of what 
 
 **DesktopRoomie** is the working name for the reusable software. **Project Vanilla** is its first private character implementation. These are two views of the same development effort, not two separate products we must build simultaneously.
 
-The first destination is modest: a small companion living on the Arch Linux desktop. The larger destination is one character identity, with multiple bodies and interfaces, living in a persistent world. The extended destination includes her own fictional phone, pictures, social events, dreams, and eventually a shared household with other characters.
+The first destination is modest: one small companion living on the Arch Linux desktop, selectable between two visual implementations. The larger destination is a persistent character identity, with multiple bodies and interfaces, living in a persistent world. The extended destination includes her own fictional phone, pictures, social events, dreams, and eventually a shared household with other characters.
 
 The plan grows that experience in playable increments. We should be able to stop after an adventure and still have a worthwhile product.
 
@@ -47,6 +49,7 @@ We detail one adventure at a time and keep the next one sketched. We do not gene
 7. **Private content stays separate.** Extracted game assets, dialogue corpus, curated audio, private models, and sensor records stay outside the public repository. Public examples use suitable original or otherwise publishable assets.
 8. **Evidence chooses technology.** Rust and Python have meaningful roles. Additional languages and frameworks must solve a demonstrated problem. Provider names, memory models, behavior algorithms, and host devices remain replaceable choices.
 9. **Every adventure delivers an experience.** Infrastructure work earns its place by enabling that adventure's acceptance scene. Debugging and small polish improvements accompany every increment.
+10. **Presentation is replaceable.** The character runtime owns semantic actions, desktop movement and interaction policy. Visual backends own pose evaluation, materials and projection, and supply compatible frames, bounds, anchors and hit information. Character-specific clips and capabilities belong in private packs, not in simulation or X11 policy. Prove this with two real representations in A01 rather than anticipating arbitrary formats.
 
 ## 4. The route at a glance
 
@@ -54,7 +57,7 @@ The numbering is the suggested order for one programmer. The dependency column n
 
 | ID | Adventure | Product you can run at the end | Essential foundation |
 | --- | --- | --- | --- |
-| A01 | First visit | A small interactive desktop companion | Accepted A00 desktop-host foundation |
+| A01 | First visit | One interactive desktop companion, selectable between Vanilla (2D) and Hina (3D) | Accepted A00 host; incremental renderer feasibility |
 | A02 | A daily life | A persistent offline companion with needs and activities | A01 |
 | A03 | A familiar voice | An expressive companion using local speech and reactions | A02; a small usable content pack |
 | A04 | A body with a mind | Sleep, limited perception, reflexes, and belief revision | A02 |
@@ -65,7 +68,7 @@ The numbering is the suggested order for one programmer. The dependency column n
 | A09 | One life across devices | Tested ownership, reconnect, and continuity when the desktop is off | A08 |
 | A10 | Her own phone | Character-paced messages, a camera/gallery, and bounded apps | A03, A05; A09 for cross-device delivery |
 | A11 | A life beyond our interactions | Fictional social events, dreams, and optional curated information | A05; A10 for phone presentation |
-| A12 | A shared household | Two characters living in one consistent world | A05; a second suitable character pack |
+| A12 | A shared household | Two simultaneously active characters living in one consistent world | A05; A01 pack/presentation boundary; suitable distinct character content |
 | A13 | A home we can keep | A packaged, recoverable, maintainable release of the chosen scope | The adventures selected for that release |
 
 Useful stopping points:
@@ -81,17 +84,19 @@ Useful stopping points:
 
 ### A01 — First visit
 
-**Experience:** Launch the program and meet a small character who can move, react to the pointer, and be picked up.
+**Experience:** Launch Vanilla, move and interact with her, then select Hina without restarting the application. Both representations inhabit the same desktop coordinate system and offer the same core interaction contract.
 
 **Connected goals**
 
-- **A01-G1: A reliable desktop home.** Reuse the accepted Rust/x11rb managed Openbox/X11 host. Extend it with companion-level controls, body sizing/bounds, presentation and workspace policy, and settings, without repeating the proven transparency, stacking, focus-safe pointer input and recovery work.
-- **A01-G2: A readable body.** Render a few animations through semantic actions such as idle, walk, sit, and sleep. Define only the animation metadata currently needed: timing, loop behavior, anchors, direction, hit regions, and interruption/transition rules.
-- **A01-G3: A physical interaction loop.** Add hover/gaze, click, grab, hold, drag, and drop/fall behavior. Add a simple pet/poke response and a developer view of the current action. Save minimal settings and position.
+- **A01-G1: A reliable desktop home.** Reuse the accepted Rust/x11rb managed Openbox/X11 host. Extend it with companion-level controls, body sizing/bounds, presentation and workspace policy, and settings, without repeating the proven transparency, stacking, focus-safe pointer input and recovery work. Generalize static input geometry only through reviewed, tested integration changes.
+- **A01-G2: A readable, interchangeable body.** Complete the current 2D renderer increments, establish the minimal common presentation contract before live integration, then prove Vanilla on the desktop. Audit Hina's GLB assets when that baseline is usable; validate an independent 3D rendering path, integrate it through the same contract, and support a recoverable character switch. Semantic actions (idle, walk, sit, sleep, held, touch), clip timing, loops, transitions, anchors, bounds and hit regions are pack data. Missing authored clips require an explicit reviewed fallback or an unavailable capability, not fabricated support.
+- **A01-G3: A physical interaction loop.** Implement hover/gaze where supported, click, grab, hold, drag, drop/fall and pet/poke using one desktop-space movement and interaction policy. Build the first working loop on Vanilla, then exercise the same code with Hina. Save minimal settings, active pack and safe position. Rendering must not own durable behavior state.
 
-**Finish scene:** Launch, walk, pick up, move, drop, pet, quit, and reopen. The body stays usable and respects the current screen geometry. No AI service is required.
+**Order:** finish the scoped renderer foundation; define the presentation seam; make Vanilla usable; audit and implement Hina's presentation; verify live switching and shared interactions; close A01. See the [A00/A01 execution plan](DesktopRoomie-A00-A01-plan-v0.1.md) for the sequential checkpoints. No separate Hina track is required.
 
-**Choose here:** a character animation/rendering path and asset contract compatible with the accepted A00 host. Evaluate the private Spine export before committing to custom frame sheets; use publishable synthetic placeholders for public tests. The window host itself was selected in A00. This adventure establishes no advanced cognition or full physics engine.
+**Finish scene:** Launch Vanilla, walk, pick up, move, drop, pet, select Hina and repeat the shared interactions; switch back, quit and reopen. Transparent regions remain click-through during animation, failed pack loads preserve or safely recover the previous body, and focus, placement, layer and workspace behavior retain the A00 guarantees. Both characters are usable without AI, dialogue or voice services.
+
+**Choose here:** the Spine 2D and GLB/glTF 3D presentation paths, their minimal capabilities and integration contracts, based on actual asset and native performance evidence. wgpu is the ongoing offscreen foundation, not a claim of an already implemented 3D renderer. Public tests use original or redistributable synthetic fixtures; private assets stay outside Git. Hina's full corpus, voice, characterization, alternate outfits, and simultaneous multi-character simulation are not A01 gates. This adventure establishes no advanced cognition or general 3D engine.
 
 ### A02 — A daily life
 
@@ -241,7 +246,7 @@ Useful stopping points:
 
 - **A12-G1: Shared facts, distinct characters.** Give both characters the same authoritative objects, locations, and events while preserving separate observations, beliefs, memories, needs, and relationships.
 - **A12-G2: Interactions and resources.** Handle turn-taking, object ownership/use, attention, conversation participants, and character-to-character events. Extend relationship records without assuming every relationship is with the user.
-- **A12-G3: Prove a second pack.** Load a second suitable character pack and run common activities without embedding character-specific exceptions in the engine. Use the preserved multi-character corpus context for private design research where applicable.
+- **A12-G3: Prove simultaneous packs.** Extend the interchangeable pack boundary proven in A01 to two independently active characters. Run common activities without embedding character-specific exceptions in the engine; verify independent state, animation, input ownership and resource contention. Use suitable reviewed character content, including the earlier packs where feasible.
 
 **Finish scene:** Two characters want the same item; one uses it, both observe appropriate consequences, and only the character who witnessed a private event initially knows it. Save/reload preserves their distinct histories.
 
@@ -270,6 +275,8 @@ These feed the adventures. They are not a mandatory infrastructure campaign befo
 **Feeds:** A03 content, A05 characterization, A06 context, A12 additional characters.
 
 Maintain immutable extracted originals and explicit derived copies. Import through engine-specific adapters, including the inventory's CatSystem2 and KiriKiri/FreeMote-derived paths, into one canonical schema. Recover script-to-voice links from source data rather than using ASR as the primary mapper. Preserve full dialogue context before filtering to Vanilla; retain the other main catgirls' data for future research and packs.
+
+If Hina is later selected for authored dialogue or conversation, audit permitted Blue Archive story, MomoTalk and voice/text sources just in time for A03/A05/A06/A10 content needs. Preserve speaker/context, message branches, language and provenance; distinguish official text from translations or ASR. No full Hina corpus, scraping pipeline or voice training is required for A01 or to make the common engine functional. Use or adaptation of third-party text, models and voices requires the applicable rights; private storage alone does not establish permission.
 
 Preserve stable IDs, game/engine/scene/entry, character identity, raw/display/localized speaker fields, raw/display/spoken Japanese, localization, voice IDs and root-relative paths, duration, source archives/scripts, neighboring lines, presence/expression/pose/BGM/SFX context when available, adult provenance, multi-voice status, audio class, and audit metadata. Missing or ambiguous material stays explicit; no guessed replacement speakers or audio.
 
@@ -309,6 +316,8 @@ The optional Colab queue accepts text, language, and reference/delivery requests
 
 Build the Character Bible incrementally: true chibi Vanilla, classic maid outfit, the earlier/pre-Vol.4 visual feel, canonical colors/appearance, speech style, mannerisms, patience, playfulness, affection/conflict style, curiosity, independence, preferences, and things the system must not invent. Separate canonical guidance from learned relationship history.
 
+A01 requires only the visual/animation manifests of Vanilla and Hina. Prepare Hina's 3D pack when its sequential A01 checkpoint becomes active; later character profiles and content, if commissioned, use the same schemas and services. Do not require parity of the private dialogue or personality packs to prove presentation independence.
+
 Grow semantic animation packs and a direct-play reaction bank: sniffing, laughter, breath, sleepy sounds, surprise, small cries, exertion, hesitation, and onomatopoeia. Body actions cover gaze, ears/tail, approach/retreat, sitting, sleeping, sniffing, eating, playing, and touch responses as assets become available.
 
 Develop the offline dialogue factory only as needed: scenario matrix, candidate generation, character filters, semantic duplicate checks, human review, batch TTS, then pack export. Records can carry text/audio, intent, emotion/intensity/tone, conditions/exclusions, cooldown, semantic family, animation, and weight. Scenarios grow to include time, session length, mood/energy, wins/losses where an activity provides them, ignored interactions, repeated touch, idle periods, music, weather, place return, and routine anomalies.
@@ -332,7 +341,7 @@ The following is a responsibility proposal, not a framework selection.
 | State, clock, events, behavior, cognition, permissions, persistence | Rust as the meaningful portable core | Platform-neutral rules and explicit ownership |
 | Corpus processing, analysis, review/export, experiment orchestration, batch content | Python | Reproducible inputs/outputs and provenance |
 | TTS and other model execution | Python when the chosen ecosystem benefits from it | Replaceable requests/results; no ownership of character state |
-| Desktop host and renderer | A00 ratified Rust/x11rb managed X11; decide character animation/rendering compatibility in A01 | Semantic actions/state views, independent of private assets |
+| Desktop host and renderer | A00 ratified Rust/x11rb managed X11; scoped wgpu offscreen foundation; Spine 2D then GLB/glTF 3D feasibility/integration in A01 | Semantic actions, frames, anchors and hit information; shared desktop movement/input rules |
 | Android host/UI | Decide during A08; Kotlin/Java or another justified approach | Native lifecycle responsibilities; shared core rules |
 | Debug/review interfaces | Choose the smallest tool that serves the workflow | Developer visibility without duplicating simulation logic |
 | Content packs and contracts | Versioned declarative data; format chosen when needed | Data does not require rebuilding the engine for every new item |
@@ -348,7 +357,7 @@ A possible repository organization, created gradually, is `docs/`, `core/`, `des
 | Decision | When it becomes necessary | Evidence or small experiment |
 | --- | --- | --- |
 | Desktop host, input, global layers and recovery | A00 — accepted 2026-10-23 | Openbox/X11/Picom evidence and documented limitations |
-| Character animation, rendering, dynamic sizing and presentation policy | A01 | Safe integration with the accepted host and native companion acceptance |
+| Character animation, rendering, dynamic sizing and presentation policy | A01 | Vanilla baseline, Hina GLB audit and 3D proof; safe integration, switching and native acceptance on both |
 | Needs, mood variables, activity selection | A02; retune A05 | Short play sessions, understandable choices, no tedious care loop |
 | Persistence and elapsed-time semantics | A02 | Restart, suspend, long absence, interrupted save |
 | Spine complexity and observation uncertainty | A04 | Sleeping-lift, startle, stale-observation, and clock-correction scenes |
@@ -362,7 +371,7 @@ A possible repository organization, created gradually, is `docs/`, `core/`, `des
 | Notifications, fictional apps, image consistency | A10 | Useful communication without annoyance; recognizable gallery outputs |
 | Dream effects, social activity, curated sources | A11 | Coherent causes for behavior without overwhelming the user |
 | Shared-world scheduling and multi-character model | A12 | Two-character interaction and resource contention |
-| Extent of generalization and public release | A12/A13 or earlier chosen release | A working independent sample pack and clear private-content separation |
+| Minimal presentation generalization; broader public release | A01; A12/A13 or earlier chosen release | Two interchangeable visual backends and public fixtures in A01; concurrent packs and release boundaries later |
 
 Record consequential decisions with the question, evidence, chosen option, alternatives, consequences, and a trigger for revisiting. A small architecture decision record is enough. An experiment should end with a decision or a named unresolved limitation, not permanent speculative infrastructure.
 
@@ -374,10 +383,11 @@ Each mission brief should state the observable result, relevant current code, al
 
 For example, the first planning session after this roadmap would develop **A01**, in this order:
 
-1. Describe the desktop behavior and constraints on the user's actual machine.
-2. Research the character animation/asset runtime that can use the accepted host; do not redo A00 host selection.
-3. Define the first semantic animation and pointer interaction slice.
-4. Prepare the initial implementation mission and its visible acceptance check.
+1. Preserve accepted A00 and R00-M13 checkpoints; advance only the next authorized renderer increment.
+2. Establish the minimal common presentation contract and prove the first Vanilla slice using the accepted host.
+3. Complete Vanilla's core animation and pointer interaction baseline.
+4. Audit Hina's GLB, prove the 3D path, integrate and switch through the common contract; complete cross-backend acceptance.
+5. Prepare each bounded implementation mission and its visible acceptance check only as its dependency becomes ready.
 
 The milestone is the running companion, not completion of the experiment alone.
 
@@ -481,4 +491,4 @@ Keep the inventory as the idea record and this roadmap as the current route. As 
 
 Keep adventure and goal IDs stable once work starts. A small active-adventure document can hold implementation detail without inflating this roadmap. Maintain a brief progress record containing the working checkpoint, completed goals, active mission, known limitations, and next decision.
 
-With A00 accepted, first reconcile inherited documentation, then conduct targeted A01 research, and only afterward prepare a new approved A01 implementation roadmap and first Codex mission. The eventual success scene remains a character on the desktop that can already be played with.
+With A00 accepted and the R00-M13 C2-C1 checkpoint recorded, continue the renderer through separately approved increments. The revised A01 execution plan governs future sequencing: usable Vanilla first, then Hina on the same presentation/interaction contract, then joint acceptance. The roadmap itself does not authorize new code, reopening accepted gates, or Git publication.
