@@ -4,7 +4,7 @@ Version 0.1 · 2026-10-04 · Proposed, living roadmap (presentation sequencing r
 
 **Presentation scope revision (2026-11-21):** A01 now targets one active, interchangeable character with two private visual packs: Vanilla (Spine 2D) first, Hina (glTF 3D) second. R00-M13 C2-C2 technical acceptance and consolidated preservation establish the synthetic atlas baseline. The second renderer is a sequential A01 validation step, not a parallel project. This revision changes future goals, not accepted evidence or implementation authority. [C2-C2 acceptance](renderer/R00-M13-P2-C2-C2/C2-C2-ACCEPTANCE.md)
 
-**Spine backend decision (R00-M12-S1-B/C).** The optional Spine backend lives in DesktopRoomie-Spine, and DesktopRoomie builds and operates independently. The owner accepted the private static Vanilla rendering milestone on 2026-11-22. The next renderer milestone is **P4 — Continuous animation playback**, pending separate authorization. Licensing clarification remains pending. [Separation decision](research/R00-M12-spine-backend-separation-decision.md) · [P3 acceptance](renderer/R00-M13-P3/P3-ACCEPTANCE.md)
+**Spine backend decision (R00-M12-S1-B/C).** The optional Spine backend lives in DesktopRoomie-Spine, and DesktopRoomie builds and operates independently. The owner accepted the private static render and P4-C1 native animation preview on 2026-11-22. **P4-D — Animation and directional transitions** is next, followed by interactive desktop integration. Each requires separate authorization. Licensing clarification remains pending. [Separation decision](research/R00-M12-spine-backend-separation-decision.md) · [P3 acceptance](renderer/R00-M13-P3/P3-ACCEPTANCE.md) · [P4-C1 acceptance](renderer/R00-M13-P4-C1/P4-C1-ACCEPTANCE.md)
 
 **Checkpoint reconciliation (2026-10-23):** A00 is complete and owner-approved. The established host is Rust/x11rb managed X11 on the recorded Archcraft/Openbox 3.6.1/Picom v13 environment, with the limitations in [STATUS](STATUS.md) and the [ratified host ADR](DesktopRoomie-A00-M03.4-host-architecture-decision.md). The existing implementation is still a technical probe, not an animated companion. Earlier bspwm/host-selection wording below is historical; the original adventure IDs and product goals remain intact. A01 implementation requires separate authorization.
 
@@ -385,7 +385,7 @@ Each mission brief should state the observable result, relevant current code, al
 
 For example, the first planning session after this roadmap would develop **A01**, in this order:
 
-1. Preserve the accepted A00 and R00-M13 checkpoints. Use the accepted P3 static rendering evidence to scope P4 separately.
+1. Preserve the accepted A00 and R00-M13 checkpoints. Use the accepted P4-C1 playback evidence to scope P4-D animation and directional transitions separately.
 2. Establish the minimal common presentation contract and prove the first Vanilla slice using the accepted host.
 3. Complete Vanilla's core animation and pointer interaction baseline.
 4. Audit Hina's GLB, prove the 3D path, integrate and switch through the common contract; complete cross-backend acceptance.
@@ -493,4 +493,4 @@ Keep the inventory as the idea record and this roadmap as the current route. As 
 
 Keep adventure and goal IDs stable once work starts. A small active-adventure document can hold implementation detail without inflating this roadmap. Maintain a brief progress record containing the working checkpoint, completed goals, active mission, known limitations, and next decision.
 
-A00, the R00-M13 C2-C2 atlas milestone and P3 static Vanilla rendering are accepted within their recorded scopes. P4 is the next renderer milestone. The revised A01 execution plan governs future sequencing: usable Vanilla first, then Hina on the same presentation/interaction contract, then joint acceptance. The roadmap itself does not authorize new code, reopening accepted gates, or Git publication.
+A00, the R00-M13 C2-C2 atlas milestone, P3 static Vanilla rendering and the P4-C1 native preview are accepted within their recorded scopes. P4-D is the next renderer milestone, followed by interactive desktop integration. The revised A01 execution plan governs future sequencing: usable Vanilla first, then Hina on the same presentation/interaction contract, then joint acceptance. The roadmap itself does not authorize new code, reopening accepted gates, or Git publication.
