@@ -4,3 +4,6 @@
 # Private development and review artifacts
 /.private-reviews/
 /codex-session-reseach-PV.md
+
+# Separately maintained optional backend
+/extensions/spine

@@ -277,6 +277,8 @@ The labels below refer to the existing [canonical roadmap](https://github.com/zN
 
 ### R00-M12 — Spine 2D runtime and private asset feasibility
 
+**Owner decision (R00-M12-S1-B/C).** Spine-specific integration belongs in the separate, initially private DesktopRoomie-Spine repository. DesktopRoomie builds and operates independently. R00-M12-T1-B2 remains **PARTIAL**, and licensing confirmation is pending. [Spine backend separation decision](R00-M12-spine-backend-separation-decision.md)
+
 **Input:** a private official chibi Vanilla Spine 2D export is available as `.skel`, `.atlas`, and `.png`, with multiple existing animations. The copyrighted asset files remain private and are not to be committed to DesktopRoomie.  
 **Best time:** immediately after A00-G3 and before **A01-G2.1**, alongside the targeted A01 movement/animation studies rather than during host proof work.  
 **Why study it:** this may replace a custom frame-sheet-first pipeline with a skeletal animation path that preserves authored anchors, interpolation, skins/attachments, and a richer existing animation repertoire. The decision must be based on the export's actual Spine version/features, runtime feasibility, licensing, and rendering costs.
@@ -313,7 +315,7 @@ The labels below refer to the existing [canonical roadmap](https://github.com/zN
 
 ### Immediate, lightweight work: A00 closed → early A01
 
-**Completed A00 research:** R00-M01 is recorded and the host is now ratified. **Next proposed renderer investigation:** with separate owner authorization, conduct a bounded, read-only investigation of the actual private Vanilla asset requirements and reconcile it with the R00-M12 findings. Use the assets and intended first presentation to prioritize rotation, trimming, atlas parsing and other asset-facing requirements. Broader renderer research and A01 gates retain their own acceptance criteria. **Later A01 studies:** R00-M02/M03 when movement, physics or further window mechanics become relevant. A brief look at Mochi's event-to-action flow may inform an idle scheduler; full cognition research R00-M05 remains deferred until A04.
+**Completed A00 research:** R00-M01 is recorded and the host is now ratified. **Next major technical objective.** Render an actual privately supplied Spine character pose through wgpu in a separately authorized isolated derivative of C2-C2. Private asset inspection and runtime adoption require explicit authorization, and applicable licensing conditions still need confirmation. Use the assets and intended first presentation to prioritize rotation, trimming, atlas parsing and other asset-facing requirements. Broader renderer research and A01 gates retain their own acceptance criteria. **Later A01 studies:** R00-M02/M03 when movement, physics or further window mechanics become relevant. A brief look at Mochi's event-to-action flow may inform an idle scheduler; full cognition research R00-M05 remains deferred until A04.
 
 **Checkpoint:** a one-page note that answers “what implementation issue do we now understand better?” and records whether the lesson requires a code change. A note with no recommended change is a perfectly valid result.
 
