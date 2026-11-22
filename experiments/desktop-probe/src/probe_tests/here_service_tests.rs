@@ -2293,7 +2293,7 @@ fn external_fatal_policy_leaves_legacy_commands_untouched() {
 }
 #[test]
 fn every_production_async_error_return_is_inside_the_shared_fatal_loop_boundary() {
-    let source = include_str!("../main.rs");
+    let source = include_str!("../lib.rs");
     let probe = source
         .split("fn run_probe(")
         .nth(1)
@@ -4039,7 +4039,7 @@ pub(crate) mod recover_tests {
 
     #[test]
     fn production_owner_wait_boundaries_remain_reachable_as_specified() {
-        let source = include_str!("../main.rs");
+        let source = include_str!("../lib.rs");
         let probe = source
             .split("fn run_probe(")
             .nth(1)

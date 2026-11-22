@@ -26,6 +26,7 @@ DesktopRoomie is the reusable software; Project Vanilla is its private character
 
 ## Context and mission contracts
 
+- A01-C1-A Modular Rust Foundation records the accepted library/binary boundary, exact source identity, verification and qualified owner-native evidence. [C1-A acceptance](A01-C1-A-ACCEPTANCE.md)
 - [A00-M03.4 integrated A00 acceptance](DesktopRoomie-A00-M03.4-integrated-acceptance.md): owner-approved technical closeout on 2026-10-23, original G1/G2/G3 mapping, frozen source/CI identities, C1/C2 review provenance and accepted scaling/native-host qualifications; C3 review was approved on 2026-10-23; verified C4 publication and matching CI are recorded in the acceptance record.
 - [A00-M03.4 host architecture decision](DesktopRoomie-A00-M03.4-host-architecture-decision.md): owner-ratified existing Rust/x11rb managed Openbox/X11/Picom approach, required facilities, preserved source boundaries and known limits; no redesign or A01 authority.
 - [D00-M01 documentation/context hygiene](DesktopRoomie-D00-M01-documentation-context-hygiene.md): **accepted** docs-only context layer, with independent review and owner approval recorded in the mission document.
