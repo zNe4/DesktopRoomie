@@ -2,7 +2,7 @@
 
 Version 0.1 · 2026-10-04 · Proposed, living roadmap (presentation sequencing revised 2026-11-21)
 
-**Presentation scope revision (2026-11-21):** A01 now targets one active, interchangeable character with two private visual packs: Vanilla (Spine 2D) first, Hina (glTF 3D) second. Complete the existing R00-M13 offscreen-renderer work in its approved increments; the C2-C1 acceptance is recorded in [STATUS](STATUS.md). The second renderer is a sequential A01 validation step, not a parallel project. This revision changes future goals, not accepted evidence or implementation authority.
+**Presentation scope revision (2026-11-21):** A01 now targets one active, interchangeable character with two private visual packs: Vanilla (Spine 2D) first, Hina (glTF 3D) second. R00-M13 C2-C2 technical acceptance and consolidated preservation establish the synthetic atlas baseline. The second renderer is a sequential A01 validation step, not a parallel project. This revision changes future goals, not accepted evidence or implementation authority. [C2-C2 acceptance](renderer/R00-M13-P2-C2-C2/C2-C2-ACCEPTANCE.md)
 
 **Checkpoint reconciliation (2026-10-23):** A00 is complete and owner-approved. The established host is Rust/x11rb managed X11 on the recorded Archcraft/Openbox 3.6.1/Picom v13 environment, with the limitations in [STATUS](STATUS.md) and the [ratified host ADR](DesktopRoomie-A00-M03.4-host-architecture-decision.md). The existing implementation is still a technical probe, not an animated companion. Earlier bspwm/host-selection wording below is historical; the original adventure IDs and product goals remain intact. A01 implementation requires separate authorization.
 
@@ -89,7 +89,7 @@ Useful stopping points:
 **Connected goals**
 
 - **A01-G1: A reliable desktop home.** Reuse the accepted Rust/x11rb managed Openbox/X11 host. Extend it with companion-level controls, body sizing/bounds, presentation and workspace policy, and settings, without repeating the proven transparency, stacking, focus-safe pointer input and recovery work. Generalize static input geometry only through reviewed, tested integration changes.
-- **A01-G2: A readable, interchangeable body.** Complete the current 2D renderer increments, establish the minimal common presentation contract before live integration, then prove Vanilla on the desktop. Audit Hina's GLB assets when that baseline is usable; validate an independent 3D rendering path, integrate it through the same contract, and support a recoverable character switch. Semantic actions (idle, walk, sit, sleep, held, touch), clip timing, loops, transitions, anchors, bounds and hit regions are pack data. Missing authored clips require an explicit reviewed fallback or an unavailable capability, not fabricated support.
+- **A01-G2: A readable, interchangeable body.** Use the actual Vanilla asset and first-presentation requirements to prioritize remaining 2D renderer work, establish the minimal common presentation contract before live integration, then prove Vanilla on the desktop. Audit Hina's GLB assets when that baseline is usable; validate an independent 3D rendering path, integrate it through the same contract, and support a recoverable character switch. Semantic actions (idle, walk, sit, sleep, held, touch), clip timing, loops, transitions, anchors, bounds and hit regions are pack data. Missing authored clips require an explicit reviewed fallback or an unavailable capability, not fabricated support.
 - **A01-G3: A physical interaction loop.** Implement hover/gaze where supported, click, grab, hold, drag, drop/fall and pet/poke using one desktop-space movement and interaction policy. Build the first working loop on Vanilla, then exercise the same code with Hina. Save minimal settings, active pack and safe position. Rendering must not own durable behavior state.
 
 **Order:** finish the scoped renderer foundation; define the presentation seam; make Vanilla usable; audit and implement Hina's presentation; verify live switching and shared interactions; close A01. See the [A00/A01 execution plan](DesktopRoomie-A00-A01-plan-v0.1.md) for the sequential checkpoints. No separate Hina track is required.
@@ -383,7 +383,7 @@ Each mission brief should state the observable result, relevant current code, al
 
 For example, the first planning session after this roadmap would develop **A01**, in this order:
 
-1. Preserve accepted A00 and R00-M13 checkpoints; advance only the next authorized renderer increment.
+1. Preserve the accepted A00 and R00-M13 checkpoints. Propose a bounded, read-only investigation of the actual private Vanilla assets for separate authorization.
 2. Establish the minimal common presentation contract and prove the first Vanilla slice using the accepted host.
 3. Complete Vanilla's core animation and pointer interaction baseline.
 4. Audit Hina's GLB, prove the 3D path, integrate and switch through the common contract; complete cross-backend acceptance.
@@ -491,4 +491,4 @@ Keep the inventory as the idea record and this roadmap as the current route. As 
 
 Keep adventure and goal IDs stable once work starts. A small active-adventure document can hold implementation detail without inflating this roadmap. Maintain a brief progress record containing the working checkpoint, completed goals, active mission, known limitations, and next decision.
 
-With A00 accepted and the R00-M13 C2-C1 checkpoint recorded, continue the renderer through separately approved increments. The revised A01 execution plan governs future sequencing: usable Vanilla first, then Hina on the same presentation/interaction contract, then joint acceptance. The roadmap itself does not authorize new code, reopening accepted gates, or Git publication.
+A00 and the R00-M13 C2-C2 atlas milestone are accepted within their recorded scopes. The actual Vanilla assets and intended first presentation guide the scope of any further renderer work. The revised A01 execution plan governs future sequencing: usable Vanilla first, then Hina on the same presentation/interaction contract, then joint acceptance. The roadmap itself does not authorize new code, reopening accepted gates, or Git publication.

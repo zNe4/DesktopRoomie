@@ -7,7 +7,7 @@
 
 **Checkpoint reconciliation (2026-10-23):** A00 is closed and the native Rust/x11rb Openbox/X11/Picom host ratified. The targeted R00-M01 A00 study is completed; see [STATUS](../STATUS.md) and [host ADR](../DesktopRoomie-A00-M03.4-host-architecture-decision.md) for evidence.
 
-**Sequencing update (2026-11-21):** R00-M13 C2-C1 is owner-accepted as documented in STATUS. Continue its remaining scoped prerequisites for the first Vanilla presentation. The A01-G2.5 Hina GLB study is scheduled only after the usable Vanilla baseline (A01 C5); its R00 mission ID will be assigned when authorized. Research remains just-in-time, not implementation permission.
+**Sequencing update (2026-11-21):** R00-M13 C2-C2 technical acceptance and consolidated preservation are complete. The consolidated primary C2-C project is the accepted baseline for isolated derivatives in separately authorized renderer work. The A01-G2.5 Hina GLB study is scheduled only after the usable Vanilla baseline (A01 C5); its R00 mission ID will be assigned when authorized. Research remains just-in-time, not implementation permission. [C2-C2 acceptance](../renderer/R00-M13-P2-C2-C2/C2-C2-ACCEPTANCE.md)
 
 > **Purpose.** Build DesktopRoomie from the ground up, but learn from existing implementations before we commit to architectural choices. Research should be **just in time**, tied to the next real mission and its acceptance test. We are gathering evidence, not choosing somebody else's codebase as the foundation.
 
@@ -86,7 +86,7 @@ The labels below refer to the existing [canonical roadmap](https://github.com/zN
 | **A10/A11 phone life, notifications, dreams, social events** | Companion Emergence, AIRI, OpenCrayFish | What makes background activity feel earned rather than spammy or fabricated? | Targeted | R00-M10 |
 | **A12/A13 multi-character/public reusable release** | AIRI, Shimeji pack ecosystems, multi-agent research | How do character packs share an engine safely without shared-memory confusion, license trouble, or runaway complexity? | Later | R00-M11 |
 
-**Important timing (reconciled):** A00 is complete and its targeted R00-M01 study recorded. Reuse R00-M12 findings where available and continue the existing R00-M13 renderer sequence via separate assignments. R00-M02/M03 remain just-in-time movement and window studies. Audit the Hina GLB only at A01-G2.5, after C5 (Vanilla), not as a parallel project. Later cognitive research stays deferred. Research timing does not authorize coding.
+**Important timing (reconciled):** A00 is complete and its targeted R00-M01 study recorded. Reuse R00-M12 findings where available. Prioritize further renderer work according to the actual Vanilla assets and intended first presentation. R00-M02/M03 remain just-in-time movement and window studies. Audit the Hina GLB only at A01-G2.5, after C5 (Vanilla), not as a parallel project. Later cognitive research stays deferred. Research timing does not authorize coding.
 
 ---
 
@@ -313,7 +313,7 @@ The labels below refer to the existing [canonical roadmap](https://github.com/zN
 
 ### Immediate, lightweight work: A00 closed → early A01
 
-**Completed A00 research:** R00-M01 is recorded and the host is now ratified. **Current renderer sequence:** use the documented R00-M13 C2-C1 checkpoint and continue the next separately authorized prerequisite; reconcile R00-M12 asset/runtime findings before the first Vanilla integration. **Later A01 studies:** R00-M02/M03 when movement, physics or further window mechanics become relevant. A brief look at Mochi's event-to-action flow may inform an idle scheduler; full cognition research R00-M05 remains deferred until A04.
+**Completed A00 research:** R00-M01 is recorded and the host is now ratified. **Next proposed renderer investigation:** with separate owner authorization, conduct a bounded, read-only investigation of the actual private Vanilla asset requirements and reconcile it with the R00-M12 findings. Use the assets and intended first presentation to prioritize rotation, trimming, atlas parsing and other asset-facing requirements. Broader renderer research and A01 gates retain their own acceptance criteria. **Later A01 studies:** R00-M02/M03 when movement, physics or further window mechanics become relevant. A brief look at Mochi's event-to-action flow may inform an idle scheduler; full cognition research R00-M05 remains deferred until A04.
 
 **Checkpoint:** a one-page note that answers “what implementation issue do we now understand better?” and records whether the lesson requires a code change. A note with no recommended change is a perfectly valid result.
 
@@ -455,4 +455,4 @@ The following repository identities and their README-level scope were checked on
 6. Re-run the relevant study if a later bug exposes an unexamined failure mode or the external project materially changes.
 7. Keep the playable companion advancing; external research is a tool, not a new multi-month dependency.
 
-**Next practical triggers:** the separately authorized continuation of R00-M13, the first usable Vanilla presentation, then the A01-G2.5 Hina feasibility study. A00 host selection is closed. Deep work on Mochi's logical Spine/brain boundary should occur before **A04**, not before the first playable desktop body exists.
+**Next practical triggers:** the proposed read-only Vanilla asset investigation when separately authorized, the first usable Vanilla presentation, then the A01-G2.5 Hina feasibility study. A00 host selection is closed. Deep work on Mochi's logical Spine/brain boundary should occur before **A04**, not before the first playable desktop body exists.
