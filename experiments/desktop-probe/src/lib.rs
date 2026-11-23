@@ -5,6 +5,7 @@ mod control;
 mod geometry;
 mod interaction;
 mod layer;
+pub mod presentation;
 mod x11;
 
 use std::env;
