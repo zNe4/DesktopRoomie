@@ -92,6 +92,10 @@ fn set_input_with(
 }
 
 #[cfg(test)]
+#[path = "../probe_tests/presentation_runtime_tests.rs"]
+mod presentation_runtime_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -3457,6 +3457,76 @@ pub(crate) mod recover_tests {
         .unwrap_err()
     }
 
+    #[test]
+    fn expose_failure_during_recover_preserves_history_and_finishes_the_owner_once() {
+        use crate::x11::render::{checked_blit_with, paint_committed_with};
+
+        let (mut host, mut owner) = checkpoint(5);
+        assert!(host.here.runtime.body_input_ready());
+        assert!(host.here.runtime.layers.pending().is_some());
+        let history = owner.active().unwrap().placement.proof.history;
+        assert!(history.relocation_confirmed && history.restoration_confirmed);
+        let log_start = host.here.log.len();
+        let fences = host.here.count("fence");
+        let mutations = host.mutations.clone();
+        let original: HostError = Box::new(NativeFault("Expose flush", 1));
+        let address = error_address(&original);
+        let error = paint_committed_with(&host.here.runtime.frames, |dimensions| {
+            assert_eq!(dimensions, (160, 160));
+            checked_blit_with(|| Ok(()), || Err(original))
+        })
+        .unwrap_err();
+
+        let trace = RefCell::new(Vec::new());
+        host.here
+            .runtime
+            .invalidate_frame_and_fence_with(|runtime| {
+                runtime.fence_visibility_input_with(
+                    &mut host.here.window,
+                    || {
+                        trace.borrow_mut().push("empty SHAPE");
+                        Err("injected empty SHAPE failure".into())
+                    },
+                    |_, _| {
+                        trace.borrow_mut().push("checked release");
+                        Ok(())
+                    },
+                    |_| panic!("no popup to destroy"),
+                )
+            });
+        assert_eq!(trace.into_inner(), ["empty SHAPE", "checked release"]);
+        assert!(!host.here.runtime.body_input_ready());
+        owner.fail_reply(true);
+        let error = external(&mut owner, &mut host, error);
+        assert_eq!(error_address(&error), address);
+        let reply = assert_terminal(&mut owner, &host, Reason::X11Failure);
+        assert_eq!(reply.detail.stage, Stage::Shutdown);
+        assert_eq!(reply.detail.placement.history, history);
+        assert!(host.here.runtime.layers.pending().is_none());
+        assert!(host.here.runtime.visibility_dispatch_eligible());
+        assert_eq!(host.here.count("fence"), fences + 1);
+        let fatal_log = &host.here.log[log_start..];
+        for step in [
+            "desktop",
+            "zero",
+            "map",
+            "correct",
+            "enable",
+            "top_enable",
+            "shape",
+        ] {
+            assert!(!fatal_log.contains(&step), "{fatal_log:?}");
+        }
+        assert_eq!(fatal_log.iter().filter(|&&s| s == "observe").count(), 1);
+        assert_eq!(host.mutations, mutations);
+        assert!(host.here.runtime.frames.committed().is_none());
+        assert!(
+            paint_committed_with(&host.here.runtime.frames, |_| panic!("late Expose")).is_err()
+        );
+        tick(&mut owner, &mut host).unwrap();
+        assert_eq!(owner.replies().len(), 1);
+    }
+
     /// Follow run_probe's Closing -> ordinary finish ordering, using the actual
     /// endpoint seams. An error must leave the sole slot for the fatal boundary.
     fn closing_error(owner: &mut HereOwner, publication: bool, original: HostError) -> HostError {
