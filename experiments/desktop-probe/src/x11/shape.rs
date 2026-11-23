@@ -209,6 +209,62 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn procedural_coverage_matches_legacy_geometry_and_x11_rectangles() {
+        use crate::presentation::procedural::{Palette, ProceduralProducer};
+        use crate::presentation::{
+            Action, ActionIntent, ClientExtent, Facing, FrameIdentity, FrameProducer, FrameRequest,
+            Point, Size,
+        };
+        use std::time::Duration;
+
+        let rects = silhouette_rectangles(160, 160);
+        let extent = ClientExtent::new(Size::new(160, 160)).unwrap();
+        let request = FrameRequest::new(
+            FrameIdentity {
+                generation: 0,
+                sequence: 0,
+            },
+            ActionIntent {
+                action: Action::Idle,
+                facing: Facing::Neutral,
+            },
+            extent,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        for palette in [Palette::Lavender, Palette::Coral] {
+            let frame = ProceduralProducer::new(palette)
+                .prepare_frame(&request)
+                .unwrap();
+            let region = frame.metadata.hit_region();
+            for y in -1..=160i16 {
+                for x in -1..=160i16 {
+                    let point = Point::new(i32::from(x), i32::from(y));
+                    let legacy_hit = crate::geometry::is_in_interactive_silhouette(x, y);
+                    let alpha_hit = extent.contains(point)
+                        && frame.payload[(y as usize * 160 + x as usize) * 4 + 3] != 0;
+                    let rect_hit = rects.iter().any(|r| {
+                        x >= r.x
+                            && y >= r.y
+                            && point.x < i32::from(r.x) + i32::from(r.width)
+                            && point.y < i32::from(r.y) + i32::from(r.height)
+                    });
+                    assert_eq!(alpha_hit, legacy_hit, "{palette:?} alpha at {point:?}");
+                    assert_eq!(
+                        region.contains(point),
+                        legacy_hit,
+                        "{palette:?} spans at {point:?}"
+                    );
+                    assert_eq!(rect_hit, legacy_hit, "X11 rectangles at {point:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn empty_and_restored_requests_are_checked_exact_input_sets() {
         for rectangles in [vec![], silhouette_rectangles(160, 160)] {

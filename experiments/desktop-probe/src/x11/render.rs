@@ -1,4 +1,9 @@
 use super::resource::{cleanup_all, OwnedResource};
+use crate::presentation::procedural::{Palette, ProceduralProducer};
+use crate::presentation::{
+    Action, ActionIntent, ClientExtent, Facing, FrameIdentity, FrameProducer, FrameRequest, Size,
+};
+use std::time::Duration;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     Colormap, ConnectionExt as XprotoExt, CreateGCAux, Gcontext, ImageFormat, Pixmap, Window,
@@ -7,8 +12,9 @@ use x11rb::protocol::xproto::{
 pub const WINDOW_WIDTH: u16 = 160;
 pub const WINDOW_HEIGHT: u16 = 160;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ColorTheme {
+    #[default]
     Lavender,
     Coral,
 }
@@ -18,6 +24,20 @@ impl ColorTheme {
         match self {
             Self::Lavender => "Lavender (Default)",
             Self::Coral => "Coral (Clicked)",
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Self::Lavender => Self::Coral,
+            Self::Coral => Self::Lavender,
+        }
+    }
+
+    fn palette(self) -> Palette {
+        match self {
+            Self::Lavender => Palette::Lavender,
+            Self::Coral => Palette::Coral,
         }
     }
 }
@@ -31,6 +51,7 @@ pub struct Renderer {
     pub width: u16,
     pub height: u16,
     pub theme: ColorTheme,
+    frame_identity: FrameIdentity,
 }
 
 impl Renderer {
@@ -41,7 +62,7 @@ impl Renderer {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let width = WINDOW_WIDTH;
         let height = WINDOW_HEIGHT;
-        let theme = ColorTheme::Lavender;
+        let theme = ColorTheme::default();
 
         // 1. Create depth-32 Pixmap for double buffering
         let pixmap = conn.generate_id()?;
@@ -76,29 +97,12 @@ impl Renderer {
             width,
             height,
             theme,
+            frame_identity: FrameIdentity {
+                generation: 0,
+                sequence: 0,
+            },
         };
-        let upload: Result<(), Box<dyn std::error::Error>> = (|| {
-            // 3. Generate 32-bit ARGB image buffer
-            let buffer = generate_test_body_pattern(width as usize, height as usize, theme);
-
-            // 4. Upload buffer into Pixmap
-            conn.put_image(
-                ImageFormat::Z_PIXMAP,
-                pixmap,
-                gc,
-                width,
-                height,
-                0,
-                0,
-                0,
-                32,
-                &buffer,
-            )?
-            .check()?;
-
-            Ok(())
-        })();
-        if let Err(error) = upload {
+        if let Err(error) = renderer.upload_frame(conn) {
             eprintln!("[ERROR] Renderer upload failed: {error}");
             if let Err(cleanup) = renderer.destroy(conn) {
                 eprintln!("[ERROR] Partial renderer cleanup: {cleanup}");
@@ -136,13 +140,32 @@ impl Renderer {
         conn: &impl Connection,
         window: Window,
     ) -> Result<ColorTheme, Box<dyn std::error::Error>> {
-        self.theme = match self.theme {
-            ColorTheme::Lavender => ColorTheme::Coral,
-            ColorTheme::Coral => ColorTheme::Lavender,
-        };
+        self.theme = self.theme.toggled();
+        self.frame_identity = self
+            .frame_identity
+            .checked_next()
+            .ok_or("Renderer frame sequence exhausted")?;
 
-        let buffer =
-            generate_test_body_pattern(self.width as usize, self.height as usize, self.theme);
+        self.upload_frame(conn)?;
+        self.paint(conn, window)?;
+        Ok(self.theme)
+    }
+
+    fn upload_frame(&self, conn: &impl Connection) -> Result<(), Box<dyn std::error::Error>> {
+        let extent = ClientExtent::new(Size::new(self.width.into(), self.height.into()))
+            .map_err(|error| format!("Invalid renderer frame extent: {error:?}"))?;
+        let request = FrameRequest::new(
+            self.frame_identity,
+            ActionIntent {
+                action: Action::Idle,
+                facing: Facing::Neutral,
+            },
+            extent,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .map_err(|error| format!("Invalid renderer frame request: {error:?}"))?;
+        let frame = ProceduralProducer::new(self.theme.palette()).prepare_frame(&request)?;
 
         conn.put_image(
             ImageFormat::Z_PIXMAP,
@@ -154,12 +177,11 @@ impl Renderer {
             0,
             0,
             32,
-            &buffer,
+            &frame.payload,
         )?
         .check()?;
 
-        self.paint(conn, window)?;
-        Ok(self.theme)
+        Ok(())
     }
 
     /// Releases server-side GC and Pixmap resources, checking requests and reporting failures
@@ -185,63 +207,26 @@ impl Renderer {
     }
 }
 
-/// Generates a 160x160 little-endian premultiplied ARGB buffer:
-/// Byte order in memory: [B, G, R, A]
-fn generate_test_body_pattern(width: usize, height: usize, theme: ColorTheme) -> Vec<u8> {
-    let mut data = vec![0u8; width * height * 4];
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    for y in 0..height {
-        for x in 0..width {
-            let idx = (y * width + x) * 4;
-            let dx = (x as f32) - 80.0;
-            let dy = (y as f32) - 80.0;
-            let dist = (dx * dx + dy * dy).sqrt();
-
-            if dist <= 45.0 {
-                // Check if this pixel is an eye/accent dot
-                let is_left_eye = (x as i32 - 68).pow(2) + (y as i32 - 75).pow(2) <= 16;
-                let is_right_eye = (x as i32 - 92).pow(2) + (y as i32 - 75).pow(2) <= 16;
-
-                if is_left_eye || is_right_eye {
-                    // Accent: White dots (A=255, R=255, G=255, B=255)
-                    data[idx] = 255;
-                    data[idx + 1] = 255;
-                    data[idx + 2] = 255;
-                    data[idx + 3] = 255;
-                } else {
-                    match theme {
-                        ColorTheme::Lavender => {
-                            // Vibrant Lavender/Purple (A=255, R=165, G=95, B=225)
-                            data[idx] = 225; // B
-                            data[idx + 1] = 95; // G
-                            data[idx + 2] = 165; // R
-                            data[idx + 3] = 255; // A
-                        }
-                        ColorTheme::Coral => {
-                            // Warm Coral/Orange-Pink (A=255, R=240, G=110, B=80)
-                            data[idx] = 80; // B
-                            data[idx + 1] = 110; // G
-                            data[idx + 2] = 240; // R
-                            data[idx + 3] = 255; // A
-                        }
-                    }
-                }
-            } else if (15..=65).contains(&x) && (15..=65).contains(&y) {
-                // Translucent test patch: 50% opacity Cyan (A=128, R=0, G=200, B=255)
-                // Premultiplied: R=0, G=100, B=128, A=128
-                data[idx] = 128; // B
-                data[idx + 1] = 100; // G
-                data[idx + 2] = 0; // R
-                data[idx + 3] = 128; // A
-            } else {
-                // Empty region: Genuinely transparent (A=0, R=0, G=0, B=0)
-                data[idx] = 0;
-                data[idx + 1] = 0;
-                data[idx + 2] = 0;
-                data[idx + 3] = 0;
-            }
-        }
+    #[test]
+    fn renderer_theme_starts_lavender_and_alternates_adapter_palettes() {
+        let initial = ColorTheme::default();
+        let clicked = initial.toggled();
+        let clicked_again = clicked.toggled();
+        assert_eq!(
+            (initial, clicked, clicked_again),
+            (ColorTheme::Lavender, ColorTheme::Coral, initial)
+        );
+        assert_eq!(
+            [
+                initial.palette(),
+                clicked.palette(),
+                clicked_again.palette()
+            ],
+            [Palette::Lavender, Palette::Coral, Palette::Lavender]
+        );
     }
-
-    data
 }
