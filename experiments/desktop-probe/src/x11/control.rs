@@ -490,6 +490,19 @@ impl ControlWindow {
         Ok(())
     }
 
+    /// The delay can expire with a selection-loss event still queued. Check
+    /// ownership before invoking the body producer factory.
+    pub fn verify_startup_ownership(&mut self, conn: &impl Connection) -> Result<()> {
+        self.owns_selection = self.exists
+            && self.owns_selection
+            && conn.get_selection_owner(self.selection)?.reply()?.owner
+                == self.descriptor.control_xid;
+        if !self.owns_selection {
+            return Err("Control endpoint ownership lost before body startup".into());
+        }
+        Ok(())
+    }
+
     /// Control messages are consumed before body/popup routing and movement flushing.
     pub fn route_request(
         &mut self,

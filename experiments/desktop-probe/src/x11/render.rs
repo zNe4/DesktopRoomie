@@ -3,10 +3,13 @@ use super::{
     resource::{cleanup_all, OwnedResource},
     shape::input_rectangles,
 };
+#[cfg(test)]
 use crate::presentation::procedural::{Palette, ProceduralProducer};
+#[cfg(test)]
+use crate::presentation::{Action, Facing, FrameProducer};
 use crate::presentation::{
-    Action, ActionIntent, ClientExtent, Facing, FrameIdentity, FrameMetadata, FrameProducer,
-    FrameRequest, PreparedFrame, Publication, PublicationEvent, PublicationState,
+    ActionIntent, ClientExtent, FrameIdentity, FrameMetadata, FrameRequest, PreparedFrame,
+    Publication, PublicationError, PublicationEvent, PublicationState,
 };
 use crate::HostError;
 use std::time::Duration;
@@ -66,7 +69,12 @@ impl FrameGeometry {
         self.publication.visibility_uncertain()
     }
 
-    fn request(&self) -> Result<FrameRequest, HostError> {
+    pub(crate) fn frame_request(
+        &self,
+        intent: ActionIntent,
+        elapsed: Duration,
+        delta: Duration,
+    ) -> Result<FrameRequest, HostError> {
         if self.publication_uncertain() {
             return Err("Renderer publication remains unsettled".into());
         }
@@ -85,20 +93,11 @@ impl FrameGeometry {
             }
             None => return Err("Renderer frame authority was invalidated".into()),
         };
-        FrameRequest::new(
-            identity,
-            ActionIntent {
-                action: Action::Idle,
-                facing: Facing::Neutral,
-            },
-            extent,
-            Duration::ZERO,
-            Duration::ZERO,
-        )
-        .map_err(|error| format!("Invalid renderer frame request: {error:?}").into())
+        FrameRequest::new(identity, intent, extent, elapsed, delta)
+            .map_err(|error| format!("Invalid renderer frame request: {error:?}").into())
     }
 
-    fn publish_with(
+    pub(crate) fn publish_with(
         &mut self,
         request: &FrameRequest,
         frame: PreparedFrame<Vec<u8>>,
@@ -107,6 +106,12 @@ impl FrameGeometry {
     ) -> Result<(), HostError> {
         if request.extent() != self.initial_extent {
             return Err("Runtime frame extent changes are unsupported".into());
+        }
+        if frame.identity != request.identity() {
+            return Err(publication_error(PublicationError::IdentityMismatch));
+        }
+        if frame.metadata.extent() != request.extent() {
+            return Err(publication_error(PublicationError::ExtentMismatch));
         }
         let dimensions = native_dimensions(frame.metadata.extent())?;
         if let Some(committed) = self.committed() {
@@ -117,6 +122,7 @@ impl FrameGeometry {
             // Validate the first coverage before it can ever become authoritative.
             input_rectangles(frame.metadata.hit_region())?;
         }
+        validate_bgra8(dimensions, &frame)?;
         self.publication
             .prepare(request, &frame)
             .map_err(publication_error)?;
@@ -146,54 +152,101 @@ impl FrameGeometry {
     }
 
     #[cfg(test)]
+    fn request(&self) -> Result<FrameRequest, HostError> {
+        self.frame_request(
+            ActionIntent {
+                action: Action::Idle,
+                facing: Facing::Neutral,
+            },
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn commit_fixture(&mut self, metadata: Option<FrameMetadata>) {
         let request = self.request().unwrap();
-        let mut frame = ProceduralProducer::new(Palette::Lavender);
         let frame = match metadata {
-            Some(metadata) => PreparedFrame {
-                identity: request.identity(),
-                metadata,
-                payload: Vec::new(),
-            },
-            None => frame.prepare_frame(&request).unwrap(),
+            Some(metadata) => {
+                let size = metadata.extent().size();
+                let mut payload = vec![0; size.width as usize * size.height as usize * 4];
+                for span in metadata.hit_region().spans() {
+                    for x in span.start_x..span.end_x {
+                        payload[(span.y as usize * size.width as usize + x as usize) * 4 + 3] = 255;
+                    }
+                }
+                PreparedFrame {
+                    identity: request.identity(),
+                    metadata,
+                    payload,
+                }
+            }
+            None => ProceduralProducer::new(Palette::Lavender)
+                .prepare_frame(&request)
+                .unwrap(),
         };
         self.publish_with(&request, frame, |_, _| Ok(()), |_| Ok(()))
             .unwrap();
     }
 }
 
-fn publication_error(error: crate::presentation::PublicationError) -> HostError {
+fn publication_error(error: PublicationError) -> HostError {
     format!("Renderer publication rejected: {error:?}").into()
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum ColorTheme {
-    #[default]
-    Lavender,
-    Coral,
+fn validate_bgra8(
+    (width, height): (u16, u16),
+    frame: &PreparedFrame<Vec<u8>>,
+) -> Result<(), HostError> {
+    let width = usize::from(width);
+    let expected_bytes = width
+        .checked_mul(usize::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or("BGRA8 payload size exceeds host limits")?;
+    if frame.payload.len() != expected_bytes {
+        return Err("BGRA8 payload has an unexpected byte length".into());
+    }
+
+    // Canonical spans yield covered pixel indices in the same order as the
+    // tightly packed rows, including disjoint spans and transparent padding.
+    let mut covered = frame
+        .metadata
+        .hit_region()
+        .spans()
+        .iter()
+        .flat_map(|span| {
+            let row_start = span.y as usize * width;
+            (span.start_x..span.end_x).map(move |x| row_start + x as usize)
+        })
+        .peekable();
+    let (pixels, _) = frame.payload.as_chunks::<4>();
+    for (index, pixel) in pixels.iter().enumerate() {
+        let alpha = pixel[3];
+        if pixel[..3].iter().any(|&channel| channel > alpha) {
+            return Err("BGRA8 payload contains a non-premultiplied pixel".into());
+        }
+        if (alpha != 0) != covered.next_if_eq(&index).is_some() {
+            return Err("BGRA8 alpha does not match frame hit coverage".into());
+        }
+    }
+    Ok(())
 }
 
-impl ColorTheme {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Lavender => "Lavender (Default)",
-            Self::Coral => "Coral (Clicked)",
-        }
-    }
+pub(crate) fn paint_committed_with(
+    geometry: &FrameGeometry,
+    blit: impl FnOnce((u16, u16)) -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    blit(native_dimensions(
+        geometry.require_committed()?.metadata.extent(),
+    )?)
+}
 
-    fn toggled(self) -> Self {
-        match self {
-            Self::Lavender => Self::Coral,
-            Self::Coral => Self::Lavender,
-        }
-    }
-
-    fn palette(self) -> Palette {
-        match self {
-            Self::Lavender => Palette::Lavender,
-            Self::Coral => Palette::Coral,
-        }
-    }
+pub(crate) fn checked_blit_with(
+    blit: impl FnOnce() -> Result<(), HostError>,
+    flush: impl FnOnce() -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    blit()?;
+    flush()
 }
 
 pub struct Renderer {
@@ -202,7 +255,6 @@ pub struct Renderer {
 
     pub pixmap: Pixmap,
     pub gc: Gcontext,
-    theme: ColorTheme,
 }
 
 impl Renderer {
@@ -212,7 +264,6 @@ impl Renderer {
         extent: ClientExtent,
     ) -> Result<Self, HostError> {
         let (width, height) = native_dimensions(extent)?;
-        let theme = ColorTheme::default();
 
         // 1. Create depth-32 Pixmap for double buffering
         let pixmap = conn.generate_id()?;
@@ -244,10 +295,10 @@ impl Renderer {
             gc_resource: OwnedResource::default(),
             pixmap,
             gc,
-            theme,
         })
     }
 
+    #[cfg(test)]
     pub fn initial_extent() -> ClientExtent {
         ProceduralProducer::new(Palette::Lavender)
             .capabilities()
@@ -261,11 +312,7 @@ impl Renderer {
         window: Window,
         geometry: &FrameGeometry,
     ) -> Result<(), HostError> {
-        self.blit(
-            conn,
-            window,
-            native_dimensions(geometry.require_committed()?.metadata.extent())?,
-        )
+        paint_committed_with(geometry, |dimensions| self.blit(conn, window, dimensions))
     }
 
     fn blit(
@@ -274,45 +321,26 @@ impl Renderer {
         window: Window,
         (width, height): (u16, u16),
     ) -> Result<(), HostError> {
-        conn.copy_area(self.pixmap, window, self.gc, 0, 0, 0, 0, width, height)?
-            .check()?;
-        conn.flush()?;
-        Ok(())
+        checked_blit_with(
+            || {
+                conn.copy_area(self.pixmap, window, self.gc, 0, 0, 0, 0, width, height)?
+                    .check()?;
+                Ok(())
+            },
+            || Ok(conn.flush()?),
+        )
     }
 
-    pub fn present_initial(
+    pub fn present(
         &self,
         conn: &impl Connection,
         window: Window,
         geometry: &mut FrameGeometry,
+        request: &FrameRequest,
+        frame: PreparedFrame<Vec<u8>>,
     ) -> Result<(), HostError> {
-        self.present(conn, window, geometry, self.theme)
-    }
-
-    /// Toggles the body color palette after checked presentation succeeds.
-    pub fn toggle_color(
-        &mut self,
-        conn: &impl Connection,
-        window: Window,
-        geometry: &mut FrameGeometry,
-    ) -> Result<ColorTheme, HostError> {
-        let theme = self.theme.toggled();
-        self.present(conn, window, geometry, theme)?;
-        self.theme = theme;
-        Ok(theme)
-    }
-
-    fn present(
-        &self,
-        conn: &impl Connection,
-        window: Window,
-        geometry: &mut FrameGeometry,
-        theme: ColorTheme,
-    ) -> Result<(), HostError> {
-        let request = geometry.request()?;
-        let frame = ProceduralProducer::new(theme.palette()).prepare_frame(&request)?;
         geometry.publish_with(
-            &request,
+            request,
             frame,
             |(width, height), payload| {
                 conn.put_image(
@@ -365,18 +393,19 @@ mod tests {
 
     #[test]
     fn renderer_theme_starts_lavender_and_alternates_adapter_palettes() {
-        let initial = ColorTheme::default();
+        let initial = Palette::default();
         let clicked = initial.toggled();
         let clicked_again = clicked.toggled();
         assert_eq!(
             (initial, clicked, clicked_again),
-            (ColorTheme::Lavender, ColorTheme::Coral, initial)
+            (Palette::Lavender, Palette::Coral, initial)
         );
+        let mut producer = ProceduralProducer::new(initial);
         assert_eq!(
             [
-                initial.palette(),
-                clicked.palette(),
-                clicked_again.palette()
+                initial,
+                producer.toggle_palette(),
+                producer.toggle_palette()
             ],
             [Palette::Lavender, Palette::Coral, Palette::Lavender]
         );
@@ -571,5 +600,148 @@ mod tests {
             assert!(geometry.committed().is_none());
             assert_eq!(geometry.initial_extent(), Renderer::initial_extent());
         }
+    }
+
+    #[test]
+    fn malformed_pixels_or_metadata_never_reach_native_submission() {
+        let extent = Renderer::initial_extent();
+        let mut geometry = FrameGeometry::new(extent);
+        geometry.commit_fixture(None);
+        let request = geometry.request().unwrap();
+        let mut producer = ProceduralProducer::new(Palette::Coral);
+        for (defect, expected) in [
+            ("short", "unexpected byte length"),
+            ("long", "unexpected byte length"),
+            ("straight alpha", "non-premultiplied"),
+            ("covered transparency", "alpha does not match"),
+            ("uncovered alpha", "alpha does not match"),
+            ("wrong extent", "ExtentMismatch"),
+        ] {
+            let mut frame = producer.prepare_frame(&request).unwrap();
+            let center = (80 * 160 + 80) * 4;
+            match defect {
+                "short" => frame.payload.truncate(frame.payload.len() - 1),
+                "long" => frame.payload.push(0),
+                "straight alpha" => frame.payload[0] = 1,
+                "covered transparency" => frame.payload[center..center + 4].fill(0),
+                "uncovered alpha" => frame.payload[3] = 1,
+                "wrong extent" => {
+                    let wrong_extent = ClientExtent::new(Size::new(159, 160)).unwrap();
+                    frame.metadata = FrameMetadata::new(
+                        wrong_extent,
+                        None,
+                        None,
+                        HitRegion::new(wrong_extent, []).unwrap(),
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let error = geometry
+                .publish_with(
+                    &request,
+                    frame,
+                    |_, _| panic!("invalid frame must not upload"),
+                    |_| panic!("invalid frame must not blit"),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{defect}: {error}");
+            assert_eq!(
+                geometry.publication.state(request.identity()),
+                Err(PublicationError::IdentityMismatch)
+            );
+            assert_eq!(
+                geometry.require_committed().unwrap().identity,
+                INITIAL_IDENTITY
+            );
+        }
+    }
+
+    #[test]
+    fn native_dimension_and_shape_limits_reject_first_frame_before_submission() {
+        for (width, expected) in [
+            (u32::from(u16::MAX) + 1, "X11"),
+            (i16::MAX as u32 + 1, "input region right edge"),
+        ] {
+            let extent = ClientExtent::new(Size::new(width, 1)).unwrap();
+            let mut geometry = FrameGeometry::new(extent);
+            let request = geometry.request().unwrap();
+            let region = HitRegion::new(
+                extent,
+                [RowSpan {
+                    y: 0,
+                    start_x: width as i32 - 1,
+                    end_x: width as i32,
+                }],
+            )
+            .unwrap();
+            let mut payload = vec![0; width as usize * 4];
+            *payload.last_mut().unwrap() = 255;
+            let frame = PreparedFrame {
+                identity: request.identity(),
+                metadata: FrameMetadata::new(extent, None, None, region).unwrap(),
+                payload,
+            };
+            let error = geometry
+                .publish_with(
+                    &request,
+                    frame,
+                    |_, _| panic!("unrepresentable frame must not upload"),
+                    |_| panic!("unrepresentable frame must not blit"),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(geometry.committed().is_none());
+        }
+    }
+
+    #[test]
+    fn host_frame_requests_stop_at_sequence_and_generation_exhaustion() {
+        let mut geometry = FrameGeometry::new(Renderer::initial_extent());
+        for generation in [0, u64::MAX] {
+            geometry.publication = Publication::new(generation);
+            let identity = FrameIdentity {
+                generation,
+                sequence: u64::MAX,
+            };
+            let request = FrameRequest::new(
+                identity,
+                ActionIntent {
+                    action: Action::Idle,
+                    facing: Facing::Neutral,
+                },
+                geometry.initial_extent(),
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap();
+            let frame = ProceduralProducer::new(Palette::Lavender)
+                .prepare_frame(&request)
+                .unwrap();
+            geometry
+                .publish_with(&request, frame, |_, _| Ok(()), |_| Ok(()))
+                .unwrap();
+            assert_eq!(geometry.require_committed().unwrap().identity, identity);
+            assert!(geometry
+                .request()
+                .unwrap_err()
+                .to_string()
+                .contains("sequence exhausted"));
+            geometry.invalidate();
+            assert!(geometry
+                .request()
+                .unwrap_err()
+                .to_string()
+                .contains("invalidated"));
+            assert!(geometry.committed().is_none());
+            assert_eq!(
+                geometry.publication.state(identity),
+                Ok(PublicationState::Stale)
+            );
+        }
+        assert_eq!(
+            geometry.publication.invalidate(),
+            Err(PublicationError::GenerationExhausted)
+        );
     }
 }

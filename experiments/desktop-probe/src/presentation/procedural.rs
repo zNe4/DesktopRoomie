@@ -13,10 +13,27 @@ const IDLE: ActionIntent = ActionIntent {
     facing: Facing::Neutral,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Palette {
+    #[default]
     Lavender,
     Coral,
+}
+
+impl Palette {
+    pub(crate) fn toggled(self) -> Self {
+        match self {
+            Self::Lavender => Self::Coral,
+            Self::Coral => Self::Lavender,
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Lavender => "Lavender (Default)",
+            Self::Coral => "Coral (Clicked)",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +80,11 @@ impl ProceduralProducer {
             capabilities,
             palette,
         }
+    }
+
+    pub(crate) fn toggle_palette(&mut self) -> Palette {
+        self.palette = self.palette.toggled();
+        self.palette
     }
 }
 

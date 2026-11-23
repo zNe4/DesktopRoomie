@@ -1,5 +1,6 @@
 //! Standalone DesktopRoomie probe and X11 host.
 
+mod body_presentation;
 mod cli;
 mod control;
 mod geometry;
@@ -18,13 +19,15 @@ use x11rb::protocol::shape::ConnectionExt as ShapeExt;
 use x11rb::protocol::xproto::{GrabStatus, MapNotifyEvent, VisualClass};
 use x11rb::protocol::Event;
 
+use crate::body_presentation::{BodyPresentation, FrameKind, FrameTiming};
 #[cfg(test)]
 use crate::cli::HELP;
 use crate::cli::{parse_args, print_help, CliMode};
 use crate::geometry::{calculate_centered_origin, compute_valid_origin_bounds, Point, Size};
 use crate::interaction::{HostAction, InteractionManager, InteractionState, MenuOutcome};
 use crate::layer::{Layer, LayerController, Mutation, ObservedLayer, Step};
-use crate::presentation::HitRegion;
+use crate::presentation::procedural::{Palette, ProceduralProducer};
+use crate::presentation::{ClientExtent, FrameProducer, HitRegion};
 use crate::x11::control::{Acquisition, ControlWindow};
 use crate::x11::events::{drain_events_bounded, wait_x11};
 use crate::x11::menu::{MenuPopup, PopupInputGate};
@@ -152,8 +155,8 @@ fn run_owner(
     };
     let mut body = None;
     let mut renderer = None;
-    let mut runtime = ProbeRuntime::new();
-    let startup = owner_startup_with(
+    let mut runtime = None;
+    let startup = owner_presentation_startup_with(
         &mut owner,
         |owner| owner.acquire(conn),
         |owner| {
@@ -161,9 +164,14 @@ fn run_owner(
                 println!("[Startup Delay] Waiting {delay} second(s) before creating and mapping probe window...");
                 owner.delay(conn, delay)?;
             }
-            Ok(())
+            owner.verify_startup_ownership(conn)
         },
-        |owner| {
+        || Ok(ProceduralProducer::new(Palette::default())),
+        |owner, mut presentation| {
+            let runtime = runtime.insert(ProbeRuntime::with_presentation(
+                presentation.initial_extent(),
+                presentation.timing(),
+            ));
             start_body(
                 conn,
                 screen,
@@ -171,7 +179,8 @@ fn run_owner(
                 owner,
                 &mut body,
                 &mut renderer,
-                &mut runtime,
+                runtime,
+                &mut presentation,
             )
         },
     );
@@ -183,7 +192,10 @@ fn run_owner(
     }
     let result = startup.map(|_| ());
     let outcome = finish_probe_with(result, || {
-        let closing_popup = runtime.menu.as_ref().map(|popup| popup.window);
+        let closing_popup = runtime
+            .as_ref()
+            .and_then(|runtime| runtime.menu.as_ref())
+            .map(|popup| popup.window);
         let cleanup = owner_cleanup_with(
             &mut owner,
             |owner| {
@@ -198,6 +210,10 @@ fn run_owner(
                 ])
             },
             || {
+                let Some(runtime) = &mut runtime else {
+                    return Ok(());
+                };
+                runtime.frame_timing.stop();
                 abort_layer(&mut runtime.layers, "shutdown");
                 runtime.correction = None;
                 let cancellation = body
@@ -216,7 +232,10 @@ fn run_owner(
             |owner| owner.destroy(conn),
             || Ok(conn.flush()?),
         );
-        if runtime.pointer.is_grabbed() {
+        if runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.pointer.is_grabbed())
+        {
             eprintln!("[ERROR] Pointer release remains unconfirmed; connection teardown is best effort only");
         }
         cleanup
@@ -245,6 +264,22 @@ fn owner_startup_with<T>(
     Ok(outcome)
 }
 
+fn owner_presentation_startup_with<T, P>(
+    owner: &mut T,
+    acquire: impl FnOnce(&mut T) -> Result<Acquisition, HostError>,
+    delay: impl FnOnce(&mut T) -> Result<(), HostError>,
+    factory: impl FnOnce() -> Result<P, HostError>,
+    body: impl FnOnce(&mut T, BodyPresentation<P>) -> Result<(), HostError>,
+) -> Result<Acquisition, HostError>
+where
+    P: FrameProducer<Payload = Vec<u8>>,
+    P::Error: Into<HostError>,
+{
+    owner_startup_with(owner, acquire, delay, |owner| {
+        body(owner, BodyPresentation::new(factory()?)?)
+    })
+}
+
 fn owner_cleanup_with<T>(
     owner: &mut T,
     closing: impl FnOnce(&mut T) -> Result<(), HostError>,
@@ -271,6 +306,7 @@ fn start_body(
     body_resource: &mut Option<ManagedProbeWindow>,
     renderer_resource: &mut Option<Renderer>,
     runtime: &mut ProbeRuntime,
+    presentation: &mut BodyPresentation<ProceduralProducer>,
 ) -> Result<(), HostError> {
     let atoms = x11::monitors::LayoutAtoms::subscribe(conn, screen.root)?;
     let layout = query_desktop_layout(conn, screen.root, &atoms, None)?;
@@ -358,8 +394,15 @@ fn start_body(
     println!("  Awaiting MapNotify confirmation from window manager...");
 
     *renderer_resource = Some(Renderer::new(conn, probe_window.window, extent)?);
-    let renderer = renderer_resource.as_mut().unwrap();
-    renderer.present_initial(conn, probe_window.window, &mut runtime.frames)?;
+    let renderer = renderer_resource.as_ref().unwrap();
+    runtime.present_frame(
+        conn,
+        probe_window,
+        renderer,
+        presentation,
+        FrameKind::Initial,
+        false,
+    )?;
 
     println!("\n[Running Probe]");
     if let Some(sec) = duration_secs {
@@ -379,6 +422,7 @@ fn start_body(
         probe_window,
         renderer,
         runtime,
+        presentation,
         owner,
         valid_bounds,
         layout.usable_area,
@@ -545,6 +589,7 @@ struct InputPlacement {
 
 struct ProbeRuntime {
     frames: FrameGeometry,
+    frame_timing: FrameTiming,
     interaction: InteractionManager,
     pointer: PointerCaptureTracker,
     pending_move: Option<Point>,
@@ -560,9 +605,15 @@ struct ProbeRuntime {
     pending_map_input: Option<u64>,
 }
 impl ProbeRuntime {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_presentation(Renderer::initial_extent(), FrameTiming::new(None))
+    }
+
+    fn with_presentation(extent: ClientExtent, frame_timing: FrameTiming) -> Self {
         Self {
-            frames: FrameGeometry::new(Renderer::initial_extent()),
+            frames: FrameGeometry::new(extent),
+            frame_timing,
             interaction: InteractionManager::new(),
             pointer: PointerCaptureTracker::new(),
             pending_move: None,
@@ -577,6 +628,69 @@ impl ProbeRuntime {
             input_fence: InputFence::default(),
             pending_map_input: None,
         }
+    }
+
+    fn frame_eligible(&self, window: &ManagedProbeWindow, owner_busy: bool) -> bool {
+        !owner_busy
+            && self.layers.pending().is_none()
+            && self.body_input_ready()
+            && self.input_obligations_settled()
+            && window.in_flight_moves.is_empty()
+    }
+
+    fn refresh_frame_eligibility(
+        &mut self,
+        now: Instant,
+        window: &ManagedProbeWindow,
+        owner_busy: bool,
+    ) -> Result<(), HostError> {
+        self.frame_timing
+            .update_eligibility(now, self.frame_eligible(window, owner_busy))
+    }
+
+    fn frame_tick_ready(
+        &mut self,
+        now: Instant,
+        window: &ManagedProbeWindow,
+        owner_busy: bool,
+        host_deadline: Option<Instant>,
+    ) -> Result<bool, HostError> {
+        self.refresh_frame_eligibility(now, window, owner_busy)?;
+        Ok(self.frame_timing.due(now) && host_deadline.is_none_or(|deadline| now < deadline))
+    }
+
+    fn present_frame(
+        &mut self,
+        conn: &impl Connection,
+        window: &mut ManagedProbeWindow,
+        renderer: &Renderer,
+        presentation: &mut BodyPresentation<ProceduralProducer>,
+        kind: FrameKind,
+        owner_busy: bool,
+    ) -> Result<(), HostError> {
+        let eligible = self.frame_eligible(window, owner_busy);
+        let result = presentation.present_with(
+            kind,
+            &mut self.frames,
+            &mut self.frame_timing,
+            eligible,
+            Instant::now,
+            |frames, request, frame| renderer.present(conn, window.window, frames, request, frame),
+        );
+        self.finish_frame_publication_with(result, |runtime| {
+            runtime.fence_visibility_input(conn, window)
+        })
+    }
+
+    fn finish_frame_publication_with(
+        &mut self,
+        result: Result<(), HostError>,
+        fence: impl FnOnce(&mut Self) -> Result<(), HostError>,
+    ) -> Result<(), HostError> {
+        if result.is_err() && self.frames.publication_uncertain() {
+            self.invalidate_frame_and_fence_with(fence);
+        }
+        result
     }
 
     /// One allowance per deliberate mapping request, never rearmed by notifications.
@@ -641,6 +755,7 @@ impl ProbeRuntime {
         conn: &impl Connection,
         window: &mut ManagedProbeWindow,
     ) -> Result<(), HostError> {
+        let timing = self.frame_timing.update_eligibility(Instant::now(), false);
         let body = window.window;
         self.fence_visibility_input_with(
             window,
@@ -648,6 +763,7 @@ impl ProbeRuntime {
             |_, _| x11::pointer::ungrab_pointer(conn, x11rb::CURRENT_TIME),
             |popup| popup.destroy(conn),
         )
+        .and(timing)
     }
 
     #[allow(dead_code)]
@@ -918,6 +1034,7 @@ impl ProbeRuntime {
     fn unavailable(&mut self, destroyed: bool) {
         abort_layer(&mut self.layers, "body unavailable");
         self.body = if destroyed {
+            self.frame_timing.stop();
             self.frames.invalidate();
             self.pending_map_input = None;
             self.input_fence.blocked = true;
@@ -1028,13 +1145,15 @@ impl ProbeRuntime {
         conn: &impl Connection,
         window: &mut ManagedProbeWindow,
     ) -> Result<(), HostError> {
+        let timing = self.frame_timing.update_eligibility(Instant::now(), false);
         self.body = BodyAvailability::Unavailable;
         self.correction = None;
-        if self.input_fence.blocked {
+        let safety = if self.input_fence.blocked {
             self.cancel(conn, window, "body unavailable")
         } else {
             self.fence_visibility_input(conn, window)
-        }
+        };
+        safety.and(timing)
     }
 
     fn invalidate_frame_and_fence(
@@ -1042,8 +1161,18 @@ impl ProbeRuntime {
         conn: &impl Connection,
         window: &mut ManagedProbeWindow,
     ) {
+        self.invalidate_frame_and_fence_with(|runtime| {
+            runtime.fence_visibility_input(conn, window)
+        });
+    }
+
+    fn invalidate_frame_and_fence_with(
+        &mut self,
+        fence: impl FnOnce(&mut Self) -> Result<(), HostError>,
+    ) {
+        self.frame_timing.stop();
         self.frames.invalidate();
-        if let Err(cleanup) = self.fence_visibility_input(conn, window) {
+        if let Err(cleanup) = fence(self) {
             eprintln!("[INPUT] Frame authority safety cleanup: {cleanup}");
         }
     }
@@ -4734,7 +4863,16 @@ fn route_owner_request<C: Connection>(
                 host.runtime.layers.pending().is_some(),
             )
         },
-        service_owner_operation,
+        |owner, host| {
+            if owner.active().is_some() {
+                // Admission and terminal completion can both happen in this
+                // call, so the next event boundary alone cannot see the pause.
+                host.runtime
+                    .frame_timing
+                    .update_eligibility(Instant::now(), false)?;
+            }
+            service_owner_operation(owner, host)
+        },
     )
 }
 
@@ -4946,8 +5084,9 @@ fn run_probe(
     atoms: &x11::monitors::LayoutAtoms,
     selected_monitor: u32,
     window: &mut ManagedProbeWindow,
-    renderer: &mut Renderer,
+    renderer: &Renderer,
     runtime: &mut ProbeRuntime,
+    presentation: &mut BodyPresentation<ProceduralProducer>,
     owner: &mut ControlWindow,
     initial_bounds: crate::geometry::ValidOriginBounds,
     initial_area: crate::geometry::Rect,
@@ -4989,6 +5128,7 @@ fn run_probe(
         if runtime.body == BodyAvailability::Destroyed {
             return Ok(None);
         }
+        runtime.refresh_frame_eligibility(Instant::now(), window, owner.active().is_some())?;
         if local_layer_service_allowed(owner.active())
             && runtime
                 .layers
@@ -5096,6 +5236,7 @@ fn run_probe(
             conn.poll_for_event_with_sequence()
         })?;
         for (event, sequence) in batch {
+            runtime.refresh_frame_eligibility(Instant::now(), window, owner.active().is_some())?;
             if owner.handle_event(conn, &event)? {
                 return Ok(Some(ProbeTermination::ControlEndpointLost));
             }
@@ -5317,6 +5458,9 @@ fn run_probe(
                     runtime.body,
                     BodyAvailability::AwaitingMap | BodyAvailability::Unavailable
                 ) {
+                    runtime
+                        .frame_timing
+                        .update_eligibility(Instant::now(), false)?;
                     if window.verified_visible(conn, layout.current_desktop, atoms.wm_desktop)? {
                         runtime.body = BodyAvailability::Validating;
                         runtime.placement(conn, root, window, &bounds)?;
@@ -5569,6 +5713,9 @@ fn run_probe(
                                     origin,
                                 )
                             {
+                                runtime
+                                    .frame_timing
+                                    .update_eligibility(Instant::now(), false)?;
                                 match runtime
                                     .pointer
                                     .acquire_with(CaptureOwner::BodyLeft, || {
@@ -5597,6 +5744,9 @@ fn run_probe(
                                 .handle_right_press_on_body(ev.time, on_body)
                                 == HostAction::TrackOpening =>
                         {
+                            runtime
+                                .frame_timing
+                                .update_eligibility(Instant::now(), false)?;
                             runtime.pointer.track_automatic_right()?;
                             runtime.safety.acquired(Instant::now());
                             println!("[INPUT] Right opening gesture pending");
@@ -5680,15 +5830,16 @@ fn run_probe(
                         HostAction::ReleaseGrabAndToggleColor { time } => {
                             runtime.pointer.release_if_held(conn, time)?;
                             runtime.safety.clear();
-                            match renderer.toggle_color(conn, window.window, &mut runtime.frames) {
-                                Ok(theme) => println!("[INPUT] Click completed: {}", theme.name()),
-                                Err(error) => {
-                                    if runtime.frames.publication_uncertain() {
-                                        runtime.invalidate_frame_and_fence(conn, window);
-                                    }
-                                    return Err(error);
-                                }
-                            }
+                            let palette = presentation.toggle_palette();
+                            runtime.present_frame(
+                                conn,
+                                window,
+                                renderer,
+                                presentation,
+                                FrameKind::Redraw,
+                                owner.active().is_some(),
+                            )?;
+                            println!("[INPUT] Click completed: {}", palette.name());
                         }
                         HostAction::ReleaseGrab { time } => {
                             runtime.pointer.release_if_held(conn, time)?;
@@ -5798,12 +5949,38 @@ fn run_probe(
             buffered_event = Some(event);
             continue;
         }
-        let timeout = probe_deadline(runtime, duration_deadline)
+        let host_deadline = probe_deadline(runtime, duration_deadline)
             .into_iter()
             .chain(remote_deadline(owner))
             .min();
+        // Only a drained batch, settled movement and an empty lookahead can
+        // reach recurring presentation. Existing deadlines still win ties.
+        if runtime.frame_tick_ready(
+            Instant::now(),
+            window,
+            owner.active().is_some(),
+            host_deadline,
+        )? {
+            runtime.present_frame(
+                conn,
+                window,
+                renderer,
+                presentation,
+                FrameKind::Scheduled,
+                false,
+            )?;
+            if let Some(event) = conn.poll_for_event_with_sequence()? {
+                buffered_event = Some(event);
+                continue;
+            }
+        }
+        let timeout = host_deadline
+            .into_iter()
+            .chain(runtime.frame_timing.deadline())
+            .min();
         wait_x11(conn, timeout)?;
     })();
+    runtime.frame_timing.stop();
     // Settle an internal Recover while its borrowed host still exists. A failed
     // shutdown ownership lookup/publication must enter the same fatal boundary,
     // rather than letting later global cleanup emit a misleading Closing reply.
