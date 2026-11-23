@@ -1,6 +1,7 @@
 use super::*;
 use crate::control::{Capability, Evidence, MapState, VisibilityEvidence, WmState, Workspace};
 use crate::geometry::MenuHit;
+use crate::presentation::{ClientExtent, FrameMetadata, RowSpan};
 use std::cell::RefCell;
 use x11rb::protocol::xproto::{ButtonPressEvent, EnterNotifyEvent, MotionNotifyEvent};
 
@@ -24,7 +25,7 @@ fn placement() -> InputPlacement {
     }
 }
 pub(super) fn runtime(case: u8) -> ProbeRuntime {
-    let mut r = ProbeRuntime::new();
+    let mut r = ProbeRuntime::test_presented();
     r.body = BodyAvailability::Ready;
     match case {
         1 => {
@@ -199,7 +200,7 @@ fn all_failure_combinations_attempt_cleanup_preserve_primary_and_block_dispatch(
         assert!(!r.accepts_input());
         r.body = BodyAvailability::Ready; // A later lifecycle event cannot bypass debt.
         assert!(r
-            .restore_visibility_input_with(&w, evidence(), &placement(), || panic!(
+            .restore_visibility_input_with(&w, evidence(), &placement(), |_| panic!(
                 "unresolved fence"
             ))
             .is_err());
@@ -299,7 +300,7 @@ fn enabling_requires_fresh_local_managed_visibility_placement_and_every_settled_
             _ => unreachable!(),
         }
         assert!(r
-            .restore_visibility_input_with(&w, e, &p, || panic!("not ready: {case}"))
+            .restore_visibility_input_with(&w, e, &p, |_| panic!("not ready: {case}"))
             .is_err());
         assert!(!r.accepts_input());
     }
@@ -311,16 +312,16 @@ fn failed_enable_retains_blocking_and_requires_new_native_empty_fence() {
     fence(&mut r, &mut w);
     r.body = BodyAvailability::Ready;
     assert!(r
-        .restore_visibility_input_with(&w, evidence(), &placement(), || Err("enable check".into()))
+        .restore_visibility_input_with(&w, evidence(), &placement(), |_| Err("enable check".into()))
         .is_err());
     assert!(!r.visibility_dispatch_eligible());
     assert!(!r.accepts_input());
     assert!(r
-        .restore_visibility_input_with(&w, evidence(), &placement(), || panic!("no blind retry"))
+        .restore_visibility_input_with(&w, evidence(), &placement(), |_| panic!("no blind retry"))
         .is_err());
     fence(&mut r, &mut w);
     r.body = BodyAvailability::Ready;
-    r.restore_visibility_input_with(&w, evidence(), &placement(), || Ok(140000))
+    r.restore_visibility_input_with(&w, evidence(), &placement(), |_| Ok(140000))
         .unwrap();
     assert!(r.accepts_input());
     assert_eq!(r.input_fence.enabled_after, Some(140000));
@@ -367,7 +368,7 @@ fn full_sequence_gate_rejects_stale_presses_releases_motion_and_crossings_across
     }
     r.body = BodyAvailability::Ready;
     let boundary = 2 * 65536 + 100;
-    r.restore_visibility_input_with(&w, evidence(), &placement(), || Ok(boundary))
+    r.restore_visibility_input_with(&w, evidence(), &placement(), |_| Ok(boundary))
         .unwrap();
     for event in pointer_events() {
         for sequence in [100, 65536 + 100, boundary - 1] {
@@ -399,7 +400,7 @@ fn stale_buffered_input_spanning_bounded_batches_cannot_recreate_actions() {
     let mut w = tests::test_window();
     fence(&mut r, &mut w);
     r.body = BodyAvailability::Ready;
-    r.restore_visibility_input_with(&w, evidence(), &placement(), || Ok(140000))
+    r.restore_visibility_input_with(&w, evidence(), &placement(), |_| Ok(140000))
         .unwrap();
     let mut queue = std::collections::VecDeque::new();
     for _ in 0..40 {
@@ -423,4 +424,170 @@ fn stale_buffered_input_spanning_bounded_batches_cannot_recreate_actions() {
     assert!(!r.interaction.has_left_gesture());
     assert!(r.pending_move.is_none());
     assert!(!r.pointer.is_grabbed());
+}
+
+pub(super) fn install_small_frame(runtime: &mut ProbeRuntime) -> Size {
+    let size = Size::new(73, 49);
+    let extent = ClientExtent::new(size).unwrap();
+    let region = HitRegion::new(
+        extent,
+        [
+            RowSpan {
+                y: 3,
+                start_x: 1,
+                end_x: 3,
+            },
+            RowSpan {
+                y: 3,
+                start_x: 4,
+                end_x: 5,
+            },
+        ],
+    )
+    .unwrap();
+    runtime.frames = FrameGeometry::new(extent);
+    runtime.frames.commit_fixture(Some(
+        FrameMetadata::new(extent, None, None, region).unwrap(),
+    ));
+    size
+}
+
+#[test]
+fn both_body_gestures_use_committed_coverage_at_admission_and_completion() {
+    let mut r = ProbeRuntime::test_input_enabled();
+    r.body = BodyAvailability::Ready;
+    install_small_frame(&mut r);
+    let origin = Point::new(100, 100);
+    let body = Point::new(2, 3);
+    let hole = Point::new(3, 3);
+    let pointer = Point::new(102, 103);
+    let bounds = placement().bounds;
+
+    for outside in [Point::new(0, 3), hole, Point::new(5, 3), Point::new(80, 80)] {
+        let on_body = r.body_hit(outside);
+        assert!(!on_body);
+        assert_eq!(
+            r.interaction
+                .handle_left_press_on_body(pointer, on_body, 100, origin),
+            HostAction::None
+        );
+        assert_eq!(
+            r.interaction.handle_right_press_on_body(100, on_body),
+            HostAction::None
+        );
+        assert!(!r.pointer.is_grabbed());
+        assert!(r.interaction.is_idle());
+    }
+    for (release, toggles) in [(hole, false), (body, true)] {
+        let on_body = r.body_hit(body);
+        assert_eq!(
+            r.interaction
+                .handle_left_press_on_body(pointer, on_body, 100, origin),
+            HostAction::AcquireGrab { time: 100 }
+        );
+        r.pointer
+            .acquire_with(CaptureOwner::BodyLeft, || Ok((GrabStatus::SUCCESS, 150000)))
+            .unwrap();
+        r.interaction.on_grab_acquired();
+        let on_body = r.body_hit(release);
+        assert_eq!(
+            r.interaction.handle_left_release_on_body(
+                Point::new(origin.x + release.x, origin.y + release.y),
+                on_body,
+                101,
+                &bounds
+            ),
+            if toggles {
+                HostAction::ReleaseGrabAndToggleColor { time: 101 }
+            } else {
+                HostAction::ReleaseGrab { time: 101 }
+            }
+        );
+        assert!(r.pointer.release_with(|| Ok(())).unwrap());
+    }
+    for (release, opens) in [(hole, false), (body, true)] {
+        let on_body = r.body_hit(body);
+        assert_eq!(
+            r.interaction.handle_right_press_on_body(102, on_body),
+            HostAction::TrackOpening
+        );
+        r.pointer.track_automatic_right().unwrap();
+        let anchor = Point::new(origin.x + release.x, origin.y + release.y);
+        let on_body = r.body_hit(release);
+        assert_eq!(
+            r.interaction
+                .handle_opening_release(3, 103, 0, anchor, on_body),
+            HostAction::OpeningFinished {
+                time: 103,
+                anchor: opens.then_some(anchor)
+            }
+        );
+        r.pointer.automatic_right_finished().unwrap();
+        assert!(!r.pointer.is_grabbed());
+    }
+}
+
+#[test]
+fn an_input_fence_allows_only_a_fresh_release_to_settle_the_interrupted_owner() {
+    let mut w = tests::test_window();
+    let bounds = placement().bounds;
+    for (button, case) in [(1, 1), (3, 2)] {
+        let mut r = runtime(case);
+        assert!(r.pointer.is_grabbed());
+        r.input_fence.enabled_after = Some(140000);
+        r.input_fence.blocked = true;
+        r.frames.invalidate();
+        assert!(!r.body_hit(Point::new(80, 80)));
+        let mut event = ButtonPressEvent {
+            event: w.window,
+            detail: button,
+            time: 101,
+            ..Default::default()
+        };
+        assert!(r.rejects_body_event(&Event::ButtonPress(event), w.window, 140100));
+        assert!(r.rejects_body_event(&Event::ButtonRelease(event), w.window, 139999));
+        event.time = 99;
+        assert!(r.rejects_body_event(&Event::ButtonRelease(event), w.window, 140100));
+        event.time = 101;
+        event.response_type = 0x80;
+        assert!(r.rejects_body_event(&Event::ButtonRelease(event), w.window, 140100));
+        event.response_type = x11rb::protocol::xproto::BUTTON_RELEASE_EVENT;
+        assert!(!r.rejects_body_event(&Event::ButtonRelease(event), w.window, 140100));
+        if button == 1 {
+            r.cancel_interrupted_left_release_with(&mut w, 101, |pointer| {
+                assert!(pointer.release_with(|| Ok(())).unwrap());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                r.interaction.handle_left_release_on_body(
+                    Point::new(220, 220),
+                    false,
+                    101,
+                    &bounds
+                ),
+                HostAction::None
+            );
+        } else {
+            assert_eq!(
+                r.interaction
+                    .handle_opening_release(3, 101, 0, Point::new(180, 180), false),
+                HostAction::OpeningFinished {
+                    time: 101,
+                    anchor: None
+                }
+            );
+            r.pointer.automatic_right_finished().unwrap();
+        }
+        assert!(!r.pointer.is_grabbed());
+        assert!(!r.accepts_input());
+        fence(&mut r, &mut w);
+        r.body = BodyAvailability::Ready;
+        assert!(r
+            .restore_visibility_input_with(&w, evidence(), &placement(), |_| panic!(
+                "invalidated geometry cannot restore SHAPE"
+            ))
+            .is_err());
+        assert!(!r.accepts_input());
+    }
 }

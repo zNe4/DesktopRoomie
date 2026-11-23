@@ -231,7 +231,7 @@ fn duration_and_wm_close_remain_normal_completion_after_cleanup() {
 
 #[test]
 fn ready_publication_follows_existing_map_and_correction_truth() {
-    let mut runtime = ProbeRuntime::new();
+    let mut runtime = ProbeRuntime::test_presented();
     let mut window = tests::test_window();
     let bounds = crate::geometry::ValidOriginBounds::new(0, 50, 0, 50);
     let actual = crate::geometry::Rect::new(100, 100, 160, 160);

@@ -55,7 +55,7 @@ fn layout() -> control::DestinationIdentity {
         viewport: control::DestinationViewport::AllZero,
         usable_area: area,
         body_size: Size::new(160, 160),
-        valid_origins: checked_probe_bounds(area).unwrap(),
+        valid_origins: checked_probe_bounds(area, Renderer::initial_extent().size()).unwrap(),
     }
 }
 struct Fake {
@@ -173,6 +173,14 @@ impl Fake {
         for step in ["empty", "release", "popup", "desktop", "correct", "shape"] {
             assert_eq!(self.count(step), 0, "{step}");
         }
+    }
+
+    fn use_small_committed_frame(&mut self) {
+        let size = visibility_fence_tests::install_small_frame(&mut self.runtime);
+        let layout = self.layout.as_mut().unwrap();
+        layout.body_size = size;
+        layout.valid_origins = checked_probe_bounds(layout.usable_area, size).unwrap();
+        self.actual = Rect::new(self.actual.x, self.actual.y, size.width, size.height);
     }
 }
 impl BringHereHost for Fake {
@@ -299,7 +307,7 @@ impl BringHereHost for Fake {
                 geometry: actual,
                 bounds: evidence.layout.as_ref().unwrap().valid_origins,
             },
-            || shape.map(|()| 1000),
+            |_| shape.map(|()| 1000),
         )?;
         Ok(true)
     }
@@ -344,6 +352,24 @@ fn safe_local_noop_is_fresh_and_has_zero_mutations_for_all_layers() {
             control::GeometryProof::Verified
         );
     }
+}
+
+#[test]
+fn bring_here_verifies_and_restores_the_admitted_committed_extent() {
+    let mut h = Fake::new(true, false, L::Normal);
+    h.use_small_committed_frame();
+    let mut op = h.operation();
+    assert!(h.run(&mut op).is_none());
+    let result = h.arrived(&mut op);
+    check_result(result, Status::Success, true);
+    assert_eq!(
+        op.placement.layout().unwrap().body_size,
+        h.runtime.committed_size().unwrap()
+    );
+    assert_eq!(h.count("desktop"), 1);
+    assert_eq!(h.count("shape"), 1);
+    assert_eq!(h.count("correct"), 0);
+    assert!(h.runtime.body_hit(Point::new(2, 3)));
 }
 #[test]
 fn local_unsafe_fence_cancels_every_gesture_popup_and_release_debt_neutrally() {
@@ -1226,7 +1252,7 @@ fn desktop_map_state_event_permutations_duplicates_delays_converge_only_through_
             unreachable!()
         };
         h.runtime
-            .synchronize_map_input_with(&map, 100, 9999, || {
+            .synchronize_map_input_with(&map, 100, 9999, |_| {
                 panic!("late map must not reassert shape")
             })
             .unwrap();
@@ -2527,7 +2553,7 @@ pub(crate) mod recover_tests {
                 &self.here.window,
                 snapshot.evidence,
                 input,
-                || shape.map(|()| 2000),
+                |_| shape.map(|()| 2000),
             )?;
             Ok(true)
         }
@@ -2673,6 +2699,34 @@ pub(crate) mod recover_tests {
 
     fn owner(h: &Host) -> HereOwner {
         HereOwner::recover(h.here.now, 2)
+    }
+
+    #[test]
+    fn recover_preserves_the_committed_extent_through_here_top_and_readiness() {
+        let mut h = Host::new(false, true, L::Normal);
+        h.here.use_small_committed_frame();
+        let mut owner = owner(&h);
+        tick(&mut owner, &mut h).unwrap();
+        assert_eq!(
+            owner
+                .active()
+                .unwrap()
+                .placement
+                .layout()
+                .unwrap()
+                .body_size,
+            h.here.runtime.committed_size().unwrap()
+        );
+        assert_eq!(h.here.count("map"), 1);
+        assert!(!h.here.runtime.accepts_input());
+        h.restored();
+        wake(&mut owner);
+        finish_owner(&mut owner, &mut h).unwrap();
+        let result = assert_terminal(&mut owner, &h, Reason::None);
+        assert_eq!(result.status, Status::Success);
+        assert_eq!(h.here.count("shape"), 1);
+        assert_eq!(h.here.count("correct"), 0);
+        assert!(h.here.runtime.body_hit(Point::new(2, 3)));
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4407,7 +4461,7 @@ pub(crate) mod recover_tests {
         h.here.runtime.arm_map_input_sync(20);
         h.here
             .runtime
-            .synchronize_map_input_with(&map, 88, 20, || Ok(25))
+            .synchronize_map_input_with(&map, 88, 20, |_| Ok(25))
             .unwrap();
         assert_eq!(h.here.runtime.pending_map_input, None);
         h.here.current.desktop = 0;
@@ -4465,7 +4519,7 @@ pub(crate) mod recover_tests {
         assert!(h.here.runtime.input_fence.rejects(&press, 88, 9999));
         h.here
             .runtime
-            .synchronize_map_input_with(&map, 88, 9999, || {
+            .synchronize_map_input_with(&map, 88, 9999, |_| {
                 panic!("old map cannot enable successor input")
             })
             .unwrap();
@@ -4520,7 +4574,7 @@ pub(crate) mod recover_tests {
         assert!(!h.here.runtime.input_fence.rejects(&press, 88, 1000));
         h.here
             .runtime
-            .synchronize_map_input_with(&map, 88, 10000, || {
+            .synchronize_map_input_with(&map, 88, 10000, |_| {
                 panic!("consumed synchronization cannot replay")
             })
             .unwrap();
@@ -4949,7 +5003,7 @@ pub(crate) mod recover_tests {
                             geometry: h.here.actual,
                             bounds: layout().valid_origins,
                         },
-                        || panic!("destroyed body must not gain input authority"),
+                        |_| panic!("destroyed body must not gain input authority"),
                     )
                     .unwrap_err();
                 let log = h.here.log.clone();

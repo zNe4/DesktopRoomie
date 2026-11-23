@@ -288,7 +288,7 @@ fn test_expired_deadline_with_more_than_64_buffered_unrelated_events() {
             &mut awaiting_final_confirmation,
             &mut interaction,
             &mut pending_move,
-            || Ok(Point::new(100, 100)), // Live query observes window remained at 100,100 (refusal)
+            || Ok((Point::new(100, 100), Size::new(160, 160))), // Live query observes window remained at 100,100 (refusal)
             |_time| {
                 grab_released = true;
                 Ok(())
@@ -533,7 +533,7 @@ fn test_expired_deadline_query_buffers_release_processes_before_socket_wait() {
             state: KeyButMask::BUTTON1,
             same_screen: true,
         }));
-        Ok(Point::new(100, 100)) // Live query observes discrepancy
+        Ok((Point::new(100, 100), Size::new(160, 160))) // Live query observes discrepancy
     };
 
     check_confirmation_timeout_with(
@@ -616,7 +616,7 @@ pub(super) fn test_window() -> ManagedProbeWindow {
     }
 }
 fn captured_runtime() -> ProbeRuntime {
-    let mut runtime = ProbeRuntime::new();
+    let mut runtime = ProbeRuntime::test_input_enabled();
     runtime.body = BodyAvailability::Ready;
     runtime.interaction.handle_left_press(
         Point::new(180, 180),
@@ -793,7 +793,7 @@ fn interruption_discards_coalesced_move_and_release_preserves_flush_order() {
 
 #[test]
 fn unavailable_body_defers_placement_and_verified_remap_requires_correction_first() {
-    let mut runtime = ProbeRuntime::new();
+    let mut runtime = ProbeRuntime::test_input_enabled();
     let mut window = test_window();
     let bounds = crate::geometry::ValidOriginBounds::new(0, 50, 0, 50);
     let actual = crate::geometry::Rect::new(100, 100, 160, 160);
@@ -1004,7 +1004,19 @@ fn failed_corrective_move_preserves_primary_error_and_attempts_release_before_de
 
 #[test]
 fn unsupported_x11_coordinate_range_is_rejected_before_placement() {
-    assert!(checked_probe_bounds(crate::geometry::Rect::new(32700, 0, 1920, 1080)).is_err());
-    assert!(checked_probe_bounds(crate::geometry::Rect::new(-40000, 0, 1920, 1080)).is_err());
-    assert!(checked_probe_bounds(crate::geometry::Rect::new(-1920, 0, 1920, 1080)).is_ok());
+    assert!(checked_probe_bounds(
+        crate::geometry::Rect::new(32700, 0, 1920, 1080),
+        Renderer::initial_extent().size()
+    )
+    .is_err());
+    assert!(checked_probe_bounds(
+        crate::geometry::Rect::new(-40000, 0, 1920, 1080),
+        Renderer::initial_extent().size()
+    )
+    .is_err());
+    assert!(checked_probe_bounds(
+        crate::geometry::Rect::new(-1920, 0, 1920, 1080),
+        Renderer::initial_extent().size()
+    )
+    .is_ok());
 }

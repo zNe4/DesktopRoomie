@@ -534,6 +534,7 @@ pub fn exceeds_drag_threshold(p1: Point, p2: Point) -> bool {
 
 /// Returns true if the local coordinates (relative to window top-left 0..160)
 /// fall inside the interactive shape (circular body silhouette or translucent test patch).
+#[cfg(test)]
 pub fn is_in_interactive_silhouette(x: i16, y: i16) -> bool {
     if !(0..160).contains(&x) || !(0..160).contains(&y) {
         return false;

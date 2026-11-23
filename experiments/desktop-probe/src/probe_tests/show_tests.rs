@@ -70,7 +70,7 @@ struct Fake {
 }
 impl Fake {
     fn new(current: Reading) -> Self {
-        let mut runtime = ProbeRuntime::new();
+        let mut runtime = ProbeRuntime::test_input_enabled();
         runtime.body = BodyAvailability::Ready;
         runtime.arm_map_input_sync(500);
         Self {
@@ -304,6 +304,7 @@ impl VisibilityHost for Fake {
     fn placement(&mut self) -> Result<ShowPlacement, HostError> {
         self.step("geometry")?;
         Ok(ShowPlacement {
+            body_size: self.runtime.committed_size()?,
             area: self.area,
             current_desktop: self.current.current,
             input: InputPlacement {
@@ -348,7 +349,7 @@ impl VisibilityHost for Fake {
         self.runtime.body = BodyAvailability::Ready;
         let fail = self.fail;
         self.runtime
-            .restore_visibility_input_with(&self.window, snapshot.evidence, p, || {
+            .restore_visibility_input_with(&self.window, snapshot.evidence, p, |_| {
                 if fail == Some("shape") {
                     Err("injected shape".into())
                 } else {
@@ -439,6 +440,36 @@ fn minimized() -> Fake {
 }
 fn visible() -> Reading {
     reading(Visibility::NotMinimizedHere, L::Normal, 2, 2)
+}
+
+#[test]
+fn local_show_restores_using_the_committed_extent_and_refuses_legacy_dimensions() {
+    for actual_matches in [false, true] {
+        let mut h = Fake::new(visible());
+        let size = visibility_fence_tests::install_small_frame(&mut h.runtime);
+        h.bounds = checked_probe_bounds(h.area, size).unwrap();
+        if actual_matches {
+            h.geometry = Rect::new(100, 100, size.width, size.height);
+        }
+        h.fence().unwrap();
+        let mut op = h.operation();
+        let result = service_show_safely_with(&mut op, &mut h);
+        if actual_matches {
+            assert_success(result.unwrap().unwrap(), true, false);
+            assert_eq!(h.count("enable"), 1);
+            assert_eq!(h.runtime.input_fence.enabled_after, Some(4 * 65536 + 123));
+            assert!(h.runtime.body_hit(Point::new(2, 3)));
+            assert!(!h.runtime.body_hit(Point::new(3, 3)));
+        } else {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "Body resized during Show placement verification"
+            );
+            assert_eq!(h.count("enable"), 0);
+            assert!(!h.runtime.accepts_input());
+        }
+        assert_eq!(h.count("correct"), 0);
+    }
 }
 #[test]
 fn recover_service_cannot_call_any_body_host_method() {
@@ -994,7 +1025,7 @@ pub(crate) mod h_c2 {
                 assert!(!op.show.correction_sent);
             } else {
                 h.area = Rect::new(200, 200, 460, 460);
-                h.bounds = checked_probe_bounds(h.area).unwrap();
+                h.bounds = checked_probe_bounds(h.area, Renderer::initial_extent().size()).unwrap();
                 assert!(service_remote_with(&mut op, &mut h).unwrap().is_none());
                 let (target, confirmation) = op.show.correction.unwrap();
                 assert_eq!(target, Point::new(200, 200));
@@ -3807,7 +3838,7 @@ fn off_workspace_show_needs_fresh_final_no_hidden_and_never_arms_map_shape_sync(
         ..Default::default()
     };
     h.runtime
-        .synchronize_map_input_with(&event, h.window.window, 70001, || {
+        .synchronize_map_input_with(&event, h.window.window, 70001, |_| {
             panic!("REMOVE-HIDDEN must not arm post-map SHAPE or enable remote input")
         })
         .unwrap();
@@ -4530,7 +4561,7 @@ fn show_map_notify_cannot_consume_old_startup_allowance_or_enable_early() {
         ..Default::default()
     };
     h.runtime
-        .synchronize_map_input_with(&event, h.window.window, 600, || {
+        .synchronize_map_input_with(&event, h.window.window, 600, |_| {
             panic!("Show must stay fenced")
         })
         .unwrap();
@@ -4539,7 +4570,7 @@ fn show_map_notify_cannot_consume_old_startup_allowance_or_enable_early() {
     h.current = visible();
     assert_success(h.run(&mut op).unwrap(), true, true);
     h.runtime
-        .synchronize_map_input_with(&event, h.window.window, 4 * 65536 + 200, || {
+        .synchronize_map_input_with(&event, h.window.window, 4 * 65536 + 200, |_| {
             panic!("no second SHAPE allowance")
         })
         .unwrap();

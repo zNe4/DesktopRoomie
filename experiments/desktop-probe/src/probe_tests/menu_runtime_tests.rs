@@ -8,7 +8,7 @@ use x11rb::protocol::xproto::{
 };
 
 fn captured_menu() -> ProbeRuntime {
-    let mut runtime = ProbeRuntime::new();
+    let mut runtime = ProbeRuntime::test_input_enabled();
     runtime.body = BodyAvailability::Ready;
     runtime.menu_generation = 2;
     runtime.menu = Some(MenuPopup::test_popup(10, 2));
@@ -436,7 +436,7 @@ fn popup_acquisition_success_and_each_denial_have_single_attempt_and_checked_tea
         GrabStatus::NOT_VIEWABLE,
         GrabStatus::FROZEN,
     ] {
-        let mut runtime = ProbeRuntime::new();
+        let mut runtime = ProbeRuntime::test_input_enabled();
         runtime.body = BodyAvailability::Ready;
         runtime.menu_generation = 2;
         let attempts = Cell::new(0);

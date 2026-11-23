@@ -24,12 +24,13 @@ use crate::cli::{parse_args, print_help, CliMode};
 use crate::geometry::{calculate_centered_origin, compute_valid_origin_bounds, Point, Size};
 use crate::interaction::{HostAction, InteractionManager, InteractionState, MenuOutcome};
 use crate::layer::{Layer, LayerController, Mutation, ObservedLayer, Step};
+use crate::presentation::HitRegion;
 use crate::x11::control::{Acquisition, ControlWindow};
 use crate::x11::events::{drain_events_bounded, wait_x11};
 use crate::x11::menu::{MenuPopup, PopupInputGate};
 use crate::x11::monitors::query_desktop_layout;
 use crate::x11::pointer::{grab_pointer, CaptureOwner, PointerCaptureTracker};
-use crate::x11::render::{Renderer, WINDOW_HEIGHT, WINDOW_WIDTH};
+use crate::x11::render::{FrameGeometry, Renderer};
 use crate::x11::state::{LayerAtoms, LayerSupport, PropertyResult, RemoteLayerIssue};
 use crate::x11::visual::find_alpha_visual;
 use crate::x11::window::{ConfigureReconciliation, ManagedProbeWindow};
@@ -302,8 +303,9 @@ fn start_body(
     );
 
     // 2. Validate geometry & bounds
-    let body_size = Size::new(WINDOW_WIDTH as u32, WINDOW_HEIGHT as u32);
-    let valid_bounds = checked_probe_bounds(layout.usable_area)?;
+    let extent = runtime.frames.initial_extent();
+    let body_size = extent.size();
+    let valid_bounds = checked_probe_bounds(layout.usable_area, body_size)?;
     let requested_origin = calculate_centered_origin(layout.usable_area, body_size)?;
 
     if let Some(ref pm) = layout.primary_monitor {
@@ -329,8 +331,13 @@ fn start_body(
     }
 
     // Save each successful resource immediately so all later failures reach ordered cleanup.
-    let (body, map_sequence) =
-        ManagedProbeWindow::create(conn, screen.root, alpha_vis.visual_id, requested_origin)?;
+    let (body, map_sequence) = ManagedProbeWindow::create(
+        conn,
+        screen.root,
+        alpha_vis.visual_id,
+        requested_origin,
+        extent,
+    )?;
     *body_resource = Some(body);
     runtime.arm_map_input_sync(map_sequence);
     let probe_window = body_resource.as_mut().unwrap();
@@ -340,23 +347,19 @@ fn start_body(
     println!(
         "  Window created: ID=0x{:x}, initial configured geometry={}x{} at +{}+{}",
         probe_window.window,
-        probe_window.width,
-        probe_window.height,
+        body_size.width,
+        body_size.height,
         probe_window.x(),
         probe_window.y()
     );
     println!("  Requested startup placement: {}", requested_origin);
     println!("  Window properties: borderless (_MOTIF_WM_HINTS), managed, type=UTILITY");
-    println!("  Input shape: X11 Shape extension applied to body silhouette and test patch");
+    println!("  Input shape: empty until presentation and placement are verified");
     println!("  Awaiting MapNotify confirmation from window manager...");
 
-    *renderer_resource = Some(Renderer::new(
-        conn,
-        probe_window.window,
-        probe_window.colormap,
-    )?);
+    *renderer_resource = Some(Renderer::new(conn, probe_window.window, extent)?);
     let renderer = renderer_resource.as_mut().unwrap();
-    renderer.paint(conn, probe_window.window)?;
+    renderer.present_initial(conn, probe_window.window, &mut runtime.frames)?;
 
     println!("\n[Running Probe]");
     if let Some(sec) = duration_secs {
@@ -396,9 +399,9 @@ fn finish_probe_with(
 
 fn checked_probe_bounds(
     area: crate::geometry::Rect,
+    size: Size,
 ) -> Result<crate::geometry::ValidOriginBounds, HostError> {
-    let bounds =
-        compute_valid_origin_bounds(area, Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()))?;
+    let bounds = compute_valid_origin_bounds(area, size)?;
     for coordinate in [bounds.min_x, bounds.max_x, bounds.min_y, bounds.max_y] {
         i16::try_from(coordinate)
             .map_err(|_| "Selected-monitor placement exceeds supported X11 coordinate range")?;
@@ -541,6 +544,7 @@ struct InputPlacement {
 }
 
 struct ProbeRuntime {
+    frames: FrameGeometry,
     interaction: InteractionManager,
     pointer: PointerCaptureTracker,
     pending_move: Option<Point>,
@@ -558,6 +562,7 @@ struct ProbeRuntime {
 impl ProbeRuntime {
     fn new() -> Self {
         Self {
+            frames: FrameGeometry::new(Renderer::initial_extent()),
             interaction: InteractionManager::new(),
             pointer: PointerCaptureTracker::new(),
             pending_move: None,
@@ -581,30 +586,53 @@ impl ProbeRuntime {
         self.pending_map_input = Some(map_sequence);
     }
 
+    fn map_input_pending_for(&self, event: &MapNotifyEvent, body: u32, sequence: u64) -> bool {
+        !self.input_fence.blocked
+            && event.window == body
+            && event.event == body
+            && event.response_type & 0x80 == 0
+            && !event.override_redirect
+            && self
+                .pending_map_input
+                .is_some_and(|after| sequence >= after)
+    }
+
     fn synchronize_map_input_with(
         &mut self,
         event: &MapNotifyEvent,
         body: u32,
         sequence: u64,
-        restore: impl FnOnce() -> Result<u64, HostError>,
+        restore: impl FnOnce(&Self) -> Result<u64, HostError>,
     ) -> Result<(), HostError> {
-        if self.input_fence.blocked
-            || event.window != body
-            || event.event != body
-            || event.response_type & 0x80 != 0
-            || event.override_redirect
-            || !self
-                .pending_map_input
-                .is_some_and(|after| sequence >= after)
-        {
+        if !self.map_input_pending_for(event, body, sequence) {
             return Ok(());
         }
         // Consume before sending: a failed check is fatal, not permission to retry
         // on duplicate notifications. Only success establishes the freshness gate.
         self.pending_map_input = None;
-        let sequence = restore()?;
+        self.input_fence.enabled_after = None;
+        let sequence = restore(self)?;
         self.input_fence.enabled_after = Some(sequence);
         Ok(())
+    }
+
+    /// Called after a genuine map has passed live visibility and placement checks.
+    fn synchronize_placed_map_input_with(
+        &mut self,
+        event: &MapNotifyEvent,
+        window: &ManagedProbeWindow,
+        sequence: u64,
+        restore: impl FnOnce(&HitRegion) -> Result<u64, HostError>,
+    ) -> Result<(), HostError> {
+        if self.body != BodyAvailability::Ready
+            || !self.input_obligations_settled()
+            || !window.in_flight_moves.is_empty()
+        {
+            return Ok(());
+        }
+        self.synchronize_map_input_with(event, window.window, sequence, |runtime| {
+            restore(runtime.frames.require_committed()?.metadata.hit_region())
+        })
     }
 
     /// Show rejects pending local correction before entering this checked fence.
@@ -676,18 +704,7 @@ impl ProbeRuntime {
     fn visibility_dispatch_eligible(&self) -> bool {
         self.input_fence.blocked
             && self.input_fence.empty_confirmed
-            && !self.pointer.is_grabbed()
-            && self.menu.is_none()
-            && matches!(
-                self.interaction.state(),
-                InteractionState::Idle | InteractionState::SuppressedUntilRelease { .. }
-            )
-            && self.pending_move.is_none()
-            && self.final_target.is_none()
-            && self.confirmation_deadline.is_none()
-            && self.correction.is_none()
-            && self.safety.deadline.is_none()
-            && self.safety.observation.is_none()
+            && self.input_obligations_settled()
             && self.body != BodyAvailability::Destroyed
     }
 
@@ -699,8 +716,8 @@ impl ProbeRuntime {
         snapshot: &x11::visibility::VisibilitySnapshot,
         placement: &InputPlacement,
     ) -> Result<(), HostError> {
-        self.restore_visibility_input_with(window, snapshot.evidence, placement, || {
-            x11::shape::restore_body_input_shape(conn, window.window, window.width, window.height)
+        self.restore_visibility_input_with(window, snapshot.evidence, placement, |region| {
+            x11::shape::restore_body_input_shape(conn, window.window, region)
         })
     }
 
@@ -710,14 +727,15 @@ impl ProbeRuntime {
         window: &ManagedProbeWindow,
         evidence: control::VisibilityEvidence,
         placement: &InputPlacement,
-        restore: impl FnOnce() -> Result<u64, HostError>,
+        restore: impl FnOnce(&HitRegion) -> Result<u64, HostError>,
     ) -> Result<(), HostError> {
+        let metadata = &self.frames.require_committed()?.metadata;
         if !self.visibility_dispatch_eligible()
             || self.body != BodyAvailability::Ready
             || control::classify(evidence).visibility != control::Visibility::NotMinimizedHere
             || placement.selected_monitor == 0
             || placement.selected_monitor != placement.observed_monitor
-            || placement.geometry.size() != Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into())
+            || placement.geometry.size() != metadata.extent().size()
             || placement.geometry.origin() != window.confirmed_origin()
             || !placement.bounds.contains(placement.geometry.origin())
             || !window.in_flight_moves.is_empty()
@@ -727,9 +745,9 @@ impl ProbeRuntime {
         // A failed check can mean the server applied the shape: retain logical
         // blocking and invalidate empty-fence proof until explicitly fenced again.
         self.input_fence.empty_confirmed = false;
-        let sequence = restore()?;
+        let sequence = restore(metadata.hit_region())?;
         self.input_fence.enabled_after = Some(sequence);
-        self.pending_map_input = None; // checked restoration supplies the post-map silhouette
+        self.pending_map_input = None; // checked restoration supplies the post-map input region
         self.input_fence.blocked = false;
         self.input_fence.automatic_correction_blocked = false;
         Ok(())
@@ -900,6 +918,9 @@ impl ProbeRuntime {
     fn unavailable(&mut self, destroyed: bool) {
         abort_layer(&mut self.layers, "body unavailable");
         self.body = if destroyed {
+            self.frames.invalidate();
+            self.pending_map_input = None;
+            self.input_fence.blocked = true;
             BodyAvailability::Destroyed
         } else {
             BodyAvailability::Unavailable
@@ -919,12 +940,128 @@ impl ProbeRuntime {
         }
         Ok(())
     }
-    fn accepts_input(&self) -> bool {
+    fn committed_size(&self) -> Result<Size, HostError> {
+        Ok(self.frames.require_committed()?.metadata.extent().size())
+    }
+
+    fn body_input_ready(&self) -> bool {
         !self.input_fence.blocked
             && self.body == BodyAvailability::Ready
+            && self.input_fence.enabled_after.is_some()
+            && self.frames.committed().is_some()
+    }
+
+    fn accepts_input(&self) -> bool {
+        self.body_input_ready()
             && self.menu.is_none()
             && !matches!(self.pointer.owner(), Some(CaptureOwner::Menu { .. }))
     }
+
+    fn body_hit(&self, point: Point) -> bool {
+        self.accepts_input()
+            && self
+                .frames
+                .committed()
+                .is_some_and(|frame| frame.metadata.hit_region().contains(point))
+    }
+
+    fn rejects_body_event(&self, event: &Event, body: u32, sequence: u64) -> bool {
+        if !self.input_fence.rejects(event, body, sequence) {
+            return false;
+        }
+        // A fence forbids actions from this gesture, but a fresh genuine
+        // matching release can still settle an existing body pointer owner.
+        !matches!(event, Event::ButtonRelease(ev)
+        if ev.event == body
+            && ev.response_type & 0x80 == 0
+            && self.input_fence.enabled_after.is_none_or(|after| sequence >= after)
+            && self.interaction.accepts_gesture_time(ev.time)
+            && match self.pointer.owner() {
+                Some(CaptureOwner::BodyLeft) => ev.detail == 1,
+                Some(CaptureOwner::OpeningRight) => true,
+                _ => false,
+            })
+    }
+
+    fn cancel_interrupted_left_release_with(
+        &mut self,
+        window: &mut ManagedProbeWindow,
+        time: u32,
+        release: impl FnOnce(&mut PointerCaptureTracker) -> Result<(), HostError>,
+    ) -> Result<(), HostError> {
+        if !self.body_input_ready()
+            && (self.interaction.has_left_gesture()
+                || self.pointer.owner() == Some(CaptureOwner::BodyLeft))
+            && self.interaction.accepts_gesture_time(time)
+        {
+            self.cancel_with(window, release)?;
+        }
+        Ok(())
+    }
+
+    fn input_obligations_settled(&self) -> bool {
+        !self.pointer.is_grabbed()
+            && self.menu.is_none()
+            && matches!(
+                self.interaction.state(),
+                InteractionState::Idle | InteractionState::SuppressedUntilRelease { .. }
+            )
+            && self.pending_move.is_none()
+            && self.final_target.is_none()
+            && self.confirmation_deadline.is_none()
+            && self.correction.is_none()
+            && self.safety.deadline.is_none()
+            && self.safety.observation.is_none()
+    }
+
+    fn native_unavailable(
+        &mut self,
+        conn: &impl Connection,
+        window: &mut ManagedProbeWindow,
+    ) -> Result<(), HostError> {
+        abort_layer(&mut self.layers, "body unavailable");
+        self.fence_unavailable_input(conn, window)
+    }
+
+    fn fence_unavailable_input(
+        &mut self,
+        conn: &impl Connection,
+        window: &mut ManagedProbeWindow,
+    ) -> Result<(), HostError> {
+        self.body = BodyAvailability::Unavailable;
+        self.correction = None;
+        if self.input_fence.blocked {
+            self.cancel(conn, window, "body unavailable")
+        } else {
+            self.fence_visibility_input(conn, window)
+        }
+    }
+
+    fn invalidate_frame_and_fence(
+        &mut self,
+        conn: &impl Connection,
+        window: &mut ManagedProbeWindow,
+    ) {
+        self.frames.invalidate();
+        if let Err(cleanup) = self.fence_visibility_input(conn, window) {
+            eprintln!("[INPUT] Frame authority safety cleanup: {cleanup}");
+        }
+    }
+
+    #[cfg(test)]
+    fn test_presented() -> Self {
+        let mut runtime = Self::new();
+        runtime.frames.commit_fixture(None);
+        runtime
+    }
+
+    #[cfg(test)]
+    fn test_input_enabled() -> Self {
+        let mut runtime = Self::test_presented();
+        runtime.input_fence.enabled_after = Some(0);
+        runtime
+    }
+
     fn can_reconcile(&self) -> bool {
         !matches!(
             self.body,
@@ -944,6 +1081,18 @@ impl ProbeRuntime {
             return Ok(());
         }
         let actual = window.query_actual_root_geometry(conn, root)?;
+        if actual.size() != self.committed_size()? {
+            self.invalidate_frame_and_fence(conn, window);
+            return Err(format!(
+                "Unsupported body dimensions on placement verification: {}",
+                actual.size()
+            )
+            .into());
+        }
+        if !bounds.contains(actual.origin()) && !self.input_fence.blocked {
+            self.fence_visibility_input(conn, window)?;
+            self.body = BodyAvailability::Validating;
+        }
         self.placement_with(window, actual, bounds, |window, target| {
             window.configure_position(conn, target)
         })
@@ -958,7 +1107,7 @@ impl ProbeRuntime {
         if !self.can_reconcile() {
             return Ok(());
         }
-        if actual.size() != Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()) {
+        if actual.size() != self.committed_size()? {
             return Err(format!(
                 "Unsupported body dimensions on placement verification: {}",
                 actual.size()
@@ -1481,6 +1630,7 @@ trait VisibilityHost {
 }
 
 struct ShowPlacement {
+    body_size: Size,
     input: InputPlacement,
     area: crate::geometry::Rect,
     current_desktop: u32,
@@ -1797,6 +1947,7 @@ fn visibility_placement(
         .layout()
         .ok_or("Recover has no admitted destination")?;
     Ok(ShowPlacement {
+        body_size: layout.body_size,
         area: layout.usable_area,
         current_desktop: layout.current_desktop,
         input: InputPlacement {
@@ -2026,7 +2177,7 @@ fn validate_show_placement(
             "Retained monitor disappeared during Show; automatic migration is unsupported".into(),
         );
     }
-    if input.geometry.size() != Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()) {
+    if input.geometry.size() != placement.body_size {
         return Err("Body resized during Show placement verification".into());
     }
     if operation
@@ -3929,22 +4080,9 @@ impl<'b, C: Connection> RecoverHost for NativeHere<'_, 'b, C> {
 }
 
 fn here_runtime_ready(runtime: &ProbeRuntime, window: &ManagedProbeWindow) -> bool {
-    runtime.body == BodyAvailability::Ready
-        && !runtime.input_fence.blocked
-        && runtime.input_fence.enabled_after.is_some()
+    runtime.body_input_ready()
         && runtime.pending_map_input.is_none()
-        && !runtime.pointer.is_grabbed()
-        && runtime.menu.is_none()
-        && matches!(
-            runtime.interaction.state(),
-            InteractionState::Idle | InteractionState::SuppressedUntilRelease { .. }
-        )
-        && runtime.pending_move.is_none()
-        && runtime.final_target.is_none()
-        && runtime.confirmation_deadline.is_none()
-        && runtime.correction.is_none()
-        && runtime.safety.deadline.is_none()
-        && runtime.safety.observation.is_none()
+        && runtime.input_obligations_settled()
         && window.in_flight_moves.is_empty()
 }
 
@@ -4008,6 +4146,7 @@ impl<C: Connection> NativeVisibility<'_, C> {
             self.layout_atoms,
             self.selected_monitor,
         );
+        let body_size = self.runtime.committed_size()?;
         here_evidence_with(
             || {
                 let layout = query_destination_layout_preserving_native(
@@ -4016,7 +4155,7 @@ impl<C: Connection> NativeVisibility<'_, C> {
                     atoms,
                     selected,
                     frozen_destination,
-                    Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()),
+                    body_size,
                 )?;
                 Ok(layout.and_then(here_destination_identity))
             },
@@ -4048,7 +4187,7 @@ fn here_destination_identity(
 ) -> Result<control::DestinationIdentity, x11::monitors::destination::DestinationError> {
     // Stage B proves capacity; signed native coordinate limits remain evidence
     // validation, never an outer native acquisition failure.
-    checked_probe_bounds(layout.usable_area).map_err(|error| {
+    checked_probe_bounds(layout.usable_area, layout.body_size).map_err(|error| {
         x11::monitors::destination::DestinationError::Unverifiable(error.to_string())
     })?;
     Ok((&layout).into())
@@ -4150,9 +4289,7 @@ impl<C: Connection> VisibilityHost for NativeVisibility<'_, C> {
         Ok(snapshot)
     }
     fn noop_ready(&self) -> bool {
-        self.runtime.body == BodyAvailability::Ready
-            && !self.runtime.input_fence.blocked
-            && self.runtime.correction.is_none()
+        self.runtime.body_input_ready() && self.runtime.correction.is_none()
     }
     fn placement_busy(&self) -> bool {
         self.runtime.correction.is_some()
@@ -4223,13 +4360,15 @@ impl<C: Connection> VisibilityHost for NativeVisibility<'_, C> {
             self.layout_atoms,
             self.selected_monitor,
         )?;
-        let bounds = checked_probe_bounds(layout.usable_area)?;
+        let body_size = self.runtime.committed_size()?;
+        let bounds = checked_probe_bounds(layout.usable_area, body_size)?;
         let geometry = self
             .window
             .query_actual_root_geometry(self.conn, self.root)?;
         *self.bounds = bounds;
         *self.area = layout.usable_area;
         Ok(ShowPlacement {
+            body_size,
             area: layout.usable_area,
             current_desktop: layout.current_desktop,
             input: InputPlacement {
@@ -4286,6 +4425,9 @@ impl<C: Connection> VisibilityHost for NativeVisibility<'_, C> {
     ) -> Result<geometry::Rect, HostError> {
         // Match ordinary placement's borrowed resource updates, using only the
         // already admitted strict identity rather than a new legacy layout.
+        if layout.body_size != self.runtime.committed_size()? {
+            return Err("Recover placement lost its committed body extent".into());
+        }
         *self.bounds = layout.valid_origins;
         *self.area = layout.usable_area;
         self.window.query_actual_root_geometry(self.conn, self.root)
@@ -4869,16 +5011,12 @@ fn run_probe(
             if let Some((_, deadline)) = runtime.correction {
                 if now >= deadline {
                     if !window.is_viewable(conn)? {
-                        runtime.cancel(
-                            conn,
-                            window,
-                            "body unavailable during correction verification",
-                        )?;
-                        runtime.unavailable(false);
+                        runtime.native_unavailable(conn, window)?;
                         continue;
                     }
                     let actual = window.query_actual_root_geometry(conn, root)?;
-                    if actual.size() != Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()) {
+                    if actual.size() != runtime.committed_size()? {
+                        runtime.invalidate_frame_and_fence(conn, window);
                         return Err("Body resized during bounds correction".into());
                     }
                     runtime.check_correction(now, actual.origin(), &bounds)?;
@@ -4887,7 +5025,8 @@ fn run_probe(
                 }
             } else {
                 let window_id = window.window;
-                check_confirmation_timeout_with(
+                let frames = &runtime.frames;
+                let confirmation = check_confirmation_timeout_with(
                     &mut runtime.confirmation_deadline,
                     window,
                     &mut runtime.final_target,
@@ -4897,13 +5036,17 @@ fn run_probe(
                         let actual = ManagedProbeWindow::query_window_actual_root_geometry(
                             conn, window_id, root,
                         )?;
-                        if actual.size() != Size::new(WINDOW_WIDTH.into(), WINDOW_HEIGHT.into()) {
+                        if actual.size() != frames.require_committed()?.metadata.extent().size() {
                             return Err("Body resized during movement verification".into());
                         }
-                        Ok(actual.origin())
+                        Ok((actual.origin(), actual.size()))
                     },
                     |time| runtime.pointer.release_if_held(conn, time).map(|_| ()),
-                )?;
+                );
+                if let Err(error) = confirmation {
+                    runtime.invalidate_frame_and_fence(conn, window);
+                    return Err(error);
+                }
                 if runtime.menu.is_some()
                     && !matches!(
                         runtime.interaction.state(),
@@ -5068,13 +5211,7 @@ fn run_probe(
                                 // A delayed unmap is evidence, not unconditional
                                 // cancellation. Real unavailability still settles input.
                                 if !window.is_viewable(conn)? {
-                                    runtime.cancel(
-                                        conn,
-                                        window,
-                                        "body unavailable during remote layer operation",
-                                    )?;
-                                    runtime.body = BodyAvailability::Unavailable;
-                                    runtime.correction = None;
+                                    runtime.fence_unavailable_input(conn, window)?;
                                 }
                                 continue;
                             }
@@ -5085,18 +5222,16 @@ fn run_probe(
                         }
                     } else {
                         if matches!(&event, Event::UnmapNotify(e) if e.window == window.window) {
-                            runtime.cancel(
-                                conn,
-                                window,
-                                "body unavailable during visibility operation",
-                            )?;
-                            runtime.unavailable(false);
+                            runtime.native_unavailable(conn, window)?;
                         }
                         // E/F owns expected visibility and geometry notifications.
                         continue;
                     }
                 }
-                if owner.active().is_none() && runtime.input_fence.blocked {
+                if owner.active().is_none()
+                    && runtime.input_fence.blocked
+                    && !matches!(&event, Event::DestroyNotify(ev) if ev.window == window.window)
+                {
                     restore_deferred_input(&mut NativeVisibility {
                         recover_owner: None,
                         conn,
@@ -5115,7 +5250,7 @@ fn run_probe(
                     continue;
                 }
             }
-            if runtime.input_fence.rejects(&event, window.window, sequence) {
+            if runtime.rejects_body_event(&event, window.window, sequence) {
                 continue;
             }
             // Preserve the original fatal diagnostic even if release/cleanup also fails.
@@ -5153,6 +5288,13 @@ fn run_probe(
                     "QueryPointer confirmed initiating button released",
                 )?;
             }
+            if matches!(&event, Event::UnmapNotify(ev)
+                if ev.window == window.window && ev.event == window.window
+                    && ev.response_type & 0x80 == 0)
+            {
+                runtime.native_unavailable(conn, window)?;
+                continue;
+            }
             let right_cancelled = matches!(&event, Event::ButtonPress(ev) if ev.event == window.window && ev.detail == 3)
                 && runtime.interaction.has_left_gesture();
             if matches!(&event, Event::ButtonPress(ev) if ev.event == window.window && ev.detail == 3 && !runtime.interaction.accepts_gesture_time(ev.time))
@@ -5170,7 +5312,7 @@ fn run_probe(
             if relevant_layout_event(&event, root, window.window, atoms) {
                 let layout = query_desktop_layout(conn, root, atoms, Some(selected_monitor))?;
                 usable_area = layout.usable_area;
-                bounds = checked_probe_bounds(usable_area)?;
+                bounds = checked_probe_bounds(usable_area, runtime.committed_size()?)?;
                 if !matches!(
                     runtime.body,
                     BodyAvailability::AwaitingMap | BodyAvailability::Unavailable
@@ -5179,7 +5321,7 @@ fn run_probe(
                         runtime.body = BodyAvailability::Validating;
                         runtime.placement(conn, root, window, &bounds)?;
                     } else {
-                        runtime.unavailable(false);
+                        runtime.native_unavailable(conn, window)?;
                     }
                 }
                 continue;
@@ -5288,28 +5430,39 @@ fn run_probe(
                 }
             }
             match event {
-                Event::MapNotify(ev) if ev.window == window.window => {
+                Event::MapNotify(ev)
+                    if runtime.map_input_pending_for(&ev, window.window, sequence) =>
+                {
                     if owner.active().is_some_and(remote_owns_layer) {
                         continue;
                     }
                     runtime.cancel(conn, window, "map verification")?;
                     let layout = query_desktop_layout(conn, root, atoms, Some(selected_monitor))?;
                     usable_area = layout.usable_area;
-                    bounds = checked_probe_bounds(usable_area)?;
+                    bounds = checked_probe_bounds(usable_area, runtime.committed_size()?)?;
                     if window.verified_visible(conn, layout.current_desktop, atoms.wm_desktop)? {
-                        // Openbox may not propagate the pre-map input shape to its
-                        // managed frame. Reassert the identical SK::INPUT silhouette
-                        // once after a genuine map, before existing placement checks.
-                        runtime.synchronize_map_input_with(&ev, window.window, sequence, || {
-                            x11::shape::restore_body_input_shape(
-                                conn,
-                                window.window,
-                                window.width,
-                                window.height,
-                            )
-                        })?;
+                        // The initial checked blit can precede the WM's actual map.
+                        // Paint the same committed frame now that the body is viewable.
+                        if let Err(error) = renderer.paint(conn, window.window, &runtime.frames) {
+                            runtime.invalidate_frame_and_fence(conn, window);
+                            return Err(error);
+                        }
                         runtime.body = BodyAvailability::Validating;
                         runtime.placement(conn, root, window, &bounds)?;
+                        // Openbox can require a checked post-map SHAPE update.
+                        // If placement needed a correction, the ordinary fenced
+                        // restore path will do this only after confirmation.
+                        if let Err(error) = runtime.synchronize_placed_map_input_with(
+                            &ev,
+                            window,
+                            sequence,
+                            |region| {
+                                x11::shape::restore_body_input_shape(conn, window.window, region)
+                            },
+                        ) {
+                            runtime.invalidate_frame_and_fence(conn, window);
+                            return Err(error);
+                        }
                         println!("[PLACEMENT] Verified map at {}", window.confirmed_origin());
                         service_layer(
                             conn,
@@ -5320,11 +5473,8 @@ fn run_probe(
                             None,
                         )?;
                     } else {
-                        runtime.unavailable(false);
+                        runtime.native_unavailable(conn, window)?;
                     }
-                }
-                Event::UnmapNotify(ev) if ev.window == window.window => {
-                    runtime.unavailable(false);
                 }
                 Event::DestroyNotify(ev) if ev.window == window.window => {
                     window.window_resource.externally_destroyed();
@@ -5339,12 +5489,18 @@ fn run_probe(
                     ) {
                         continue;
                     }
-                    match window.handle_configure_notify(conn, root, &ev)? {
+                    match window.handle_configure_notify(
+                        conn,
+                        root,
+                        runtime.committed_size()?,
+                        &ev,
+                    )? {
                         ConfigureReconciliation::UnexpectedSizeChange { expected, actual } => {
+                            runtime.invalidate_frame_and_fence(conn, window);
                             return Err(format!(
                                 "WM altered body dimensions: expected {expected}, actual {actual}"
                             )
-                            .into())
+                            .into());
                         }
                         _ if runtime.correction.is_some() => {} // fixed deadline verifies the live position
                         ConfigureReconciliation::Confirmed { origin, .. } => {
@@ -5397,13 +5553,18 @@ fn run_probe(
                         runtime.sync_safety(previous);
                         continue;
                     }
+                    let on_body = ev.same_screen
+                        && runtime.body_hit(Point::new(ev.event_x.into(), ev.event_y.into()));
                     match ev.detail {
-                        1 if held_buttons(ev.state) == 0 && !runtime.pointer.is_grabbed() => {
+                        1 if on_body
+                            && held_buttons(ev.state) == 0
+                            && !runtime.pointer.is_grabbed() =>
+                        {
                             let origin = window.query_actual_root_origin(conn, root)?;
                             if let HostAction::AcquireGrab { time } =
-                                runtime.interaction.handle_left_press(
+                                runtime.interaction.handle_left_press_on_body(
                                     Point::new(ev.root_x.into(), ev.root_y.into()),
-                                    (ev.event_x, ev.event_y),
+                                    on_body,
                                     ev.time,
                                     origin,
                                 )
@@ -5431,10 +5592,9 @@ fn run_probe(
                         3 if !right_cancelled
                             && held_buttons(ev.state) == 0
                             && !runtime.pointer.is_grabbed()
-                            && crate::geometry::is_in_interactive_silhouette(
-                                ev.event_x, ev.event_y,
-                            )
-                            && runtime.interaction.handle_right_press(ev.time)
+                            && runtime
+                                .interaction
+                                .handle_right_press_on_body(ev.time, on_body)
                                 == HostAction::TrackOpening =>
                         {
                             runtime.pointer.track_automatic_right()?;
@@ -5454,15 +5614,13 @@ fn run_probe(
                     ) {
                         let previous = runtime.interaction.active_button();
                         let anchor = Point::new(ev.root_x.into(), ev.root_y.into());
-                        let origin = window.query_actual_root_origin(conn, root)?;
-                        let local = Point::new(anchor.x - origin.x, anchor.y - origin.y);
-                        let on_body = ev.same_screen
-                            && i16::try_from(local.x)
-                                .ok()
-                                .zip(i16::try_from(local.y).ok())
-                                .is_some_and(|(x, y)| {
-                                    crate::geometry::is_in_interactive_silhouette(x, y)
-                                });
+                        let on_body = if ev.same_screen && runtime.accepts_input() {
+                            let origin = window.query_actual_root_origin(conn, root)?;
+                            // Both points come from signed X11 coordinates and are widened.
+                            runtime.body_hit(Point::new(anchor.x - origin.x, anchor.y - origin.y))
+                        } else {
+                            false
+                        };
                         let action = runtime.interaction.handle_opening_release(
                             ev.detail,
                             ev.time,
@@ -5489,9 +5647,14 @@ fn run_probe(
                     if ev.detail != 1 {
                         continue;
                     }
-                    let action = runtime.interaction.handle_left_release(
+                    runtime.cancel_interrupted_left_release_with(window, ev.time, |pointer| {
+                        pointer.release_if_held(conn, ev.time).map(|_| ())
+                    })?;
+                    let on_body = ev.same_screen
+                        && runtime.body_hit(Point::new(ev.event_x.into(), ev.event_y.into()));
+                    let action = runtime.interaction.handle_left_release_on_body(
                         Point::new(ev.root_x.into(), ev.root_y.into()),
-                        (ev.event_x, ev.event_y),
+                        on_body,
                         ev.time,
                         &bounds,
                     );
@@ -5517,8 +5680,15 @@ fn run_probe(
                         HostAction::ReleaseGrabAndToggleColor { time } => {
                             runtime.pointer.release_if_held(conn, time)?;
                             runtime.safety.clear();
-                            let theme = renderer.toggle_color(conn, window.window)?;
-                            println!("[INPUT] Click completed: {}", theme.name());
+                            match renderer.toggle_color(conn, window.window, &mut runtime.frames) {
+                                Ok(theme) => println!("[INPUT] Click completed: {}", theme.name()),
+                                Err(error) => {
+                                    if runtime.frames.publication_uncertain() {
+                                        runtime.invalidate_frame_and_fence(conn, window);
+                                    }
+                                    return Err(error);
+                                }
+                            }
                         }
                         HostAction::ReleaseGrab { time } => {
                             runtime.pointer.release_if_held(conn, time)?;
@@ -5528,7 +5698,10 @@ fn run_probe(
                     }
                 }
                 Event::Expose(ev) if ev.window == window.window && ev.count == 0 => {
-                    renderer.paint(conn, window.window)?;
+                    if let Err(error) = renderer.paint(conn, window.window, &runtime.frames) {
+                        runtime.invalidate_frame_and_fence(conn, window);
+                        return Err(error);
+                    }
                 }
                 Event::ClientMessage(ev) if wm_delete_event(&ev, window) => {
                     return Ok(Some(ProbeTermination::WmClose));
@@ -5591,7 +5764,7 @@ fn run_probe(
                 }
                 continue;
             }
-            if runtime.input_fence.rejects(&event, window.window, sequence) {
+            if runtime.rejects_body_event(&event, window.window, sequence) {
                 continue;
             }
             if runtime.apply_safety(Instant::now(), Some(sequence)) {
@@ -5759,15 +5932,14 @@ fn check_confirmation_timeout_with<F, R>(
     release: R,
 ) -> Result<bool, HostError>
 where
-    F: FnMut() -> Result<Point, HostError>,
+    F: FnMut() -> Result<(Point, Size), HostError>,
     R: FnOnce(u32) -> Result<(), HostError>,
 {
     if !confirmation_deadline.is_some_and(|dl| Instant::now() >= dl) {
         return Ok(false);
     }
-    let live = query()?;
-    let rec =
-        window.reconcile_live_snapshot(live, Size::new(window.width.into(), window.height.into()));
+    let (live, size) = query()?;
+    let rec = window.reconcile_live_snapshot(live, size);
     if matches!(rec, ConfigureReconciliation::Confirmed { .. })
         && final_target.is_none_or(|target| target == live)
     {

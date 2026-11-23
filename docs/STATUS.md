@@ -1,6 +1,8 @@
 # Current checkpoint
 
-**A01-C1-B-B2 — TECHNICALLY ACCEPTED — OWNER APPROVED — 2026-11-22.** The procedural adapter preserves exact Lavender/Coral pixels and hit regions. Independent ChatGPT source review passed, Cargo reported 795 passed and zero failures, and the owner confirmed correct operation on Arch Linux/X11/Openbox. B3a (committed geometry and input) is the next checkpoint and requires a separate assignment. [B2 acceptance record](A01-C1-B-B2-ACCEPTANCE.md)
+**A01-C1-B-B3a — TECHNICALLY ACCEPTED — OWNER APPROVED — 2026-11-22.** Committed frame geometry and hit coverage now drive body placement and input. Independent ChatGPT source review passed, Codex reported 809 passing tests with zero failures, and the owner reported PASS for all six native acceptance groups on Arch Linux/X11/Openbox. The documentation closeout passed independent ChatGPT review on 2026-11-22. [B3a acceptance record](A01-C1-B-B3a-ACCEPTANCE.md)
+
+**A01-C1-B-B2 — TECHNICALLY ACCEPTED — OWNER APPROVED — 2026-11-22.** The procedural adapter preserves exact Lavender/Coral pixels and hit regions. Independent ChatGPT source review passed, Cargo reported 795 passed and zero failures, and the owner confirmed correct operation on Arch Linux/X11/Openbox. [B2 acceptance record](A01-C1-B-B2-ACCEPTANCE.md)
 
 **A01-C1-A Modular Rust Foundation — TECHNICALLY ACCEPTED.** Codex reported 760/760 tests, 13/13 CLI comparisons, a locked build, formatting and all-target Clippy PASS. ChatGPT independently approved the implementation source, and the owner confirmed that the updated executable works correctly. The closeout records the accepted source and the scope of verification. [C1-A acceptance](A01-C1-A-ACCEPTANCE.md)
 

@@ -7,9 +7,9 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::wrapper::ConnectionExt as WrapperExt;
 
-use super::render::{WINDOW_HEIGHT, WINDOW_WIDTH};
-use super::shape::apply_body_input_shape;
+use super::{native_dimensions, shape::empty_body_input_shape};
 use crate::geometry::{Point, Rect, Size};
+use crate::presentation::ClientExtent;
 
 use std::collections::VecDeque;
 
@@ -61,7 +61,9 @@ pub struct ManagedProbeWindow {
     pub confirmed_origin: Point,
     pub in_flight_moves: VecDeque<Point>,
     pub superseded_moves: VecDeque<Point>,
+    #[cfg(test)]
     pub width: u16,
+    #[cfg(test)]
     pub height: u16,
 }
 
@@ -72,11 +74,13 @@ impl ManagedProbeWindow {
         root: Window,
         visual_id: Visualid,
         initial_origin: Point,
+        initial_extent: ClientExtent,
     ) -> Result<(Self, u64), Box<dyn std::error::Error>> {
         let wire_x =
             i16::try_from(initial_origin.x).map_err(|_| "Unsupported X11 startup x coordinate")?;
         let wire_y =
             i16::try_from(initial_origin.y).map_err(|_| "Unsupported X11 startup y coordinate")?;
+        let (width, height) = native_dimensions(initial_extent)?;
         // 1. Create a colormap for the 32-bit visual (required in X11 to prevent BadMatch)
         let colormap = conn.generate_id()?;
         let window = conn.generate_id()?;
@@ -84,8 +88,6 @@ impl ManagedProbeWindow {
             .check()?;
 
         // 2. Position the window at initial_origin on the primary display
-        let width = WINDOW_WIDTH;
-        let height = WINDOW_HEIGHT;
         let x = initial_origin.x;
         let y = initial_origin.y;
 
@@ -143,7 +145,9 @@ impl ManagedProbeWindow {
             confirmed_origin: initial_origin,
             in_flight_moves: VecDeque::new(),
             superseded_moves: VecDeque::new(),
+            #[cfg(test)]
             width,
+            #[cfg(test)]
             height,
         };
         let initialization: Result<(u32, u32, u64), Box<dyn std::error::Error>> = (|| {
@@ -240,8 +244,8 @@ impl ManagedProbeWindow {
             )?
             .check()?;
 
-            // 8. Apply X11 Shape extension: restrict pointer input exclusively to the test shapes
-            apply_body_input_shape(conn, window, width, height)?;
+            // 8. Keep the mapped body noninteractive until presentation and placement are verified.
+            empty_body_input_shape(conn, window)?;
 
             // 9. Map window to screen
             let map = conn.map_window(window)?;
@@ -593,17 +597,30 @@ impl ManagedProbeWindow {
         }
     }
 
-    /// Evaluates and reconciles a ConfigureNotify event, using a custom root-translation closure if needed.
-    pub fn handle_configure_notify_with<F>(
+    #[cfg(test)]
+    pub fn handle_configure_notify_with(
         &mut self,
+        ev: &ConfigureNotifyEvent,
+        translate: impl FnMut() -> Result<Point, crate::HostError>,
+    ) -> Result<ConfigureReconciliation, crate::HostError> {
+        self.reconcile_configure_with(
+            Size::new(self.width.into(), self.height.into()),
+            ev,
+            translate,
+        )
+    }
+
+    /// Evaluates and reconciles a ConfigureNotify event against the committed size.
+    fn reconcile_configure_with<F>(
+        &mut self,
+        expected: Size,
         ev: &ConfigureNotifyEvent,
         mut translate_fn: F,
     ) -> Result<ConfigureReconciliation, Box<dyn std::error::Error>>
     where
         F: FnMut() -> Result<Point, Box<dyn std::error::Error>>,
     {
-        let analysis =
-            Self::evaluate_configure_event(Size::new(self.width as u32, self.height as u32), ev);
+        let analysis = Self::evaluate_configure_event(expected, ev);
 
         match analysis {
             ConfigureEventAnalysis::UnexpectedSizeChange { expected, actual } => {
@@ -628,10 +645,11 @@ impl ManagedProbeWindow {
         &mut self,
         conn: &impl Connection,
         root: Window,
+        expected: Size,
         ev: &ConfigureNotifyEvent,
     ) -> Result<ConfigureReconciliation, Box<dyn std::error::Error>> {
         let window = self.window;
-        self.handle_configure_notify_with(ev, || {
+        self.reconcile_configure_with(expected, ev, || {
             Self::query_window_actual_root_origin(conn, window, root)
         })
     }

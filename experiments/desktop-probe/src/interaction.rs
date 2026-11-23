@@ -1,8 +1,11 @@
 #![allow(dead_code)]
 
+#[cfg(test)]
+use crate::geometry::is_in_interactive_silhouette;
+
 use crate::geometry::{
-    calculate_grab_offset, calculate_target_origin, exceeds_drag_threshold,
-    is_in_interactive_silhouette, GrabOffset, MenuHit, Point, ValidOriginBounds,
+    calculate_grab_offset, calculate_target_origin, exceeds_drag_threshold, GrabOffset, MenuHit,
+    Point, ValidOriginBounds,
 };
 use crate::layer::Layer;
 
@@ -188,7 +191,7 @@ impl InteractionManager {
         matches!(self.state, InteractionState::Idle)
     }
 
-    /// Handles a left mouse button press on the window.
+    #[cfg(test)]
     pub fn handle_left_press(
         &mut self,
         pointer_root: Point,
@@ -196,9 +199,24 @@ impl InteractionManager {
         time: u32,
         body_origin: Point,
     ) -> HostAction {
+        self.handle_left_press_on_body(
+            pointer_root,
+            is_in_interactive_silhouette(local.0, local.1),
+            time,
+            body_origin,
+        )
+    }
+
+    pub fn handle_left_press_on_body(
+        &mut self,
+        pointer_root: Point,
+        on_body: bool,
+        time: u32,
+        body_origin: Point,
+    ) -> HostAction {
         match self.state {
             InteractionState::Idle | InteractionState::SuppressedUntilRelease { .. } => {
-                if !is_in_interactive_silhouette(local.0, local.1) {
+                if !on_body {
                     self.state = InteractionState::Idle;
                     return HostAction::None;
                 }
@@ -321,11 +339,26 @@ impl InteractionManager {
         final_action
     }
 
-    /// Handles a left mouse button release.
+    #[cfg(test)]
     pub fn handle_left_release(
         &mut self,
         pointer_root: Point,
         local: (i16, i16),
+        time: u32,
+        bounds: &ValidOriginBounds,
+    ) -> HostAction {
+        self.handle_left_release_on_body(
+            pointer_root,
+            is_in_interactive_silhouette(local.0, local.1),
+            time,
+            bounds,
+        )
+    }
+
+    pub fn handle_left_release_on_body(
+        &mut self,
+        pointer_root: Point,
+        on_body: bool,
         time: u32,
         bounds: &ValidOriginBounds,
     ) -> HostAction {
@@ -354,7 +387,7 @@ impl InteractionManager {
                         time,
                         target: final_target,
                     }
-                } else if is_in_interactive_silhouette(local.0, local.1) {
+                } else if on_body {
                     HostAction::ReleaseGrabAndToggleColor { time }
                 } else {
                     HostAction::ReleaseGrab { time }
@@ -382,13 +415,18 @@ impl InteractionManager {
         }
     }
 
-    /// Host validates the body hit and an unchorded genuine press first.
+    #[cfg(test)]
     pub fn handle_right_press(&mut self, time: u32) -> HostAction {
+        self.handle_right_press_on_body(time, true)
+    }
+
+    /// The host supplies committed coverage and checks the native button state.
+    pub fn handle_right_press_on_body(&mut self, time: u32, on_body: bool) -> HostAction {
         match self.state {
             InteractionState::LeftPressed { .. } | InteractionState::Dragging { .. } => {
                 self.cancel(time)
             }
-            InteractionState::Idle | InteractionState::SuppressedUntilRelease { .. } => {
+            InteractionState::Idle | InteractionState::SuppressedUntilRelease { .. } if on_body => {
                 self.freshness_pending = true;
                 self.state = InteractionState::RightPressed {
                     press_time: time,

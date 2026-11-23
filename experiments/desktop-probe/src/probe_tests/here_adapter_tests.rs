@@ -20,7 +20,7 @@ fn destination_layout() -> DestinationLayout {
         viewport: ViewportEvidence::AllZero,
         usable_area: area,
         body_size: Size::new(160, 160),
-        valid_origins: checked_probe_bounds(area).unwrap(),
+        valid_origins: checked_probe_bounds(area, Renderer::initial_extent().size()).unwrap(),
     }
 }
 
@@ -324,13 +324,40 @@ fn native_failure_at_each_here_read_preserves_original_error_and_stops_immediate
 fn here_native_fit_keeps_the_existing_signed_wire_limits() {
     for origin in [i32::from(i16::MIN), i32::from(i16::MAX)] {
         let area = geometry::Rect::new(origin, origin, 160, 160);
-        assert!(checked_probe_bounds(area)
-            .unwrap()
-            .contains(Point::new(origin, origin)));
+        assert!(
+            checked_probe_bounds(area, Renderer::initial_extent().size())
+                .unwrap()
+                .contains(Point::new(origin, origin))
+        );
     }
-    assert!(checked_probe_bounds(geometry::Rect::new(i32::from(i16::MAX), 0, 161, 160)).is_err());
+    assert!(checked_probe_bounds(
+        geometry::Rect::new(i32::from(i16::MAX), 0, 161, 160),
+        Renderer::initial_extent().size()
+    )
+    .is_err());
+    assert!(checked_probe_bounds(
+        geometry::Rect::new(i32::from(i16::MIN) - 1, 0, 160, 160),
+        Renderer::initial_extent().size()
+    )
+    .is_err());
+}
+
+#[test]
+fn here_destination_native_fit_uses_the_body_extent_from_its_layout() {
+    let mut layout = destination_layout();
+    let mut runtime = ProbeRuntime::test_presented();
+    layout.body_size = visibility_fence_tests::install_small_frame(&mut runtime);
+    let edge = i32::from(i16::MAX);
+    layout.usable_area =
+        geometry::Rect::new(edge, edge, layout.body_size.width, layout.body_size.height);
+    layout.valid_origins = geometry::ValidOriginBounds::new(edge, edge, edge, edge);
+    let destination = here_destination_identity(layout.clone()).unwrap();
+    assert_eq!(destination.body_size, runtime.committed_size().unwrap());
+    assert_eq!(destination.valid_origins, layout.valid_origins);
+    layout.usable_area.width += 1;
     assert!(
-        checked_probe_bounds(geometry::Rect::new(i32::from(i16::MIN) - 1, 0, 160, 160)).is_err()
+        here_destination_identity(layout).is_err(),
+        "a legal-placement domain cannot overflow X11 coordinates"
     );
 }
 
