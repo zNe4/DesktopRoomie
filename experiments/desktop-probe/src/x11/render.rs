@@ -1,7 +1,7 @@
 use super::{
     native_dimensions,
     resource::{cleanup_all, OwnedResource},
-    shape::input_rectangles,
+    shape::{input_rectangles, validate_input_request_size},
 };
 #[cfg(test)]
 use crate::presentation::procedural::{Palette, ProceduralProducer};
@@ -15,7 +15,7 @@ use crate::HostError;
 use std::time::Duration;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    ConnectionExt as XprotoExt, CreateGCAux, Gcontext, ImageFormat, Pixmap, Window,
+    ConnectionExt as XprotoExt, CreateGCAux, Gcontext, ImageFormat, Pixmap, Rectangle, Window,
 };
 
 const INITIAL_IDENTITY: FrameIdentity = FrameIdentity {
@@ -26,6 +26,14 @@ const INITIAL_IDENTITY: FrameIdentity = FrameIdentity {
 pub(crate) struct CommittedFrameGeometry {
     pub identity: FrameIdentity,
     pub metadata: FrameMetadata,
+}
+
+/// Owner input obligations during the optional changing-coverage publication.
+pub(crate) trait CoverageCutover {
+    fn maximum_request_bytes(&self) -> usize;
+    fn block_input(&mut self);
+    fn empty_and_release(&mut self) -> Result<(), HostError>;
+    fn enable(&mut self, rectangles: Vec<Rectangle>) -> Result<u64, HostError>;
 }
 
 /// Geometry for one fixed X11 presentation target. The publication tracker
@@ -97,6 +105,7 @@ impl FrameGeometry {
             .map_err(|error| format!("Invalid renderer frame request: {error:?}").into())
     }
 
+    #[cfg(test)]
     pub(crate) fn publish_with(
         &mut self,
         request: &FrameRequest,
@@ -104,6 +113,18 @@ impl FrameGeometry {
         upload: impl FnOnce((u16, u16), &[u8]) -> Result<(), HostError>,
         blit: impl FnOnce((u16, u16)) -> Result<(), HostError>,
     ) -> Result<(), HostError> {
+        self.publish_with_cutover(request, frame, upload, blit, None)?;
+        Ok(())
+    }
+
+    pub(crate) fn publish_with_cutover(
+        &mut self,
+        request: &FrameRequest,
+        frame: PreparedFrame<Vec<u8>>,
+        upload: impl FnOnce((u16, u16), &[u8]) -> Result<(), HostError>,
+        blit: impl FnOnce((u16, u16)) -> Result<(), HostError>,
+        cutover: Option<&mut dyn CoverageCutover>,
+    ) -> Result<Option<u64>, HostError> {
         if request.extent() != self.initial_extent {
             return Err("Runtime frame extent changes are unsupported".into());
         }
@@ -114,31 +135,74 @@ impl FrameGeometry {
             return Err(publication_error(PublicationError::ExtentMismatch));
         }
         let dimensions = native_dimensions(frame.metadata.extent())?;
-        if let Some(committed) = self.committed() {
-            if committed.metadata.hit_region() != frame.metadata.hit_region() {
-                return Err("Runtime frame coverage changes are unsupported".into());
-            }
-        } else {
-            // Validate the first coverage before it can ever become authoritative.
-            input_rectangles(frame.metadata.hit_region())?;
+        if cutover.is_some()
+            && (i16::try_from(dimensions.0).is_err() || i16::try_from(dimensions.1).is_err())
+        {
+            return Err("Animated canvas exceeds X11 signed coordinate limits".into());
         }
+        let previous = self.committed();
+        let changed = previous.is_some_and(|committed| {
+            committed.metadata.hit_region() != frame.metadata.hit_region()
+        });
+        if changed && cutover.is_none() {
+            return Err("Runtime frame coverage changes are unsupported".into());
+        }
+        // Validate coverage before the first commit or a checked cutover.
+        let rectangles = (previous.is_none() || changed)
+            .then(|| input_rectangles(frame.metadata.hit_region()))
+            .transpose()?;
         validate_bgra8(dimensions, &frame)?;
+        if let Some(policy) = cutover.as_ref() {
+            if frame.metadata.hit_region().spans().is_empty()
+                && frame.metadata.visible_bounds().is_some()
+            {
+                return Err("Transparent animated frame must omit visible bounds".into());
+            }
+            let expected = self.frame_request(
+                request.intent(),
+                request.active_elapsed(),
+                request.active_delta(),
+            )?;
+            if request.identity() != expected.identity() {
+                return Err(publication_error(PublicationError::IdentityMismatch));
+            }
+            let maximum = policy.maximum_request_bytes();
+            if let Some(rectangles) = &rectangles {
+                validate_input_request_size(rectangles, maximum)?;
+            }
+            let image_bytes = frame
+                .payload
+                .len()
+                .checked_add(24)
+                .ok_or("PutImage request size overflow")?;
+            super::validate_request_size(image_bytes, maximum, "PutImage")?;
+        }
         self.publication
             .prepare(request, &frame)
             .map_err(publication_error)?;
         self.advance(frame.identity, PublicationEvent::Submit)?;
+        let mut cutover = cutover.zip(rectangles).filter(|_| changed);
+        if let Some((policy, _)) = cutover.as_mut() {
+            policy.block_input();
+        }
         // A failure leaves the submitted attempt unsettled. In particular a
         // failed blit/flush can have visible effects. The host fences and exits
         // without reusing this pixmap or automatically attempting another frame.
         upload(dimensions, &frame.payload)?;
+        if let Some((policy, _)) = cutover.as_mut() {
+            policy.empty_and_release()?;
+        }
         blit(dimensions)?;
         self.advance(frame.identity, PublicationEvent::TransportComplete)?;
+        let enabling_sequence = cutover
+            .map(|(policy, rectangles)| policy.enable(rectangles))
+            .transpose()?;
         self.advance(frame.identity, PublicationEvent::Commit)?;
         self.committed = Some(CommittedFrameGeometry {
             identity: frame.identity,
             metadata: frame.metadata,
         });
-        Ok(())
+        Ok(enabling_sequence)
     }
 
     fn advance(
@@ -149,6 +213,19 @@ impl FrameGeometry {
         self.publication
             .advance(identity, event)
             .map_err(publication_error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_committed(&self) -> Option<FrameIdentity> {
+        self.publication.last_committed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publication_state(
+        &self,
+        identity: FrameIdentity,
+    ) -> Result<PublicationState, PublicationError> {
+        self.publication.state(identity)
     }
 
     #[cfg(test)]
@@ -338,8 +415,9 @@ impl Renderer {
         geometry: &mut FrameGeometry,
         request: &FrameRequest,
         frame: PreparedFrame<Vec<u8>>,
-    ) -> Result<(), HostError> {
-        geometry.publish_with(
+        cutover: Option<&mut dyn CoverageCutover>,
+    ) -> Result<Option<u64>, HostError> {
+        geometry.publish_with_cutover(
             request,
             frame,
             |(width, height), payload| {
@@ -359,6 +437,7 @@ impl Renderer {
                 Ok(())
             },
             |dimensions| self.blit(conn, window, dimensions),
+            cutover,
         )
     }
 

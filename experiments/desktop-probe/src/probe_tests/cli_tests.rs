@@ -2,6 +2,37 @@ use super::*;
 use crate::control::{Command, ExitCode};
 
 #[test]
+fn synthetic_animation_is_an_owner_only_opt_in() {
+    assert!(HELP.contains("--synthetic-animation"));
+    assert_eq!(
+        parse_args(["--delay", "2", "--synthetic-animation", "--duration", "7"]),
+        Ok(CliMode::SyntheticAnimation {
+            delay_secs: Some(2),
+            duration_secs: Some(7)
+        })
+    );
+    for flag in [
+        "--diagnose",
+        "--hide",
+        "--show",
+        "--bring-top",
+        "--bring-here",
+        "--recover",
+    ] {
+        for args in [
+            [flag, "--synthetic-animation"],
+            ["--synthetic-animation", flag],
+        ] {
+            assert_eq!(parse_args(args).unwrap_err().exit_code(), ExitCode::Usage);
+        }
+    }
+    assert_eq!(
+        parse_args(["--synthetic-animation", "--help"]),
+        Ok(CliMode::Help)
+    );
+}
+
+#[test]
 fn default_and_owner_invocations_remain_valid() {
     assert_eq!(
         parse_args(Vec::<String>::new()),

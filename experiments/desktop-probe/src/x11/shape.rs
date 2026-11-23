@@ -25,7 +25,27 @@ pub fn empty_body_input_shape(
     conn: &impl Connection,
     window: Window,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    set_input_with(window, vec![], |request| request.send(conn))
+    set_body_input_rectangles(conn, window, vec![])
+}
+
+pub(crate) fn set_body_input_rectangles(
+    conn: &impl Connection,
+    window: Window,
+    rectangles: Vec<Rectangle>,
+) -> Result<u64, crate::HostError> {
+    set_input_with(window, rectangles, |request| request.send(conn))
+}
+
+pub(super) fn validate_input_request_size(
+    rectangles: &[Rectangle],
+    maximum: usize,
+) -> Result<(), crate::HostError> {
+    let bytes = rectangles
+        .len()
+        .checked_mul(8) // x, y, width, height (16 bits each)
+        .and_then(|bytes| bytes.checked_add(16)) // SHAPE Rectangles header
+        .ok_or("Input SHAPE request size overflow")?;
+    super::validate_request_size(bytes, maximum, "Input SHAPE")
 }
 
 /// Preserve canonical row order and half-open coverage. Check exclusive
@@ -94,6 +114,10 @@ fn set_input_with(
 #[cfg(test)]
 #[path = "../probe_tests/presentation_runtime_tests.rs"]
 mod presentation_runtime_tests;
+
+#[cfg(test)]
+#[path = "../probe_tests/animated_presentation_tests.rs"]
+mod animated_presentation_tests;
 
 #[cfg(test)]
 mod tests {

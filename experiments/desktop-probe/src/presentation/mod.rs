@@ -7,6 +7,7 @@
 
 pub mod procedural;
 mod region;
+pub(crate) mod synthetic;
 
 use std::time::Duration;
 

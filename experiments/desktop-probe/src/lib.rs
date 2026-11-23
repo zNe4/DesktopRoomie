@@ -13,13 +13,13 @@ use std::env;
 use std::process;
 use std::time::{Duration, Instant};
 
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::render::ConnectionExt as RenderExt;
 use x11rb::protocol::shape::ConnectionExt as ShapeExt;
-use x11rb::protocol::xproto::{GrabStatus, MapNotifyEvent, VisualClass};
+use x11rb::protocol::xproto::{GrabStatus, MapNotifyEvent, Rectangle, VisualClass};
 use x11rb::protocol::Event;
 
-use crate::body_presentation::{BodyPresentation, FrameKind, FrameTiming};
+use crate::body_presentation::{BodyPresentation, BodyProducer, FrameKind, FrameTiming};
 #[cfg(test)]
 use crate::cli::HELP;
 use crate::cli::{parse_args, print_help, CliMode};
@@ -27,13 +27,14 @@ use crate::geometry::{calculate_centered_origin, compute_valid_origin_bounds, Po
 use crate::interaction::{HostAction, InteractionManager, InteractionState, MenuOutcome};
 use crate::layer::{Layer, LayerController, Mutation, ObservedLayer, Step};
 use crate::presentation::procedural::{Palette, ProceduralProducer};
-use crate::presentation::{ClientExtent, FrameProducer, HitRegion};
+use crate::presentation::synthetic::SyntheticProducer;
+use crate::presentation::{ClientExtent, FrameProducer, FrameRequest, HitRegion, PreparedFrame};
 use crate::x11::control::{Acquisition, ControlWindow};
 use crate::x11::events::{drain_events_bounded, wait_x11};
 use crate::x11::menu::{MenuPopup, PopupInputGate};
 use crate::x11::monitors::query_desktop_layout;
 use crate::x11::pointer::{grab_pointer, CaptureOwner, PointerCaptureTracker};
-use crate::x11::render::{FrameGeometry, Renderer};
+use crate::x11::render::{CoverageCutover, FrameGeometry, Renderer};
 use crate::x11::state::{LayerAtoms, LayerSupport, PropertyResult, RemoteLayerIssue};
 use crate::x11::visual::find_alpha_visual;
 use crate::x11::window::{ConfigureReconciliation, ManagedProbeWindow};
@@ -55,7 +56,7 @@ pub fn run_cli(args: impl IntoIterator<Item = impl AsRef<str>>) {
             process::exit(err.exit_code() as i32);
         }
     };
-    let (diagnose, delay_secs, duration_secs) = match mode {
+    let (diagnose, delay_secs, duration_secs, synthetic_animation) = match mode {
         CliMode::Help => {
             print_help();
             return;
@@ -73,11 +74,15 @@ pub fn run_cli(args: impl IntoIterator<Item = impl AsRef<str>>) {
             };
             process::exit(exit as i32);
         }
-        CliMode::Diagnose => (true, None, None),
+        CliMode::Diagnose => (true, None, None, false),
         CliMode::Owner {
             delay_secs,
             duration_secs,
-        } => (false, delay_secs, duration_secs),
+        } => (false, delay_secs, duration_secs, false),
+        CliMode::SyntheticAnimation {
+            delay_secs,
+            duration_secs,
+        } => (false, delay_secs, duration_secs, true),
     };
 
     println!("=== DesktopRoomie A00-M03.2: Desktop Probe ===");
@@ -132,7 +137,14 @@ pub fn run_cli(args: impl IntoIterator<Item = impl AsRef<str>>) {
         return;
     }
 
-    let exit = run_owner(&conn, screen, screen_num, delay_secs, duration_secs);
+    let exit = run_owner(
+        &conn,
+        screen,
+        screen_num,
+        delay_secs,
+        duration_secs,
+        synthetic_animation,
+    );
     if exit != control::ExitCode::Success {
         process::exit(exit as i32);
     }
@@ -145,6 +157,7 @@ fn run_owner(
     screen_num: usize,
     delay_secs: Option<u64>,
     duration_secs: Option<u64>,
+    synthetic_animation: bool,
 ) -> control::ExitCode {
     let mut owner = match ControlWindow::create(conn, screen, screen_num) {
         Ok(owner) => owner,
@@ -166,12 +179,21 @@ fn run_owner(
             }
             owner.verify_startup_ownership(conn)
         },
-        || Ok(ProceduralProducer::new(Palette::default())),
+        || {
+            Ok(if synthetic_animation {
+                BodyProducer::Synthetic(SyntheticProducer::new())
+            } else {
+                BodyProducer::Procedural(ProceduralProducer::new(Palette::default()))
+            })
+        },
         |owner, mut presentation| {
             let runtime = runtime.insert(ProbeRuntime::with_presentation(
                 presentation.initial_extent(),
                 presentation.timing(),
             ));
+            // Resolve the negotiated limit once, before candidate preflight.
+            runtime.animated_shape_limit =
+                synthetic_animation.then(|| conn.maximum_request_bytes());
             start_body(
                 conn,
                 screen,
@@ -306,7 +328,7 @@ fn start_body(
     body_resource: &mut Option<ManagedProbeWindow>,
     renderer_resource: &mut Option<Renderer>,
     runtime: &mut ProbeRuntime,
-    presentation: &mut BodyPresentation<ProceduralProducer>,
+    presentation: &mut BodyPresentation<BodyProducer>,
 ) -> Result<(), HostError> {
     let atoms = x11::monitors::LayoutAtoms::subscribe(conn, screen.root)?;
     let layout = query_desktop_layout(conn, screen.root, &atoms, None)?;
@@ -407,6 +429,8 @@ fn start_body(
     println!("\n[Running Probe]");
     if let Some(sec) = duration_secs {
         println!("  Probe running for {} seconds (or until closed)...", sec);
+    } else if runtime.animated_shape_limit.is_some() {
+        println!("  Experimental CPU animation. Left drag moves the body; right-click opens Above/Normal/Below/Dismiss/Quit.");
     } else {
         println!(
             "  Left-click toggles body color; right-click opens Above/Normal/Below/Dismiss/Quit. Launch with --duration <SECONDS> for automatic termination."
@@ -578,6 +602,42 @@ impl InputFence {
     }
 }
 
+struct AnimatedCoverage<'a, S, R> {
+    input: &'a mut InputFence,
+    pointer: &'a mut PointerCaptureTracker,
+    maximum_request_bytes: usize,
+    set_input: S,
+    release: R,
+}
+
+impl<S, R> CoverageCutover for AnimatedCoverage<'_, S, R>
+where
+    S: FnMut(Vec<Rectangle>) -> Result<u64, HostError>,
+    R: FnMut() -> Result<(), HostError>,
+{
+    fn maximum_request_bytes(&self) -> usize {
+        self.maximum_request_bytes
+    }
+
+    fn block_input(&mut self) {
+        self.input.blocked = true;
+        self.input.empty_confirmed = false;
+    }
+
+    fn empty_and_release(&mut self) -> Result<(), HostError> {
+        self.pointer.require_transition_release();
+        (self.set_input)(Vec::new())?;
+        self.input.empty_confirmed = true;
+        self.pointer.release_with(&mut self.release)?;
+        Ok(())
+    }
+
+    fn enable(&mut self, rectangles: Vec<Rectangle>) -> Result<u64, HostError> {
+        self.input.empty_confirmed = false;
+        (self.set_input)(rectangles)
+    }
+}
+
 /// Supplied by fresh retained-monitor/layout and root-geometry validation, never
 /// a MapNotify or the desired Ready state.
 struct InputPlacement {
@@ -590,6 +650,7 @@ struct InputPlacement {
 struct ProbeRuntime {
     frames: FrameGeometry,
     frame_timing: FrameTiming,
+    animated_shape_limit: Option<usize>,
     interaction: InteractionManager,
     pointer: PointerCaptureTracker,
     pending_move: Option<Point>,
@@ -614,6 +675,7 @@ impl ProbeRuntime {
         Self {
             frames: FrameGeometry::new(extent),
             frame_timing,
+            animated_shape_limit: None,
             interaction: InteractionManager::new(),
             pointer: PointerCaptureTracker::new(),
             pending_move: None,
@@ -664,22 +726,94 @@ impl ProbeRuntime {
         conn: &impl Connection,
         window: &mut ManagedProbeWindow,
         renderer: &Renderer,
-        presentation: &mut BodyPresentation<ProceduralProducer>,
+        presentation: &mut BodyPresentation<BodyProducer>,
         kind: FrameKind,
         owner_busy: bool,
     ) -> Result<(), HostError> {
         let eligible = self.frame_eligible(window, owner_busy);
+        let body = window.window;
+        let limit = self.animated_shape_limit;
+        self.present_frame_with(
+            presentation,
+            kind,
+            eligible,
+            Instant::now,
+            |frames, request, frame, input, pointer| {
+                let mut coverage = limit.map(|maximum_request_bytes| AnimatedCoverage {
+                    input,
+                    pointer,
+                    maximum_request_bytes,
+                    set_input: |rectangles| {
+                        x11::shape::set_body_input_rectangles(conn, body, rectangles)
+                    },
+                    release: || x11::pointer::ungrab_pointer(conn, x11rb::CURRENT_TIME),
+                });
+                renderer.present(
+                    conn,
+                    body,
+                    frames,
+                    request,
+                    frame,
+                    coverage
+                        .as_mut()
+                        .map(|policy| policy as &mut dyn CoverageCutover),
+                )
+            },
+            |runtime| runtime.fence_visibility_input(conn, window),
+        )
+    }
+
+    fn present_frame_with<P>(
+        &mut self,
+        presentation: &mut BodyPresentation<P>,
+        kind: FrameKind,
+        eligible: bool,
+        now: impl FnMut() -> Instant,
+        publish: impl FnOnce(
+            &mut FrameGeometry,
+            &FrameRequest,
+            PreparedFrame<Vec<u8>>,
+            &mut InputFence,
+            &mut PointerCaptureTracker,
+        ) -> Result<Option<u64>, HostError>,
+        fence: impl FnOnce(&mut Self) -> Result<(), HostError>,
+    ) -> Result<(), HostError>
+    where
+        P: FrameProducer<Payload = Vec<u8>>,
+        P::Error: Into<HostError>,
+    {
+        let mut committed = false;
+        let mut enabling_sequence = None;
         let result = presentation.present_with(
             kind,
             &mut self.frames,
             &mut self.frame_timing,
             eligible,
-            Instant::now,
-            |frames, request, frame| renderer.present(conn, window.window, frames, request, frame),
+            now,
+            |frames, request, frame| {
+                enabling_sequence = publish(
+                    frames,
+                    request,
+                    frame,
+                    &mut self.input_fence,
+                    &mut self.pointer,
+                )?;
+                committed = true;
+                Ok(())
+            },
         );
-        self.finish_frame_publication_with(result, |runtime| {
-            runtime.fence_visibility_input(conn, window)
-        })
+        // A timing error after Commit has no Publication uncertainty. Revoke
+        // explicitly and keep changed input blocked until timing also succeeds.
+        if result.is_err() && committed {
+            self.invalidate_frame_and_fence_with(fence);
+            return result;
+        }
+        self.finish_frame_publication_with(result, fence)?;
+        if let Some(sequence) = enabling_sequence {
+            self.input_fence.enabled_after = Some(sequence);
+            self.input_fence.blocked = false;
+        }
+        Ok(())
     }
 
     fn finish_frame_publication_with(
@@ -1170,8 +1304,9 @@ impl ProbeRuntime {
         &mut self,
         fence: impl FnOnce(&mut Self) -> Result<(), HostError>,
     ) {
-        self.frame_timing.stop();
         self.frames.invalidate();
+        self.input_fence.blocked = true;
+        self.frame_timing.stop();
         if let Err(cleanup) = fence(self) {
             eprintln!("[INPUT] Frame authority safety cleanup: {cleanup}");
         }
@@ -5086,7 +5221,7 @@ fn run_probe(
     window: &mut ManagedProbeWindow,
     renderer: &Renderer,
     runtime: &mut ProbeRuntime,
-    presentation: &mut BodyPresentation<ProceduralProducer>,
+    presentation: &mut BodyPresentation<BodyProducer>,
     owner: &mut ControlWindow,
     initial_bounds: crate::geometry::ValidOriginBounds,
     initial_area: crate::geometry::Rect,
@@ -5830,16 +5965,17 @@ fn run_probe(
                         HostAction::ReleaseGrabAndToggleColor { time } => {
                             runtime.pointer.release_if_held(conn, time)?;
                             runtime.safety.clear();
-                            let palette = presentation.toggle_palette();
-                            runtime.present_frame(
-                                conn,
-                                window,
-                                renderer,
-                                presentation,
-                                FrameKind::Redraw,
-                                owner.active().is_some(),
-                            )?;
-                            println!("[INPUT] Click completed: {}", palette.name());
+                            if let Some(palette) = presentation.click_palette() {
+                                runtime.present_frame(
+                                    conn,
+                                    window,
+                                    renderer,
+                                    presentation,
+                                    FrameKind::Redraw,
+                                    owner.active().is_some(),
+                                )?;
+                                println!("[INPUT] Click completed: {}", palette.name());
+                            }
                         }
                         HostAction::ReleaseGrab { time } => {
                             runtime.pointer.release_if_held(conn, time)?;

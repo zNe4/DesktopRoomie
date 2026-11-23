@@ -3,7 +3,11 @@
 use std::time::{Duration, Instant};
 
 use crate::presentation::procedural::{Palette, ProceduralProducer};
-use crate::presentation::{ActionIntent, ClientExtent, FrameProducer, FrameRequest, PreparedFrame};
+use crate::presentation::synthetic::SyntheticProducer;
+use crate::presentation::{
+    ActionIntent, ClientExtent, FrameProducer, FrameRequest, PreparedFrame,
+    PresentationCapabilities,
+};
 use crate::x11::render::FrameGeometry;
 use crate::HostError;
 
@@ -79,9 +83,46 @@ where
     }
 }
 
+#[cfg(test)]
 impl BodyPresentation<ProceduralProducer> {
     pub(crate) fn toggle_palette(&mut self) -> Palette {
         self.producer.toggle_palette()
+    }
+}
+
+pub(crate) enum BodyProducer {
+    Procedural(ProceduralProducer),
+    Synthetic(SyntheticProducer),
+}
+
+impl BodyPresentation<BodyProducer> {
+    pub(crate) fn click_palette(&mut self) -> Option<Palette> {
+        match &mut self.producer {
+            BodyProducer::Procedural(producer) => Some(producer.toggle_palette()),
+            BodyProducer::Synthetic(_) => None,
+        }
+    }
+}
+
+impl FrameProducer for BodyProducer {
+    type Payload = Vec<u8>;
+    type Error = HostError;
+
+    fn capabilities(&self) -> &PresentationCapabilities {
+        match self {
+            Self::Procedural(producer) => producer.capabilities(),
+            Self::Synthetic(producer) => producer.capabilities(),
+        }
+    }
+
+    fn prepare_frame(
+        &mut self,
+        request: &FrameRequest,
+    ) -> Result<PreparedFrame<Vec<u8>>, HostError> {
+        match self {
+            Self::Procedural(producer) => Ok(producer.prepare_frame(request)?),
+            Self::Synthetic(producer) => producer.prepare_frame(request),
+        }
     }
 }
 

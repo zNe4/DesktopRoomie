@@ -8,6 +8,10 @@ pub(super) enum CliMode {
         delay_secs: Option<u64>,
         duration_secs: Option<u64>,
     },
+    SyntheticAnimation {
+        delay_secs: Option<u64>,
+        duration_secs: Option<u64>,
+    },
     Control(control::Command),
 }
 
@@ -29,6 +33,7 @@ where
     let mut args = args.into_iter();
     let mut help = false;
     let mut diagnose = false;
+    let mut synthetic_animation = false;
     let mut duration_secs = None;
     let mut delay_secs = None;
     let mut command = None;
@@ -36,6 +41,7 @@ where
         match arg.as_ref() {
             "-h" | "--help" => help = true,
             "--diagnose" => diagnose = true,
+            "--synthetic-animation" => synthetic_animation = true,
             flag @ ("--delay" | "--duration") => {
                 let value = args
                     .next()
@@ -68,6 +74,11 @@ where
             }
         }
     }
+    if synthetic_animation && (diagnose || command.is_some()) {
+        return Err(UsageError(
+            "--synthetic-animation is only available in owner mode".into(),
+        ));
+    }
     if let Some(command) = command {
         if diagnose || delay_secs.is_some() || duration_secs.is_some() {
             return Err(UsageError(
@@ -82,6 +93,11 @@ where
         Ok(CliMode::Help)
     } else if diagnose {
         Ok(CliMode::Diagnose)
+    } else if synthetic_animation {
+        Ok(CliMode::SyntheticAnimation {
+            delay_secs,
+            duration_secs,
+        })
     } else {
         Ok(CliMode::Owner {
             delay_secs,
@@ -103,6 +119,7 @@ OPTIONS:
   --diagnose              Run pure X11 environment diagnostics and exit
   --delay <SECONDS>       Delay in seconds before mapping window (for typing test)
   --duration <SECONDS>    Run for a specified duration in seconds, then exit
+  --synthetic-animation   Run the experimental CPU animation in owner mode (no click color toggle)
   --show       Restore the existing body without activation or workspace/layer changes
   --hide       Minimize the existing body without workspace/layer changes
   --bring-top  Ensure the existing body is not minimized and set Above on its existing workspace
