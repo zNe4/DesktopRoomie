@@ -1,0 +1,16 @@
+[package]
+name = "gpu-readback"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+description = "A01-C1-C-B1 standalone synthetic Vulkan BGRA8 readback experiment"
+
+[features]
+default = []
+native-vulkan = ["dep:wgpu"]
+
+[dependencies]
+desktop-probe = { path = "../desktop-probe" }
+sha2 = "0.10.9"
+wgpu = { version = "=29.0.1", default-features = false, features = ["std", "vulkan", "wgsl"], optional = true }

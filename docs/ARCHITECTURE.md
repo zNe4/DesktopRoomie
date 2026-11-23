@@ -14,6 +14,8 @@ B3b-R1 adds a persistent procedural producer created after owner admission. `Pro
 
 A01-C1-C-A1 adds the owner-only `--synthetic-animation` option and experimental changing-coverage publication on the existing managed body. Independent source review passed and the owner reported 6/6 native PASS on Arch Linux/X11/Openbox/Picom. [A1/A2 acceptance record](A01-C1-C-A1-A2-ACCEPTANCE.md)
 
+A01-C1-C-B1 is a standalone headless Cargo experiment. It owns the offscreen Vulkan renderer, single staging buffer, readback validation and parity comparison against the accepted CPU animation fixture. The existing X11 owner retains window lifecycle, pixel upload, input SHAPE and event-loop responsibilities. B1 has no live presentation path or private character assets. [Experiment README](../experiments/gpu-readback/README.md), [B1 acceptance record](A01-C1-C-B1-ACCEPTANCE.md)
+
 M03.2 host H-N1/N2/N3 results remain in [ACCEPTANCE-M03.2](../experiments/desktop-probe/ACCEPTANCE-M03.2.md), with H14/H23/H28 qualifications. M03.3 H0 manually instrumented Stage-B feasibility, [Stage-D public Bring Here acceptance](../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md) at D4.1 `4c67da0b09ffe7b69605ac4a415d256acf8abd23`, and [Stage-E Recover acceptance](../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md) at E4 are distinct evidence. RF2d preserves those behaviors; later documentation HEADs are not newly tested executables.
 
 ## State ownership and boundaries
