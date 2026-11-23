@@ -1,5 +1,7 @@
 # Current checkpoint
 
+**A01-C1-B-B3b — TECHNICALLY ACCEPTED — OWNER APPROVED — 2026-11-23.** The owner runtime keeps a persistent procedural producer and coordinates frame preparation, timing and checked publication. Independent ChatGPT source review passed after the R1 timing correction, Codex reported 831 passing tests with zero failures, and the owner reported PASS for all six native acceptance groups on Arch Linux/X11/Openbox. This documentation closeout passed independent ChatGPT review on 2026-11-23. [B3b acceptance record](A01-C1-B-B3b-ACCEPTANCE.md)
+
 **A01-C1-B-B3a — TECHNICALLY ACCEPTED — OWNER APPROVED — 2026-11-22.** Committed frame geometry and hit coverage now drive body placement and input. Independent ChatGPT source review passed, Codex reported 809 passing tests with zero failures, and the owner reported PASS for all six native acceptance groups on Arch Linux/X11/Openbox. The documentation closeout passed independent ChatGPT review on 2026-11-22. [B3a acceptance record](A01-C1-B-B3a-ACCEPTANCE.md)
 
 **A01-C1-B-B2 — TECHNICALLY ACCEPTED — OWNER APPROVED — 2026-11-22.** The procedural adapter preserves exact Lavender/Coral pixels and hit regions. Independent ChatGPT source review passed, Cargo reported 795 passed and zero failures, and the owner confirmed correct operation on Arch Linux/X11/Openbox. [B2 acceptance record](A01-C1-B-B2-ACCEPTANCE.md)
