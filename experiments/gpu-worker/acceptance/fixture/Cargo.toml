@@ -1,0 +1,15 @@
+[package]
+name = "roomie-acceptance-fixture"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+roomie-worker-acceptance = { path = ".." }
+roomie-worker-vulkan = { path = "../../vulkan" }
+roomie-worker-protocol = { path = "../../protocol" }
+
+[[bin]]
+name = "roomie-acceptance-fixture"
+path = "src/main.rs"

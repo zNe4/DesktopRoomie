@@ -1,0 +1,26 @@
+[package]
+name = "roomie-worker-vulkan"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[features]
+default = []
+native-vulkan = ["dep:wgpu"]
+
+[dependencies]
+roomie-worker-protocol = { path = "../protocol" }
+libc = "=0.2.191"
+wgpu = { version = "=29.0.1", default-features = false, features = ["std", "vulkan", "wgsl"], optional = true }
+
+[dev-dependencies]
+roomie-worker-supervisor = { path = "../supervisor" }
+
+[[bin]]
+name = "roomie-worker-vulkan"
+path = "src/main.rs"
+
+[[bin]]
+name = "vulkan-worker-fixture"
+path = "src/bin/worker-fixture.rs"

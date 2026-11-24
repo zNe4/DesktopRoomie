@@ -56,6 +56,10 @@ pub enum ScheduleRejection {
 #[derive(Debug)]
 pub enum JobCompletion<P> {
     Frame(PreparedFrame<P>),
+    /// A correlated successful worker result whose payload was discarded by
+    /// supervision after invalidation. This certifies settlement only and can
+    /// never create a ready frame, even if eligibility has since resumed.
+    SettledWithoutPayload,
     RejectedBeforeSubmission,
     Failed(String),
     /// Settlement is unproven. A terminal report is still owed for this job.
@@ -253,6 +257,7 @@ impl<P> GpuHandoff<P> {
                 self.work = Work::Ready(request, frame);
                 return Ok(CompletionStatus::Ready);
             }
+            JobCompletion::SettledWithoutPayload => Ok(CompletionStatus::Obsolete),
             JobCompletion::RejectedBeforeSubmission => {
                 Ok(CompletionStatus::RejectedBeforeSubmission)
             }

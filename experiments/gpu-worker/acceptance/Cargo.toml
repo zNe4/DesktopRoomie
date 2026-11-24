@@ -1,0 +1,16 @@
+[package]
+name = "roomie-worker-acceptance"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+desktop-probe = { path = "../../desktop-probe" }
+roomie-worker-protocol = { path = "../protocol" }
+roomie-worker-supervisor = { path = "../supervisor" }
+libc = "=0.2.191"
+
+[[bin]]
+name = "roomie-worker-acceptance"
+path = "src/main.rs"
