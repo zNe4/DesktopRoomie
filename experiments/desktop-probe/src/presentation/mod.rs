@@ -5,6 +5,7 @@
 //! Validation establishes common coordinate limits. Native target limits and
 //! the correspondence between coverage and rendered content are host checks.
 
+pub mod gpu_handoff;
 pub mod procedural;
 mod region;
 pub(crate) mod synthetic;
