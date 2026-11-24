@@ -23,6 +23,9 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::protocol::Event;
 
+#[path = "asynchronous_presentation_tests.rs"]
+mod asynchronous_tests;
+
 const OLD_BOUNDARY: u64 = 65_537;
 const BOUNDARY: u64 = 131_072;
 const REQUEST_LIMIT: usize = 262_140;

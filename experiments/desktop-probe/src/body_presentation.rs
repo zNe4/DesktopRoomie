@@ -1,4 +1,4 @@
-//! Owner-side frame preparation and timing for the synchronous X11 body.
+//! Owner-side frame requests, preparation and successful-publication timing.
 
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,52 @@ where
         FrameTiming::new(self.producer.capabilities().frame_period())
     }
 
+    /// Construct the authoritative request without reserving a publication
+    /// sequence. An unpublished sequence may be requested again later.
+    pub(crate) fn frame_request(
+        &self,
+        kind: FrameKind,
+        geometry: &FrameGeometry,
+        timing: &mut FrameTiming,
+        now: impl FnOnce() -> Instant,
+    ) -> Result<FrameRequest, HostError> {
+        let result = (|| {
+            if timing.stopped {
+                return Err("Body presentation has stopped".into());
+            }
+            if !self.producer.capabilities().supports(self.intent) {
+                return Err("Body producer no longer supports the selected intent".into());
+            }
+            if (kind == FrameKind::Initial) != geometry.committed().is_none() {
+                return Err("Frame request does not match the body publication phase".into());
+            }
+            let (elapsed, delta) = timing.request_times(kind, now())?;
+            geometry.frame_request(self.intent, elapsed, delta)
+        })();
+        if result.is_err() {
+            timing.stop();
+        }
+        result
+    }
+
+    pub(crate) fn prepare_with(
+        &mut self,
+        kind: FrameKind,
+        geometry: &FrameGeometry,
+        timing: &mut FrameTiming,
+        now: impl FnOnce() -> Instant,
+    ) -> Result<(FrameRequest, PreparedFrame<Vec<u8>>), HostError> {
+        let request = self.frame_request(kind, geometry, timing, now)?;
+        match self.producer.prepare_frame(&request).map_err(Into::into) {
+            Ok(frame) => Ok((request, frame)),
+            Err(error) => {
+                timing.stop();
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn present_with(
         &mut self,
         kind: FrameKind,
@@ -58,28 +104,11 @@ where
             PreparedFrame<Vec<u8>>,
         ) -> Result<(), HostError>,
     ) -> Result<(), HostError> {
-        let result = (|| {
-            if timing.stopped {
-                return Err("Body presentation has stopped".into());
-            }
-            if !self.producer.capabilities().supports(self.intent) {
-                return Err("Body producer no longer supports the selected intent".into());
-            }
-            if (kind == FrameKind::Initial) != geometry.committed().is_none() {
-                return Err("Frame request does not match the body publication phase".into());
-            }
-            let (elapsed, delta) = timing.request_times(kind, now())?;
-            let request = geometry.frame_request(self.intent, elapsed, delta)?;
-            let frame = self.producer.prepare_frame(&request).map_err(Into::into)?;
+        let (request, frame) = self.prepare_with(kind, geometry, timing, &mut now)?;
+        timing.publish_with(&request, eligible_after, now, || {
             publish(geometry, &request, frame)?;
-            timing.presented(request.active_elapsed(), now(), eligible_after)
-        })();
-        if result.is_err() {
-            // Preparation/validation errors are terminal here too. Do not issue
-            // a second request even when no native mutation could have occurred.
-            timing.stop();
-        }
-        result
+            Ok(true)
+        })
     }
 }
 
@@ -139,6 +168,32 @@ pub(crate) struct FrameTiming {
 }
 
 impl FrameTiming {
+    /// Only a successful checked publication advances presentation timing.
+    /// The completion clock observation stays after the native commitment.
+    /// A false publication result means ordinary pre-submission invalidation:
+    /// leave timing untouched and do not read the completion clock.
+    pub(crate) fn publish_with(
+        &mut self,
+        request: &FrameRequest,
+        eligible_after: bool,
+        mut now: impl FnMut() -> Instant,
+        publish: impl FnOnce() -> Result<bool, HostError>,
+    ) -> Result<(), HostError> {
+        let result = (|| {
+            if self.stopped {
+                return Err("Body presentation has stopped".into());
+            }
+            if !publish()? {
+                return Ok(());
+            }
+            self.presented(request.active_elapsed(), now(), eligible_after)
+        })();
+        if result.is_err() {
+            self.stop();
+        }
+        result
+    }
+
     pub(crate) fn new(period: Option<Duration>) -> Self {
         Self {
             period,

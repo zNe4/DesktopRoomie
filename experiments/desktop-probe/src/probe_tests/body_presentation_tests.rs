@@ -16,6 +16,91 @@ const INTENT: ActionIntent = ActionIntent {
     facing: Facing::Neutral,
 };
 
+#[test]
+fn split_seam_preserves_clock_order_and_skips_completion_clock_on_preparation_error() {
+    let mut presentation = BodyPresentation::new(Synthetic::new(Some(PERIOD))).unwrap();
+    let mut runtime =
+        ProbeRuntime::with_presentation(presentation.initial_extent(), presentation.timing());
+    let trace = RefCell::new(Vec::new());
+    let start = Instant::now();
+    let mut readings = [start, start + PERIOD].into_iter();
+    runtime
+        .present_frame_with(
+            &mut presentation,
+            FrameKind::Initial,
+            true,
+            || {
+                if trace.borrow().is_empty() {
+                    trace.borrow_mut().push("request clock");
+                } else {
+                    assert_eq!(
+                        *trace.borrow(),
+                        ["request clock", "upload", "blit", "commit"]
+                    );
+                    trace.borrow_mut().push("completion clock");
+                }
+                readings.next().expect("exactly two clock reads")
+            },
+            |frames, request, frame, _, _| {
+                frames.publish_with(
+                    request,
+                    frame,
+                    |_, _| {
+                        trace.borrow_mut().push("upload");
+                        Ok(())
+                    },
+                    |_| {
+                        trace.borrow_mut().push("blit");
+                        Ok(())
+                    },
+                )?;
+                assert_eq!(frames.require_committed()?.identity, request.identity());
+                trace.borrow_mut().push("commit");
+                Ok(None)
+            },
+            |_| panic!("successful publication must not fence"),
+        )
+        .unwrap();
+    assert_eq!(
+        *trace.borrow(),
+        [
+            "request clock",
+            "upload",
+            "blit",
+            "commit",
+            "completion clock"
+        ]
+    );
+    assert_eq!(runtime.frame_timing.deadline(), Some(start + PERIOD * 2));
+    presentation.producer.fail = true;
+    let mut reads = 0;
+    assert!(runtime
+        .present_frame_with(
+            &mut presentation,
+            FrameKind::Redraw,
+            true,
+            || {
+                reads += 1;
+                assert_eq!(reads, 1);
+                start + PERIOD * 2
+            },
+            |_, _, _, _, _| panic!("preparation failed"),
+            |_| panic!("trustworthy commit must remain usable"),
+        )
+        .is_err());
+    assert_eq!(reads, 1);
+    assert!(runtime.frame_timing.deadline().is_none());
+    assert!(runtime.frames.committed().is_some());
+    assert!(presentation
+        .frame_request(
+            FrameKind::Redraw,
+            &runtime.frames,
+            &mut runtime.frame_timing,
+            || panic!("stopped check precedes request clock"),
+        )
+        .is_err());
+}
+
 struct Synthetic {
     caps: PresentationCapabilities,
     requests: Vec<FrameRequest>,

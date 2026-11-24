@@ -28,6 +28,12 @@ pub(crate) struct CommittedFrameGeometry {
     pub metadata: FrameMetadata,
 }
 
+pub(crate) enum PreparedPublication {
+    /// Admission declined before publication state or native mutation.
+    Skipped,
+    Committed(Option<u64>),
+}
+
 /// Owner input obligations during the optional changing-coverage publication.
 pub(crate) trait CoverageCutover {
     fn maximum_request_bytes(&self) -> usize;
@@ -125,6 +131,24 @@ impl FrameGeometry {
         blit: impl FnOnce((u16, u16)) -> Result<(), HostError>,
         cutover: Option<&mut dyn CoverageCutover>,
     ) -> Result<Option<u64>, HostError> {
+        match self.publish_with_admission(request, frame, upload, blit, cutover, || Ok(true))? {
+            PreparedPublication::Committed(sequence) => Ok(sequence),
+            PreparedPublication::Skipped => unreachable!("CPU admission is unconditional"),
+        }
+    }
+
+    /// Final owner eligibility/freshness check after validation, before any
+    /// publication state or native input/pixel mutation. The CPU path has no
+    /// additional admission policy and performs no additional clock read.
+    pub(crate) fn publish_with_admission(
+        &mut self,
+        request: &FrameRequest,
+        frame: PreparedFrame<Vec<u8>>,
+        upload: impl FnOnce((u16, u16), &[u8]) -> Result<(), HostError>,
+        blit: impl FnOnce((u16, u16)) -> Result<(), HostError>,
+        cutover: Option<&mut dyn CoverageCutover>,
+        admit: impl FnOnce() -> Result<bool, HostError>,
+    ) -> Result<PreparedPublication, HostError> {
         if request.extent() != self.initial_extent {
             return Err("Runtime frame extent changes are unsupported".into());
         }
@@ -177,6 +201,9 @@ impl FrameGeometry {
                 .ok_or("PutImage request size overflow")?;
             super::validate_request_size(image_bytes, maximum, "PutImage")?;
         }
+        if !admit()? {
+            return Ok(PreparedPublication::Skipped);
+        }
         self.publication
             .prepare(request, &frame)
             .map_err(publication_error)?;
@@ -202,7 +229,7 @@ impl FrameGeometry {
             identity: frame.identity,
             metadata: frame.metadata,
         });
-        Ok(enabling_sequence)
+        Ok(PreparedPublication::Committed(enabling_sequence))
     }
 
     fn advance(

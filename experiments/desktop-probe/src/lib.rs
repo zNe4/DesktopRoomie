@@ -768,7 +768,7 @@ impl ProbeRuntime {
         presentation: &mut BodyPresentation<P>,
         kind: FrameKind,
         eligible: bool,
-        now: impl FnMut() -> Instant,
+        mut now: impl FnMut() -> Instant,
         publish: impl FnOnce(
             &mut FrameGeometry,
             &FrameRequest,
@@ -782,38 +782,73 @@ impl ProbeRuntime {
         P: FrameProducer<Payload = Vec<u8>>,
         P::Error: Into<HostError>,
     {
-        let mut committed = false;
-        let mut enabling_sequence = None;
-        let result = presentation.present_with(
-            kind,
-            &mut self.frames,
-            &mut self.frame_timing,
+        let (request, frame) =
+            match presentation.prepare_with(kind, &self.frames, &mut self.frame_timing, &mut now) {
+                Ok(candidate) => candidate,
+                Err(error) => return self.finish_frame_publication_with(Err(error), fence),
+            };
+        self.publish_prepared_with(
+            request,
+            frame,
             eligible,
             now,
-            |frames, request, frame| {
-                enabling_sequence = publish(
-                    frames,
-                    request,
-                    frame,
-                    &mut self.input_fence,
-                    &mut self.pointer,
-                )?;
-                committed = true;
-                Ok(())
+            |frames, request, frame, input, pointer| {
+                publish(frames, request, frame, input, pointer)
+                    .map(x11::render::PreparedPublication::Committed)
             },
-        );
+            fence,
+        )
+        .map(|_| ())
+    }
+
+    /// Accept an already prepared candidate with its original owner request.
+    /// Async callers must consume D1 ready and finish this call in the same
+    /// owner turn, supplying current eligibility at the renderer admission seam.
+    fn publish_prepared_with(
+        &mut self,
+        request: FrameRequest,
+        frame: PreparedFrame<Vec<u8>>,
+        eligible: bool,
+        now: impl FnMut() -> Instant,
+        publish: impl FnOnce(
+            &mut FrameGeometry,
+            &FrameRequest,
+            PreparedFrame<Vec<u8>>,
+            &mut InputFence,
+            &mut PointerCaptureTracker,
+        ) -> Result<x11::render::PreparedPublication, HostError>,
+        fence: impl FnOnce(&mut Self) -> Result<(), HostError>,
+    ) -> Result<bool, HostError> {
+        let mut committed = false;
+        let mut enabling_sequence = None;
+        let result = self.frame_timing.publish_with(&request, eligible, now, || {
+            match publish(
+                &mut self.frames,
+                &request,
+                frame,
+                &mut self.input_fence,
+                &mut self.pointer,
+            )? {
+                x11::render::PreparedPublication::Skipped => Ok(false),
+                x11::render::PreparedPublication::Committed(sequence) => {
+                    enabling_sequence = sequence;
+                    committed = true;
+                    Ok(true)
+                }
+            }
+        });
         // A timing error after Commit has no Publication uncertainty. Revoke
         // explicitly and keep changed input blocked until timing also succeeds.
         if result.is_err() && committed {
             self.invalidate_frame_and_fence_with(fence);
-            return result;
+            return result.map(|_| false);
         }
         self.finish_frame_publication_with(result, fence)?;
         if let Some(sequence) = enabling_sequence {
             self.input_fence.enabled_after = Some(sequence);
             self.input_fence.blocked = false;
         }
-        Ok(())
+        Ok(committed)
     }
 
     fn finish_frame_publication_with(
