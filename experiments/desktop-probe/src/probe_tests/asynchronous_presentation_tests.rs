@@ -106,7 +106,7 @@ impl Fixture {
                 );
                 completed
             },
-            |frames, request, frame, input, pointer| {
+            |frames, request, frame, input, pointer, _| {
                 let mut coverage = AnimatedCoverage {
                     input,
                     pointer,
@@ -147,7 +147,7 @@ impl Fixture {
                         )
                     },
                     Some(&mut policy),
-                    || Ok(clock.get() < deadline),
+                    |_, _| Ok(clock.get() < deadline),
                 )
             },
             |runtime| {

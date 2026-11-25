@@ -556,3 +556,40 @@ fn gpu_readiness_neither_submits_nor_commits_and_host_still_validates() {
     );
     assert_eq!(geometry.committed().unwrap().identity, identity);
 }
+
+#[test]
+fn ready_retains_exact_admission_until_one_shot_transfer_or_expiry() {
+    let (now, deadline) = time_window();
+    let original = request(2);
+    let mut handoff = active();
+    let first = admit(&mut handoff, original, now, deadline);
+    assert_eq!(
+        report_frame(
+            &mut handoff,
+            first,
+            original,
+            deadline - Duration::from_millis(1)
+        ),
+        Ok(CompletionStatus::Ready)
+    );
+    assert_eq!(handoff.wait_deadline(), Some(deadline));
+    let candidate = handoff.take_ready_frame().unwrap();
+    assert_eq!(candidate.identity, first);
+    assert_eq!(candidate.deadline, deadline);
+    assert_eq!(candidate.request, original);
+    assert!(handoff.take_ready().is_none());
+    let later = deadline + Duration::from_millis(1);
+    let second = admit(&mut handoff, original, now, later);
+    assert_ne!(first, second);
+    assert_eq!(first.frame, second.frame);
+    assert_eq!(
+        report_frame(&mut handoff, second, original, deadline),
+        Ok(CompletionStatus::Ready)
+    );
+    assert_eq!(handoff.wait_deadline(), Some(later));
+    assert_eq!(handoff.expire(later), Some(second));
+    assert_eq!(handoff.expire(later), None);
+    assert!(handoff.take_ready_frame().is_none());
+    assert_eq!(handoff.wait_deadline(), None);
+    assert_eq!(handoff.outstanding(), None);
+}

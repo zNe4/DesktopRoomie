@@ -26,6 +26,10 @@ use x11rb::protocol::Event;
 #[path = "asynchronous_presentation_tests.rs"]
 mod asynchronous_tests;
 
+#[cfg(feature = "managed-supervisor-fixture")]
+#[path = "managed_supervisor_tests.rs"]
+mod managed_supervisor_tests;
+
 const OLD_BOUNDARY: u64 = 65_537;
 const BOUNDARY: u64 = 131_072;
 const REQUEST_LIMIT: usize = 262_140;
@@ -211,6 +215,10 @@ impl<C: CoverageCutover> CoverageCutover for RecordBlock<'_, C> {
     }
     fn enable(&mut self, rectangles: Vec<Rectangle>) -> Result<u64, HostError> {
         self.0.enable(rectangles)
+    }
+    #[cfg(feature = "managed-supervisor-fixture")]
+    fn input_ready_for_admission(&self) -> bool {
+        self.0.input_ready_for_admission()
     }
 }
 

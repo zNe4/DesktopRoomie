@@ -214,6 +214,34 @@ impl FrameTiming {
         self.deadline.is_some_and(|deadline| now >= deadline)
     }
 
+    #[cfg(feature = "managed-supervisor-fixture")]
+    pub(crate) fn consume_opportunity(&mut self, now: Instant) -> bool {
+        if self.due(now) {
+            self.deadline = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Backpressure suppresses request deadlines while active time continues.
+    #[cfg(feature = "managed-supervisor-fixture")]
+    pub(crate) fn update_opportunity(&mut self, now: Instant, idle: bool) -> Result<(), HostError> {
+        if !idle || self.active_since.is_none() {
+            self.deadline = None;
+        } else if self.deadline.is_none() {
+            self.observe(now)?;
+            self.deadline = self
+                .period
+                .map(|period| {
+                    now.checked_add(period)
+                        .ok_or("Frame period exceeds supported monotonic deadline")
+                })
+                .transpose()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn stop(&mut self) {
         self.stopped = true;
         self.active_since = None;

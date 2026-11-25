@@ -6,6 +6,9 @@ mod control;
 mod geometry;
 mod interaction;
 mod layer;
+#[cfg(feature = "managed-supervisor-fixture")]
+#[doc(hidden)]
+pub mod managed_supervisor;
 pub mod presentation;
 mod x11;
 
@@ -26,6 +29,8 @@ use crate::cli::{parse_args, print_help, CliMode};
 use crate::geometry::{calculate_centered_origin, compute_valid_origin_bounds, Point, Size};
 use crate::interaction::{HostAction, InteractionManager, InteractionState, MenuOutcome};
 use crate::layer::{Layer, LayerController, Mutation, ObservedLayer, Step};
+#[cfg(feature = "managed-supervisor-fixture")]
+use crate::managed_supervisor::{Fixture, ManagedSupervisor};
 use crate::presentation::procedural::{Palette, ProceduralProducer};
 use crate::presentation::synthetic::SyntheticProducer;
 use crate::presentation::{ClientExtent, FrameProducer, FrameRequest, HitRegion, PreparedFrame};
@@ -144,11 +149,50 @@ pub fn run_cli(args: impl IntoIterator<Item = impl AsRef<str>>) {
         delay_secs,
         duration_secs,
         synthetic_animation,
+        #[cfg(feature = "managed-supervisor-fixture")]
+        None,
     );
     if exit != control::ExitCode::Success {
         process::exit(exit as i32);
     }
     println!("  Probe exited cleanly.");
+}
+
+/// Explicit fixture-only Rust entry point for the managed owner. The CLI
+/// continues to select only its existing CPU presentation modes.
+#[cfg(feature = "managed-supervisor-fixture")]
+#[doc(hidden)]
+pub fn run_managed_fixture(
+    fixture: Fixture<'_>,
+    duration_secs: Option<u64>,
+) -> Result<(), HostError> {
+    let (conn, screen_num) = x11rb::connect(None)?;
+    let screen = conn
+        .setup()
+        .roots
+        .get(screen_num)
+        .ok_or("Invalid default X11 screen")?;
+    let mut retired = None;
+    let exit = run_owner(
+        &conn,
+        screen,
+        screen_num,
+        None,
+        duration_secs,
+        true,
+        Some((fixture, &mut retired)),
+    );
+    // Even a failed checked teardown cannot keep the X11 connection alive
+    // while this thread waits for an unconfirmed child to exit.
+    drop(conn);
+    let reaping = retired
+        .as_mut()
+        .map_or(Ok(()), ManagedSupervisor::reap_after_host_cleanup);
+    if exit == control::ExitCode::Success {
+        reaping
+    } else {
+        Err(format!("Managed fixture owner exited with status {}", exit as i32).into())
+    }
 }
 
 fn run_owner(
@@ -158,7 +202,13 @@ fn run_owner(
     delay_secs: Option<u64>,
     duration_secs: Option<u64>,
     synthetic_animation: bool,
+    #[cfg(feature = "managed-supervisor-fixture")] fixture: Option<(
+        Fixture<'_>,
+        &mut Option<ManagedSupervisor>,
+    )>,
 ) -> control::ExitCode {
+    #[cfg(feature = "managed-supervisor-fixture")]
+    let (fixture, retired) = fixture.unzip();
     let mut owner = match ControlWindow::create(conn, screen, screen_num) {
         Ok(owner) => owner,
         Err(error) => {
@@ -194,6 +244,10 @@ fn run_owner(
             // Resolve the negotiated limit once, before candidate preflight.
             runtime.animated_shape_limit =
                 synthetic_animation.then(|| conn.maximum_request_bytes());
+            #[cfg(feature = "managed-supervisor-fixture")]
+            if let Some(fixture) = fixture {
+                runtime.managed = Some(ManagedSupervisor::spawn(fixture, Instant::now())?);
+            }
             start_body(
                 conn,
                 screen,
@@ -213,6 +267,14 @@ fn run_owner(
         );
     }
     let result = startup.map(|_| ());
+    #[cfg(feature = "managed-supervisor-fixture")]
+    let mut managed = runtime.as_mut().and_then(|runtime| runtime.managed.take());
+    #[cfg(feature = "managed-supervisor-fixture")]
+    let result = result.and(
+        managed
+            .as_mut()
+            .map_or(Ok(()), |managed| managed.begin_shutdown(Instant::now())),
+    );
     let outcome = finish_probe_with(result, || {
         let closing_popup = runtime
             .as_ref()
@@ -262,6 +324,10 @@ fn run_owner(
         }
         cleanup
     });
+    #[cfg(feature = "managed-supervisor-fixture")]
+    if let Some(retired) = retired {
+        *retired = managed;
+    }
     if outcome.is_err() {
         control::ExitCode::LocalFailure
     } else if duplicate {
@@ -636,6 +702,11 @@ where
         self.input.empty_confirmed = false;
         (self.set_input)(rectangles)
     }
+
+    #[cfg(feature = "managed-supervisor-fixture")]
+    fn input_ready_for_admission(&self) -> bool {
+        !self.input.blocked && self.input.enabled_after.is_some() && !self.pointer.is_grabbed()
+    }
 }
 
 /// Supplied by fresh retained-monitor/layout and root-geometry validation, never
@@ -664,7 +735,92 @@ struct ProbeRuntime {
     layers: LayerController,
     input_fence: InputFence,
     pending_map_input: Option<u64>,
+    #[cfg(feature = "managed-supervisor-fixture")]
+    managed: Option<ManagedSupervisor>,
 }
+
+/// Read-only host facts disjoint from the frame, input fence and capture
+/// borrowed by the checked publication transaction.
+struct FrameHostState<'a> {
+    body: &'a BodyAvailability,
+    layers: &'a LayerController,
+    interaction: &'a InteractionManager,
+    menu: &'a Option<MenuPopup>,
+    pending_move: &'a Option<Point>,
+    final_target: &'a Option<Point>,
+    confirmation_deadline: &'a Option<Instant>,
+    correction: &'a Option<(Point, Instant)>,
+    safety: &'a GestureSafety,
+}
+
+#[cfg(feature = "managed-supervisor-fixture")]
+type FinalFrameAdmission<'a> =
+    dyn FnMut(&FrameGeometry, Option<&dyn CoverageCutover>) -> Result<bool, HostError> + 'a;
+
+#[cfg(feature = "managed-supervisor-fixture")]
+fn look_ahead<T>(
+    buffered: &mut Option<T>,
+    peek: &mut impl FnMut() -> Result<Option<T>, HostError>,
+) -> Result<bool, HostError> {
+    if buffered.is_none() {
+        *buffered = peek()?;
+    }
+    Ok(buffered.is_none())
+}
+
+impl FrameHostState<'_> {
+    fn interaction_settled(&self) -> bool {
+        self.menu.is_none()
+            && matches!(
+                self.interaction.state(),
+                InteractionState::Idle | InteractionState::SuppressedUntilRelease { .. }
+            )
+            && self.pending_move.is_none()
+            && self.final_target.is_none()
+            && self.confirmation_deadline.is_none()
+            && self.correction.is_none()
+            && self.safety.deadline.is_none()
+            && self.safety.observation.is_none()
+    }
+
+    fn permits_frame(&self, owner_busy: bool, movement_settled: bool) -> bool {
+        !owner_busy
+            && self.layers.pending().is_none()
+            && *self.body == BodyAvailability::Ready
+            && self.interaction_settled()
+            && movement_settled
+    }
+
+    fn deadline(&self, duration: Option<Instant>) -> Option<Instant> {
+        [
+            duration,
+            *self.confirmation_deadline,
+            self.correction.map(|(_, deadline)| deadline),
+            self.safety.deadline,
+            self.layers.deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+}
+
+macro_rules! frame_host_state {
+    ($runtime:ident) => {
+        FrameHostState {
+            body: &$runtime.body,
+            layers: &$runtime.layers,
+            interaction: &$runtime.interaction,
+            menu: &$runtime.menu,
+            pending_move: &$runtime.pending_move,
+            final_target: &$runtime.final_target,
+            confirmation_deadline: &$runtime.confirmation_deadline,
+            correction: &$runtime.correction,
+            safety: &$runtime.safety,
+        }
+    };
+}
+
 impl ProbeRuntime {
     #[cfg(test)]
     fn new() -> Self {
@@ -689,15 +845,15 @@ impl ProbeRuntime {
             layers: LayerController::default(),
             input_fence: InputFence::default(),
             pending_map_input: None,
+            #[cfg(feature = "managed-supervisor-fixture")]
+            managed: None,
         }
     }
 
     fn frame_eligible(&self, window: &ManagedProbeWindow, owner_busy: bool) -> bool {
-        !owner_busy
-            && self.layers.pending().is_none()
+        frame_host_state!(self).permits_frame(owner_busy, window.in_flight_moves.is_empty())
             && self.body_input_ready()
-            && self.input_obligations_settled()
-            && window.in_flight_moves.is_empty()
+            && !self.pointer.is_grabbed()
     }
 
     fn refresh_frame_eligibility(
@@ -706,8 +862,175 @@ impl ProbeRuntime {
         window: &ManagedProbeWindow,
         owner_busy: bool,
     ) -> Result<(), HostError> {
-        self.frame_timing
-            .update_eligibility(now, self.frame_eligible(window, owner_busy))
+        let eligible = self.frame_eligible(window, owner_busy);
+        self.frame_timing.update_eligibility(now, eligible)?;
+        #[cfg(feature = "managed-supervisor-fixture")]
+        if let Some(managed) = &mut self.managed {
+            managed.set_eligible(eligible)?;
+            self.frame_timing
+                .update_opportunity(now, managed.can_request())?;
+        }
+        Ok(())
+    }
+
+    fn interrupt_frame_eligibility(&mut self, now: Instant) -> Result<(), HostError> {
+        #[cfg(feature = "managed-supervisor-fixture")]
+        if let Some(managed) = &mut self.managed {
+            managed.set_eligible(false)?;
+        }
+        self.frame_timing.update_eligibility(now, false)
+    }
+
+    #[cfg(feature = "managed-supervisor-fixture")]
+    fn progress_managed(&mut self, mut now: impl FnMut() -> Instant) -> Result<(), HostError> {
+        if let Some(managed) = &mut self.managed {
+            managed.observe(&mut now)?;
+            self.frame_timing
+                .update_opportunity(now(), managed.can_request())?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "managed-supervisor-fixture")]
+    fn progress_before_event_batch<T>(
+        &mut self,
+        now: impl FnMut() -> Instant,
+        buffered: &mut Option<T>,
+        peek: impl FnMut() -> Result<Option<T>, HostError>,
+    ) -> Result<Vec<T>, HostError> {
+        self.progress_managed(now)?;
+        drain_events_bounded(buffered, 64, peek)
+    }
+
+    /// The owner calls this only at the existing safe presentation boundary.
+    /// Both observations also run through this method with checked test transport.
+    #[cfg(feature = "managed-supervisor-fixture")]
+    #[allow(clippy::too_many_arguments)]
+    fn managed_presentation_turn<P, T>(
+        &mut self,
+        window: &mut ManagedProbeWindow,
+        presentation: &mut BodyPresentation<P>,
+        duration_deadline: Option<Instant>,
+        owner_busy: impl Fn() -> bool,
+        control_deadline: impl Fn() -> Option<Instant>,
+        now: impl FnMut() -> Instant,
+        buffered: &mut Option<T>,
+        mut peek: impl FnMut() -> Result<Option<T>, HostError>,
+        publish: impl FnOnce(
+            &mut FrameGeometry,
+            &FrameRequest,
+            PreparedFrame<Vec<u8>>,
+            &mut InputFence,
+            &mut PointerCaptureTracker,
+            &mut FinalFrameAdmission<'_>,
+        ) -> Result<x11::render::PreparedPublication, HostError>,
+        fence: impl FnOnce(&mut Self, &mut ManagedProbeWindow) -> Result<(), HostError>,
+    ) -> Result<bool, HostError>
+    where
+        P: FrameProducer<Payload = Vec<u8>>,
+        P::Error: Into<HostError>,
+    {
+        let clock = std::cell::RefCell::new(now);
+        let now = || (clock.borrow_mut())();
+        let managed = self.managed.as_mut().expect("selected managed fixture");
+        if managed.immediate() {
+            return Ok(false);
+        }
+        managed.observe(now)?;
+        let empty = look_ahead(buffered, &mut peek)?;
+        let observed = now();
+        self.refresh_frame_eligibility(observed, window, owner_busy())?;
+        let eligible = self.frame_eligible(window, owner_busy());
+        let managed = self.managed.as_mut().expect("selected managed fixture");
+        if !empty
+            || !eligible
+            || !managed.drained()
+            || !managed.healthy()
+            || frame_host_state!(self)
+                .deadline(duration_deadline)
+                .into_iter()
+                .chain(control_deadline())
+                .any(|deadline| observed >= deadline)
+        {
+            return Ok(false);
+        }
+        if let Some(ready) = managed.ready() {
+            if observed >= ready.deadline || !self.frames.matches_request(&ready.request) {
+                managed.take_ready();
+                self.frame_timing
+                    .update_opportunity(observed, managed.can_request())?;
+                return Ok(false);
+            }
+        } else {
+            if managed.can_request() && self.frame_timing.due(observed) {
+                let request = presentation.frame_request(
+                    FrameKind::Scheduled,
+                    &self.frames,
+                    &mut self.frame_timing,
+                    || observed,
+                )?;
+                self.frame_timing.consume_opportunity(observed);
+                managed.admit(request, observed)?;
+                self.frame_timing
+                    .update_opportunity(observed, managed.can_request())?;
+            }
+            return Ok(false);
+        }
+
+        let mut managed = self.managed.take().expect("selected managed fixture");
+        let ready = managed.take_ready().expect("ready candidate checked");
+        let mut fence_needed = false;
+        let result = self.publish_prepared_with(
+            ready.request,
+            ready.frame,
+            eligible,
+            now,
+            |frames, request, frame, input, pointer, host| {
+                publish(
+                    frames,
+                    request,
+                    frame,
+                    input,
+                    pointer,
+                    &mut |geometry, cutover| {
+                        managed.observe(now)?;
+                        let empty = look_ahead(buffered, &mut peek)?;
+                        let observed = now();
+                        Ok(empty
+                            && managed.drained()
+                            && managed.healthy()
+                            && host.permits_frame(owner_busy(), window.in_flight_moves.is_empty())
+                            && cutover.is_some_and(CoverageCutover::input_ready_for_admission)
+                            && geometry.matches_request(request)
+                            && host
+                                .deadline(duration_deadline)
+                                .into_iter()
+                                .chain(control_deadline())
+                                .all(|deadline| observed < deadline)
+                            && observed < ready.deadline)
+                    },
+                )
+            },
+            |_| {
+                fence_needed = true;
+                Ok(())
+            },
+        );
+        self.managed = Some(managed);
+        if fence_needed {
+            if let Err(cleanup) = fence(self, window) {
+                eprintln!("[INPUT] Frame authority safety cleanup: {cleanup}");
+            }
+        }
+        let committed = result?;
+        if !committed {
+            let idle = self
+                .managed
+                .as_ref()
+                .is_some_and(ManagedSupervisor::can_request);
+            self.frame_timing.update_opportunity(now(), idle)?;
+        }
+        Ok(committed)
     }
 
     fn frame_tick_ready(
@@ -792,7 +1115,7 @@ impl ProbeRuntime {
             frame,
             eligible,
             now,
-            |frames, request, frame, input, pointer| {
+            |frames, request, frame, input, pointer, _| {
                 publish(frames, request, frame, input, pointer)
                     .map(x11::render::PreparedPublication::Committed)
             },
@@ -816,11 +1139,13 @@ impl ProbeRuntime {
             PreparedFrame<Vec<u8>>,
             &mut InputFence,
             &mut PointerCaptureTracker,
+            &FrameHostState<'_>,
         ) -> Result<x11::render::PreparedPublication, HostError>,
         fence: impl FnOnce(&mut Self) -> Result<(), HostError>,
     ) -> Result<bool, HostError> {
         let mut committed = false;
         let mut enabling_sequence = None;
+        let host = frame_host_state!(self);
         let result = self.frame_timing.publish_with(&request, eligible, now, || {
             match publish(
                 &mut self.frames,
@@ -828,6 +1153,7 @@ impl ProbeRuntime {
                 frame,
                 &mut self.input_fence,
                 &mut self.pointer,
+                &host,
             )? {
                 x11::render::PreparedPublication::Skipped => Ok(false),
                 x11::render::PreparedPublication::Committed(sequence) => {
@@ -924,7 +1250,7 @@ impl ProbeRuntime {
         conn: &impl Connection,
         window: &mut ManagedProbeWindow,
     ) -> Result<(), HostError> {
-        let timing = self.frame_timing.update_eligibility(Instant::now(), false);
+        let timing = self.interrupt_frame_eligibility(Instant::now());
         let body = window.window;
         self.fence_visibility_input_with(
             window,
@@ -1286,18 +1612,7 @@ impl ProbeRuntime {
     }
 
     fn input_obligations_settled(&self) -> bool {
-        !self.pointer.is_grabbed()
-            && self.menu.is_none()
-            && matches!(
-                self.interaction.state(),
-                InteractionState::Idle | InteractionState::SuppressedUntilRelease { .. }
-            )
-            && self.pending_move.is_none()
-            && self.final_target.is_none()
-            && self.confirmation_deadline.is_none()
-            && self.correction.is_none()
-            && self.safety.deadline.is_none()
-            && self.safety.observation.is_none()
+        !self.pointer.is_grabbed() && frame_host_state!(self).interaction_settled()
     }
 
     fn native_unavailable(
@@ -1314,7 +1629,7 @@ impl ProbeRuntime {
         conn: &impl Connection,
         window: &mut ManagedProbeWindow,
     ) -> Result<(), HostError> {
-        let timing = self.frame_timing.update_eligibility(Instant::now(), false);
+        let timing = self.interrupt_frame_eligibility(Instant::now());
         self.body = BodyAvailability::Unavailable;
         self.correction = None;
         let safety = if self.input_fence.blocked {
@@ -5037,9 +5352,7 @@ fn route_owner_request<C: Connection>(
             if owner.active().is_some() {
                 // Admission and terminal completion can both happen in this
                 // call, so the next event boundary alone cannot see the pause.
-                host.runtime
-                    .frame_timing
-                    .update_eligibility(Instant::now(), false)?;
+                host.runtime.interrupt_frame_eligibility(Instant::now())?;
             }
             service_owner_operation(owner, host)
         },
@@ -5322,6 +5635,8 @@ fn run_probe(
                 if now >= deadline {
                     if !window.is_viewable(conn)? {
                         runtime.native_unavailable(conn, window)?;
+                        #[cfg(feature = "managed-supervisor-fixture")]
+                        runtime.progress_managed(Instant::now)?;
                         continue;
                     }
                     let actual = window.query_actual_root_geometry(conn, root)?;
@@ -5402,6 +5717,14 @@ fn run_probe(
             })?;
         }
         publish_ready_if(runtime.body, || owner.publish_ready(conn))?;
+        // Service one bounded worker turn before any of the batch continuations.
+        // Host deadlines and immediate host termination retain precedence.
+        #[cfg(feature = "managed-supervisor-fixture")]
+        let batch =
+            runtime.progress_before_event_batch(Instant::now, &mut buffered_event, || {
+                Ok(conn.poll_for_event_with_sequence()?)
+            })?;
+        #[cfg(not(feature = "managed-supervisor-fixture"))]
         let batch = drain_events_bounded(&mut buffered_event, 64, || {
             conn.poll_for_event_with_sequence()
         })?;
@@ -5628,9 +5951,7 @@ fn run_probe(
                     runtime.body,
                     BodyAvailability::AwaitingMap | BodyAvailability::Unavailable
                 ) {
-                    runtime
-                        .frame_timing
-                        .update_eligibility(Instant::now(), false)?;
+                    runtime.interrupt_frame_eligibility(Instant::now())?;
                     if window.verified_visible(conn, layout.current_desktop, atoms.wm_desktop)? {
                         runtime.body = BodyAvailability::Validating;
                         runtime.placement(conn, root, window, &bounds)?;
@@ -5749,6 +6070,10 @@ fn run_probe(
                 {
                     if owner.active().is_some_and(remote_owns_layer) {
                         continue;
+                    }
+                    #[cfg(feature = "managed-supervisor-fixture")]
+                    if runtime.managed.is_some() {
+                        runtime.interrupt_frame_eligibility(Instant::now())?;
                     }
                     runtime.cancel(conn, window, "map verification")?;
                     let layout = query_desktop_layout(conn, root, atoms, Some(selected_monitor))?;
@@ -5883,9 +6208,7 @@ fn run_probe(
                                     origin,
                                 )
                             {
-                                runtime
-                                    .frame_timing
-                                    .update_eligibility(Instant::now(), false)?;
+                                runtime.interrupt_frame_eligibility(Instant::now())?;
                                 match runtime
                                     .pointer
                                     .acquire_with(CaptureOwner::BodyLeft, || {
@@ -5914,9 +6237,7 @@ fn run_probe(
                                 .handle_right_press_on_body(ev.time, on_body)
                                 == HostAction::TrackOpening =>
                         {
-                            runtime
-                                .frame_timing
-                                .update_eligibility(Instant::now(), false)?;
+                            runtime.interrupt_frame_eligibility(Instant::now())?;
                             runtime.pointer.track_automatic_right()?;
                             runtime.safety.acquired(Instant::now());
                             println!("[INPUT] Right opening gesture pending");
@@ -6120,6 +6441,62 @@ fn run_probe(
             buffered_event = Some(event);
             continue;
         }
+        #[cfg(feature = "managed-supervisor-fixture")]
+        if runtime.managed.is_some() {
+            let body = window.window;
+            let maximum_request_bytes = runtime.animated_shape_limit.expect("fixture canvas limit");
+            runtime.managed_presentation_turn(
+                window,
+                presentation,
+                duration_deadline,
+                || owner.active().is_some(),
+                || remote_deadline(owner),
+                Instant::now,
+                &mut buffered_event,
+                || Ok(conn.poll_for_event_with_sequence()?),
+                |frames, request, frame, input, pointer, admit| {
+                    let mut coverage = AnimatedCoverage {
+                        input,
+                        pointer,
+                        maximum_request_bytes,
+                        set_input: |rectangles| {
+                            x11::shape::set_body_input_rectangles(conn, body, rectangles)
+                        },
+                        release: || x11::pointer::ungrab_pointer(conn, x11rb::CURRENT_TIME),
+                    };
+                    renderer.present_conditionally(
+                        conn,
+                        body,
+                        frames,
+                        request,
+                        frame,
+                        &mut coverage,
+                        admit,
+                    )
+                },
+                |runtime, window| runtime.fence_visibility_input(conn, window),
+            )?;
+            // Checked native requests can have filled x11rb's event buffer
+            // even when the underlying socket is no longer readable.
+            if buffered_event.is_none() {
+                if let Some(event) = conn.poll_for_event_with_sequence()? {
+                    buffered_event = Some(event);
+                }
+            }
+            if let Some(managed) = &runtime.managed {
+                if buffered_event.is_none() && !managed.immediate() {
+                    let (interest, deadline) = managed.interests()?;
+                    let deadline = probe_deadline(runtime, duration_deadline)
+                        .into_iter()
+                        .chain(remote_deadline(owner))
+                        .chain(runtime.frame_timing.deadline())
+                        .chain(deadline)
+                        .min();
+                    x11::events::wait_managed(Some(conn), &interest, deadline)?;
+                }
+            }
+            continue;
+        }
         let host_deadline = probe_deadline(runtime, duration_deadline)
             .into_iter()
             .chain(remote_deadline(owner))
@@ -6151,6 +6528,11 @@ fn run_probe(
             .min();
         wait_x11(conn, timeout)?;
     })();
+    #[cfg(feature = "managed-supervisor-fixture")]
+    if let Some(managed) = &mut runtime.managed {
+        let closing = managed.begin_shutdown(Instant::now());
+        outcome = outcome.and_then(|reason| closing.map(|()| reason));
+    }
     runtime.frame_timing.stop();
     // Settle an internal Recover while its borrowed host still exists. A failed
     // shutdown ownership lookup/publication must enter the same fatal boundary,
@@ -6230,16 +6612,7 @@ fn probe_duration_deadline(
 }
 
 fn probe_deadline(runtime: &ProbeRuntime, duration: Option<Instant>) -> Option<Instant> {
-    [
-        duration,
-        runtime.confirmation_deadline,
-        runtime.correction.map(|(_, dl)| dl),
-        runtime.safety.deadline,
-        runtime.layers.deadline(),
-    ]
-    .into_iter()
-    .flatten()
-    .min()
+    frame_host_state!(runtime).deadline(duration)
 }
 
 fn publish_ready_if(

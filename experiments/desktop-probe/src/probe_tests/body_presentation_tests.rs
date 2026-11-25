@@ -1089,3 +1089,34 @@ fn live_factory_and_recurring_submission_stay_behind_owner_and_event_boundaries(
     assert!(probe[tick..].contains(".chain(runtime.frame_timing.deadline())"));
     assert!(probe[tick..].contains("wait_x11(conn, timeout)"));
 }
+
+#[cfg(feature = "managed-supervisor-fixture")]
+#[test]
+fn asynchronous_opportunity_consumption_and_rearming_preserve_active_elapsed() {
+    let origin = Instant::now();
+    let mut timing = FrameTiming::new(Some(PERIOD));
+    let at = |millis| origin + Duration::from_millis(millis);
+    timing.update_eligibility(at(0), true).unwrap();
+    assert!(!timing.consume_opportunity(at(9)));
+    assert!(timing.consume_opportunity(at(10)));
+    assert!(!timing.consume_opportunity(at(100)));
+    timing.update_opportunity(at(100), false).unwrap();
+    assert_eq!(timing.deadline(), None);
+    timing.update_eligibility(at(150), true).unwrap();
+    assert_eq!(
+        timing.elapsed_at(at(150)).unwrap(),
+        Duration::from_millis(150)
+    );
+    timing.update_opportunity(at(150), true).unwrap();
+    assert_eq!(timing.deadline(), Some(at(160)));
+    assert_eq!(timing.last_request_elapsed, Duration::ZERO);
+    timing.update_eligibility(at(151), false).unwrap();
+    assert_eq!(timing.deadline(), None);
+    timing.update_eligibility(at(900), true).unwrap();
+    assert!(!timing.due(at(909)));
+    assert!(timing.due(at(910)));
+    assert_eq!(
+        timing.elapsed_at(at(910)).unwrap(),
+        Duration::from_millis(161)
+    );
+}

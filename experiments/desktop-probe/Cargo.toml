@@ -6,3 +6,17 @@ description = "A00 Desktop probe: validating X11 transparency, input shaping, an
 
 [dependencies]
 x11rb = { version = "0.14.0", features = ["render", "shape", "randr"] }
+
+[features]
+managed-supervisor-fixture = [
+    "dep:roomie-worker-supervisor",
+    "dep:roomie-worker-protocol",
+]
+
+[dependencies.roomie-worker-supervisor]
+path = "../gpu-worker/supervisor"
+optional = true
+
+[dependencies.roomie-worker-protocol]
+path = "../gpu-worker/protocol"
+optional = true

@@ -23,6 +23,14 @@ pub struct GpuJob {
     request: FrameRequest,
 }
 
+/// One settled candidate with the original admission facts.
+pub struct ReadyFrame<P> {
+    pub identity: JobIdentity,
+    pub request: FrameRequest,
+    pub deadline: Instant,
+    pub frame: PreparedFrame<P>,
+}
+
 impl GpuJob {
     pub fn identity(&self) -> JobIdentity {
         self.identity
@@ -93,10 +101,12 @@ enum Work<P> {
     Pending {
         identity: JobIdentity,
         request: FrameRequest,
-        // Cleared on timeout or uncertainty, while physical work stays pending.
-        deadline: Option<Instant>,
+        deadline: Instant,
+        // Timeout or uncertainty retires the wait interest, never the debt.
+        fresh: bool,
+        unresolved: bool,
     },
-    Ready(FrameRequest, PreparedFrame<P>),
+    Ready(ReadyFrame<P>),
 }
 
 /// Owns one job or one GPU-ready frame. The owner supplies requests explicitly
@@ -184,7 +194,9 @@ impl<P> GpuHandoff<P> {
         self.work = Work::Pending {
             identity,
             request,
-            deadline: Some(deadline),
+            deadline,
+            fresh: true,
+            unresolved: false,
         };
         Ok(GpuJob { identity, request })
     }
@@ -196,28 +208,69 @@ impl<P> GpuHandoff<P> {
         }
     }
 
-    /// One owner wakeup deadline, including canceled jobs awaiting settlement.
-    pub fn deadline(&self) -> Option<Instant> {
+    /// The original request for the outstanding physical obligation.
+    pub fn outstanding_request(&self) -> Option<FrameRequest> {
         match self.work {
-            Work::Pending { deadline, .. } => deadline,
+            Work::Pending { request, .. } => Some(request),
             _ => None,
         }
+    }
+
+    pub fn unresolved(&self) -> Option<JobIdentity> {
+        match self.work {
+            Work::Pending {
+                identity,
+                unresolved: true,
+                ..
+            } => Some(identity),
+            _ => None,
+        }
+    }
+
+    pub fn ready(&self) -> Option<&ReadyFrame<P>> {
+        match &self.work {
+            Work::Ready(ready) => Some(ready),
+            _ => None,
+        }
+    }
+
+    /// One pending-work wakeup deadline, including canceled jobs awaiting settlement.
+    pub fn deadline(&self) -> Option<Instant> {
+        match &self.work {
+            Work::Pending {
+                deadline,
+                fresh: true,
+                ..
+            } => Some(*deadline),
+            _ => None,
+        }
+    }
+
+    /// Includes the freshness deadline of an unconsumed ready candidate.
+    pub fn wait_deadline(&self) -> Option<Instant> {
+        self.ready().map(|ready| ready.deadline).or(self.deadline())
     }
 
     /// Reports expiry once and revokes this job's result eligibility. Physical
     /// settlement is still owed. Equality with the deadline counts as expiry.
     pub fn expire(&mut self, now: Instant) -> Option<JobIdentity> {
-        let Work::Pending {
-            identity, deadline, ..
-        } = &mut self.work
-        else {
-            return None;
-        };
-        if deadline.is_some_and(|deadline| now >= deadline) {
-            *deadline = None;
-            return Some(*identity);
+        match &mut self.work {
+            Work::Pending {
+                identity,
+                deadline,
+                fresh,
+                ..
+            } if *fresh && now >= *deadline => {
+                *fresh = false;
+                Some(*identity)
+            }
+            Work::Ready(ready) if now >= ready.deadline => {
+                let identity = ready.identity;
+                self.work = Work::Idle;
+                Some(identity)
+            }
+            _ => None,
         }
-        None
     }
 
     /// Accepts a worker report, for example after a future owner wakeup. Use
@@ -233,6 +286,8 @@ impl<P> GpuHandoff<P> {
             identity: pending,
             request,
             deadline,
+            fresh,
+            unresolved,
         } = &mut self.work
         else {
             return Err(CompletionError::UnexpectedJob);
@@ -243,10 +298,12 @@ impl<P> GpuHandoff<P> {
         let request = *request;
         let eligible = self.eligibility == Eligibility::Active
             && identity.epoch == self.epoch
-            && deadline.is_some_and(|deadline| now < deadline);
+            && *fresh
+            && now < *deadline;
         let status = match completion {
             JobCompletion::Unresolved(error) => {
-                *deadline = None;
+                *fresh = false;
+                *unresolved = true;
                 return Ok(CompletionStatus::Unresolved(error));
             }
             JobCompletion::Frame(_) if !eligible => Ok(CompletionStatus::Obsolete),
@@ -254,7 +311,12 @@ impl<P> GpuHandoff<P> {
                 Err(CompletionError::FrameIdentityMismatch)
             }
             JobCompletion::Frame(frame) => {
-                self.work = Work::Ready(request, frame);
+                self.work = Work::Ready(ReadyFrame {
+                    identity,
+                    request,
+                    deadline: *deadline,
+                    frame,
+                });
                 return Ok(CompletionStatus::Ready);
             }
             JobCompletion::SettledWithoutPayload => Ok(CompletionStatus::Obsolete),
@@ -270,13 +332,19 @@ impl<P> GpuHandoff<P> {
     /// Transfers the original request and candidate to the owner once. The
     /// caller must validate and publish it before processing another owner event.
     pub fn take_ready(&mut self) -> Option<(FrameRequest, PreparedFrame<P>)> {
+        self.take_ready_frame()
+            .map(|ready| (ready.request, ready.frame))
+    }
+
+    /// One-shot transfer with the full admitted identity and deadline.
+    pub fn take_ready_frame(&mut self) -> Option<ReadyFrame<P>> {
         if !matches!(self.work, Work::Ready(..)) {
             return None;
         }
-        let Work::Ready(request, frame) = std::mem::replace(&mut self.work, Work::Idle) else {
+        let Work::Ready(ready) = std::mem::replace(&mut self.work, Work::Idle) else {
             unreachable!("ready frame checked above");
         };
-        Some((request, frame))
+        Some(ready)
     }
 
     /// Latches a device-wide failure from this backend, independently of any

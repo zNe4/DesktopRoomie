@@ -48,6 +48,79 @@ pub(crate) fn wait_x11(
     Ok(())
 }
 
+#[cfg(feature = "managed-supervisor-fixture")]
+pub(crate) fn wait_managed(
+    conn: Option<&x11rb::rust_connection::RustConnection>,
+    interest: &roomie_worker_supervisor::WaitInterest,
+    deadline: Option<Instant>,
+) -> Result<roomie_worker_supervisor::Readiness, HostError> {
+    if let Some(conn) = conn {
+        conn.flush()?;
+    }
+    poll_managed(
+        conn.map(|conn| conn.stream().as_raw_fd()),
+        interest,
+        deadline,
+    )
+}
+
+#[cfg(feature = "managed-supervisor-fixture")]
+pub(crate) fn poll_managed(
+    host: Option<std::os::fd::RawFd>,
+    interest: &roomie_worker_supervisor::WaitInterest,
+    deadline: Option<Instant>,
+) -> Result<roomie_worker_supervisor::Readiness, HostError> {
+    const POLLOUT: i16 = 0x0004;
+    const POLLERR: i16 = 0x0008;
+    const POLLHUP: i16 = 0x0010;
+    const POLLNVAL: i16 = 0x0020;
+    let mut descriptors = [
+        PollFd {
+            fd: host.unwrap_or(-1),
+            events: POLLIN,
+            revents: 0,
+        },
+        PollFd {
+            fd: interest.socket.unwrap_or(-1),
+            events: POLLIN | if interest.writable { POLLOUT } else { 0 },
+            revents: 0,
+        },
+        PollFd {
+            fd: interest.process.unwrap_or(-1),
+            events: POLLIN,
+            revents: 0,
+        },
+    ];
+    let timeout = deadline.map_or(-1, |deadline| {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as i32
+    });
+    // SAFETY: poll borrows the three live entries and writes their revents.
+    let result = unsafe { poll(descriptors.as_mut_ptr(), descriptors.len(), timeout) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::Interrupted {
+            Ok(roomie_worker_supervisor::Readiness::default())
+        } else {
+            Err(error.into())
+        };
+    }
+    let [x11, worker, process] = descriptors.map(|descriptor| descriptor.revents);
+    if x11 & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+        return Err(format!("X11 socket unavailable (poll revents=0x{x11:x})").into());
+    }
+    Ok(roomie_worker_supervisor::Readiness {
+        readable: worker & POLLIN != 0,
+        writable: worker & POLLOUT != 0,
+        hangup: worker & POLLHUP != 0,
+        error: worker & (POLLERR | POLLNVAL) != 0,
+        exited: process != 0,
+    })
+}
+
 /// Drains available X11 events into a bounded batch, prepending any previously buffered event.
 pub(crate) fn drain_events_bounded<T, E, F>(
     buffered_event: &mut Option<T>,

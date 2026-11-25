@@ -40,6 +40,10 @@ pub(crate) trait CoverageCutover {
     fn block_input(&mut self);
     fn empty_and_release(&mut self) -> Result<(), HostError>;
     fn enable(&mut self, rectangles: Vec<Rectangle>) -> Result<u64, HostError>;
+    #[cfg(feature = "managed-supervisor-fixture")]
+    fn input_ready_for_admission(&self) -> bool {
+        false
+    }
 }
 
 /// Geometry for one fixed X11 presentation target. The publication tracker
@@ -111,6 +115,16 @@ impl FrameGeometry {
             .map_err(|error| format!("Invalid renderer frame request: {error:?}").into())
     }
 
+    #[cfg(feature = "managed-supervisor-fixture")]
+    pub(crate) fn matches_request(&self, request: &FrameRequest) -> bool {
+        self.frame_request(
+            request.intent(),
+            request.active_elapsed(),
+            request.active_delta(),
+        )
+        .is_ok_and(|current| current == *request)
+    }
+
     #[cfg(test)]
     pub(crate) fn publish_with(
         &mut self,
@@ -131,7 +145,7 @@ impl FrameGeometry {
         blit: impl FnOnce((u16, u16)) -> Result<(), HostError>,
         cutover: Option<&mut dyn CoverageCutover>,
     ) -> Result<Option<u64>, HostError> {
-        match self.publish_with_admission(request, frame, upload, blit, cutover, || Ok(true))? {
+        match self.publish_with_admission(request, frame, upload, blit, cutover, |_, _| Ok(true))? {
             PreparedPublication::Committed(sequence) => Ok(sequence),
             PreparedPublication::Skipped => unreachable!("CPU admission is unconditional"),
         }
@@ -147,7 +161,7 @@ impl FrameGeometry {
         upload: impl FnOnce((u16, u16), &[u8]) -> Result<(), HostError>,
         blit: impl FnOnce((u16, u16)) -> Result<(), HostError>,
         cutover: Option<&mut dyn CoverageCutover>,
-        admit: impl FnOnce() -> Result<bool, HostError>,
+        admit: impl FnOnce(&Self, Option<&dyn CoverageCutover>) -> Result<bool, HostError>,
     ) -> Result<PreparedPublication, HostError> {
         if request.extent() != self.initial_extent {
             return Err("Runtime frame extent changes are unsupported".into());
@@ -201,7 +215,7 @@ impl FrameGeometry {
                 .ok_or("PutImage request size overflow")?;
             super::validate_request_size(image_bytes, maximum, "PutImage")?;
         }
-        if !admit()? {
+        if !admit(self, cutover.as_deref())? {
             return Ok(PreparedPublication::Skipped);
         }
         self.publication
@@ -447,25 +461,54 @@ impl Renderer {
         geometry.publish_with_cutover(
             request,
             frame,
-            |(width, height), payload| {
-                conn.put_image(
-                    ImageFormat::Z_PIXMAP,
-                    self.pixmap,
-                    self.gc,
-                    width,
-                    height,
-                    0,
-                    0,
-                    0,
-                    32,
-                    payload,
-                )?
-                .check()?;
-                Ok(())
-            },
+            |dimensions, payload| self.upload(conn, dimensions, payload),
             |dimensions| self.blit(conn, window, dimensions),
             cutover,
         )
+    }
+
+    #[cfg(feature = "managed-supervisor-fixture")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn present_conditionally(
+        &self,
+        conn: &impl Connection,
+        window: Window,
+        geometry: &mut FrameGeometry,
+        request: &FrameRequest,
+        frame: PreparedFrame<Vec<u8>>,
+        cutover: &mut dyn CoverageCutover,
+        admit: impl FnOnce(&FrameGeometry, Option<&dyn CoverageCutover>) -> Result<bool, HostError>,
+    ) -> Result<PreparedPublication, HostError> {
+        geometry.publish_with_admission(
+            request,
+            frame,
+            |dimensions, payload| self.upload(conn, dimensions, payload),
+            |dimensions| self.blit(conn, window, dimensions),
+            Some(cutover),
+            admit,
+        )
+    }
+
+    fn upload(
+        &self,
+        conn: &impl Connection,
+        (width, height): (u16, u16),
+        payload: &[u8],
+    ) -> Result<(), HostError> {
+        conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            self.pixmap,
+            self.gc,
+            width,
+            height,
+            0,
+            0,
+            0,
+            32,
+            payload,
+        )?
+        .check()?;
+        Ok(())
     }
 
     /// Releases server-side GC and Pixmap resources, checking requests and reporting failures

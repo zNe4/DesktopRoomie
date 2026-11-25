@@ -12,9 +12,94 @@ fn send(socket: &mut UnixStream, message: Message, fragment: bool) -> io::Result
     }
     Ok(())
 }
+/// The test controls race ordering on a separate rendezvous stream. All worker
+/// replies and faults still travel through the actual supervised socket.
+fn managed_reply(
+    socket: &mut UnixStream,
+    gate: &mut UnixStream,
+    session: u64,
+    render: roomie_worker_protocol::Render,
+) -> io::Result<()> {
+    gate.write_all(b"R")?;
+    let mut command = [0];
+    gate.read_exact(&mut command)?;
+    let mut pixels = vec![0; FRAME_BYTES];
+    let phase = (render.elapsed.as_millis() / 300) % 5;
+    for y in 0..160 {
+        for x in 0..160 {
+            let inner = (61..86).contains(&x) && (65..96).contains(&y);
+            let pixel = match phase {
+                0 if (17..73).contains(&x) && (40..96).contains(&y) => [230, 115, 60, 255],
+                1 if (17..73).contains(&x) && (40..96).contains(&y) => [70, 211, 150, 255],
+                2 if (51..105).contains(&x) && (53..110).contains(&y) && !inner => {
+                    [112, 45, 96, 128]
+                }
+                3 if (113..137).contains(&x) && (24..58).contains(&y) => [90, 160, 240, 255],
+                3 if (132..153).contains(&x) && (101..131).contains(&y) => [35, 95, 120, 128],
+                _ => [0; 4],
+            };
+            let offset = (160 * y + x) * 4;
+            pixels[offset..offset + 4].copy_from_slice(&pixel);
+        }
+    }
+    if command == *b"M" {
+        pixels[0] = 1;
+    }
+    let mut frame = encode(&Message {
+        session,
+        body: Body::Frame {
+            job: render.job,
+            bgra: pixels,
+        },
+    })
+    .unwrap();
+    let fault = encode(&Message {
+        session,
+        body: Body::BackendFault("managed scripted fault".into()),
+    })
+    .unwrap();
+    match command[0] {
+        b'A' => frame.extend_from_slice(&fault),
+        b'P' => frame.extend_from_slice(&fault[..5]),
+        b'G' => frame.extend(fault.repeat(200)),
+        b'F' | b'L' | b'M' | b'Q' => {}
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown fixture race",
+            ))
+        }
+    }
+    socket.write_all(if command[0] == b'Q' { &fault } else { &frame })?;
+    gate.write_all(b"W")?;
+    if matches!(command[0], b'P' | b'L' | b'Q') {
+        let staged = command[0];
+        gate.read_exact(&mut command)?;
+        if command[0] != b'C' {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown fault release",
+            ));
+        }
+        let suffix = match staged {
+            b'P' => &fault[5..],
+            b'Q' => &frame,
+            _ => &fault,
+        };
+        socket.write_all(suffix)?;
+        gate.write_all(b"W")?;
+    }
+    Ok(())
+}
+
 fn run() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("normal");
+    let mut gate = if mode == "managed-script" {
+        Some(UnixStream::connect(&args[2])?)
+    } else {
+        None
+    };
     if mode == "fd-check" {
         let fd: i32 = args[2].parse().unwrap();
         // SAFETY: read-only descriptor query; the sentinel must be absent.
@@ -97,6 +182,10 @@ fn run() -> io::Result<()> {
                 }
             }
             Body::Render(render) if initialized == Some(session) => {
+                if let Some(gate) = &mut gate {
+                    managed_reply(&mut socket, gate, session, render)?;
+                    continue;
+                }
                 if mode == "no-render-expected" {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
