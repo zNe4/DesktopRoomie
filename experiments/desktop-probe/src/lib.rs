@@ -9,6 +9,13 @@ mod layer;
 #[cfg(feature = "managed-supervisor-fixture")]
 #[doc(hidden)]
 pub mod managed_supervisor;
+#[cfg(feature = "managed-supervisor-fixture")]
+#[doc(hidden)]
+pub mod managed_vulkan;
+#[cfg(feature = "managed-supervisor-fixture")]
+mod managed_vulkan_evidence;
+#[cfg(feature = "managed-supervisor-fixture")]
+use managed_vulkan_evidence::{Capture, Kind};
 pub mod presentation;
 mod x11;
 
@@ -166,13 +173,108 @@ pub fn run_managed_fixture(
     fixture: Fixture<'_>,
     duration_secs: Option<u64>,
 ) -> Result<(), HostError> {
-    let (conn, screen_num) = x11rb::connect(None)?;
-    let screen = conn
-        .setup()
-        .roots
-        .get(screen_num)
-        .ok_or("Invalid default X11 screen")?;
-    let mut retired = None;
+    let result = run_managed_owner(fixture, duration_secs);
+    if let Some(exit) = result
+        .owner_exit
+        .filter(|exit| *exit != control::ExitCode::Success)
+    {
+        return Err(format!("Managed fixture owner exited with status {}", exit as i32).into());
+    }
+    result.host.and(result.reaping)
+}
+
+/// Explicit experimental native entry. Successful host cleanup alone is
+/// insufficient: classification uses the accepted authorities and worker report.
+#[cfg(feature = "managed-supervisor-fixture")]
+#[doc(hidden)]
+pub fn run_managed_vulkan(
+    launch: managed_vulkan::NativeVulkanLaunch,
+) -> Result<managed_vulkan::NativeSummary, managed_vulkan::NativeFailure> {
+    let mut evidence = launch.evidence_mode().map(|_| Capture::new());
+    let result = match launch.validate_before_owner() {
+        Ok(()) => {
+            let args = launch.worker_args();
+            let literal = args.each_ref().map(String::as_str);
+            let fixture = managed_supervisor::Launch {
+                executable: launch.worker(),
+                args: &literal,
+                session: launch.session(),
+                policy: roomie_worker_supervisor::machine::Policy::default(),
+            };
+            let duration = Some(launch.duration_seconds());
+            if evidence.is_some() {
+                run_managed_owner_observed(fixture, duration, &mut evidence)
+            } else {
+                run_managed_owner(fixture, duration)
+            }
+        }
+        Err(error) => ManagedOwnerResult::failed(error.into()),
+    };
+    launch
+        .classify(
+            evidence,
+            (result.initialization_rejection, result.worker_exit),
+            result.host.err().map(|e| e.to_string()),
+            result.reaping.err().map(|e| e.to_string()),
+            result.observation,
+        )
+        .into_result()
+}
+
+#[cfg(feature = "managed-supervisor-fixture")]
+struct ManagedOwnerResult {
+    owner_exit: Option<control::ExitCode>,
+    initialization_rejection: bool,
+    worker_exit: Option<i32>,
+    host: Result<(), HostError>,
+    reaping: Result<(), HostError>,
+    observation: managed_vulkan::OwnerObservation,
+}
+
+#[cfg(feature = "managed-supervisor-fixture")]
+#[derive(Default)]
+struct ManagedRetirement {
+    supervisor: Option<ManagedSupervisor>,
+    evidence: Option<Capture>,
+    host_error: Option<HostError>,
+}
+
+#[cfg(feature = "managed-supervisor-fixture")]
+impl ManagedOwnerResult {
+    fn failed(error: HostError) -> Self {
+        Self {
+            owner_exit: None,
+            initialization_rejection: false,
+            worker_exit: None,
+            host: Err(error),
+            reaping: Ok(()),
+            observation: managed_vulkan::OwnerObservation::default(),
+        }
+    }
+}
+
+#[cfg(feature = "managed-supervisor-fixture")]
+fn run_managed_owner(fixture: Fixture<'_>, duration_secs: Option<u64>) -> ManagedOwnerResult {
+    run_managed_owner_observed(fixture, duration_secs, &mut None)
+}
+
+#[cfg(feature = "managed-supervisor-fixture")]
+fn run_managed_owner_observed(
+    fixture: Fixture<'_>,
+    duration_secs: Option<u64>,
+    evidence: &mut Option<Capture>,
+) -> ManagedOwnerResult {
+    let (conn, screen_num) = match x11rb::connect(None) {
+        Ok(connection) => connection,
+        Err(error) => return ManagedOwnerResult::failed(error.into()),
+    };
+    let Some(screen) = conn.setup().roots.get(screen_num) else {
+        return ManagedOwnerResult::failed("Invalid default X11 screen".into());
+    };
+    let mut retired = ManagedRetirement {
+        evidence: evidence.take(),
+        ..ManagedRetirement::default()
+    };
     let exit = run_owner(
         &conn,
         screen,
@@ -182,16 +284,59 @@ pub fn run_managed_fixture(
         true,
         Some((fixture, &mut retired)),
     );
-    // Even a failed checked teardown cannot keep the X11 connection alive
-    // while this thread waits for an unconfirmed child to exit.
-    drop(conn);
-    let reaping = retired
-        .as_mut()
-        .map_or(Ok(()), ManagedSupervisor::reap_after_host_cleanup);
-    if exit == control::ExitCode::Success {
-        reaping
+    let host = if exit == control::ExitCode::Success {
+        Ok(())
     } else {
-        Err(format!("Managed fixture owner exited with status {}", exit as i32).into())
+        Err(retired.host_error.take().unwrap_or_else(|| {
+            format!("Managed fixture owner exited with status {}", exit as i32).into()
+        }))
+    };
+    let mut result = finish_managed_owner_with(
+        host,
+        || drop(conn),
+        || {
+            let reaping = retired
+                .supervisor
+                .as_mut()
+                .map_or(Ok(()), ManagedSupervisor::reap_after_host_cleanup);
+            let observation = retired.supervisor.as_ref().map_or_else(
+                managed_vulkan::OwnerObservation::default,
+                managed_vulkan::OwnerObservation::of,
+            );
+            (reaping, observation)
+        },
+    );
+    if let Some(managed) = &mut retired.supervisor {
+        if managed.evidence.is_some() {
+            result.initialization_rejection =
+                managed_vulkan::unavailable_adapter(managed.diagnostic());
+            result.worker_exit = managed.exit_code();
+        }
+        *evidence = managed.evidence.take();
+    } else {
+        *evidence = retired.evidence.take();
+    }
+    result.owner_exit = Some(exit);
+    result
+}
+
+#[cfg(feature = "managed-supervisor-fixture")]
+fn finish_managed_owner_with(
+    host: Result<(), HostError>,
+    destroy_connection: impl FnOnce(),
+    reap: impl FnOnce() -> (Result<(), HostError>, managed_vulkan::OwnerObservation),
+) -> ManagedOwnerResult {
+    // Even a failed checked teardown cannot retain the X11 connection during
+    // quiescent reaping. Both entries use this exact order on the owner thread.
+    destroy_connection();
+    let (reaping, observation) = reap();
+    ManagedOwnerResult {
+        owner_exit: None,
+        initialization_rejection: false,
+        worker_exit: None,
+        host,
+        reaping,
+        observation,
     }
 }
 
@@ -204,15 +349,19 @@ fn run_owner(
     synthetic_animation: bool,
     #[cfg(feature = "managed-supervisor-fixture")] fixture: Option<(
         Fixture<'_>,
-        &mut Option<ManagedSupervisor>,
+        &mut ManagedRetirement,
     )>,
 ) -> control::ExitCode {
     #[cfg(feature = "managed-supervisor-fixture")]
-    let (fixture, retired) = fixture.unzip();
+    let (fixture, mut retired) = fixture.unzip();
     let mut owner = match ControlWindow::create(conn, screen, screen_num) {
         Ok(owner) => owner,
         Err(error) => {
             eprintln!("[ERROR] Control endpoint creation failed: {error}");
+            #[cfg(feature = "managed-supervisor-fixture")]
+            if let Some(retired) = retired {
+                retired.host_error = Some(error);
+            }
             return control::ExitCode::LocalFailure;
         }
     };
@@ -246,7 +395,11 @@ fn run_owner(
                 synthetic_animation.then(|| conn.maximum_request_bytes());
             #[cfg(feature = "managed-supervisor-fixture")]
             if let Some(fixture) = fixture {
-                runtime.managed = Some(ManagedSupervisor::spawn(fixture, Instant::now())?);
+                let mut managed = ManagedSupervisor::spawn(fixture, Instant::now())?;
+                managed.evidence = retired
+                    .as_deref_mut()
+                    .and_then(|retired| retired.evidence.take());
+                runtime.managed = Some(managed);
             }
             start_body(
                 conn,
@@ -324,11 +477,13 @@ fn run_owner(
         }
         cleanup
     });
+    let failed = outcome.is_err();
     #[cfg(feature = "managed-supervisor-fixture")]
     if let Some(retired) = retired {
-        *retired = managed;
+        retired.supervisor = managed;
+        retired.host_error = outcome.err();
     }
-    if outcome.is_err() {
+    if failed {
         control::ExitCode::LocalFailure
     } else if duplicate {
         control::ExitCode::DuplicateLaunch
@@ -492,6 +647,11 @@ fn start_body(
         false,
     )?;
 
+    #[cfg(feature = "managed-supervisor-fixture")]
+    if let Some(managed) = &mut runtime.managed {
+        managed.record(Kind::Startup, None, None);
+    }
+
     println!("\n[Running Probe]");
     if let Some(sec) = duration_secs {
         println!("  Probe running for {} seconds (or until closed)...", sec);
@@ -516,6 +676,8 @@ fn start_body(
         owner,
         valid_bounds,
         layout.usable_area,
+        #[cfg(feature = "managed-supervisor-fixture")]
+        alpha_vis,
     )
 }
 
@@ -866,7 +1028,7 @@ impl ProbeRuntime {
         self.frame_timing.update_eligibility(now, eligible)?;
         #[cfg(feature = "managed-supervisor-fixture")]
         if let Some(managed) = &mut self.managed {
-            managed.set_eligible(eligible)?;
+            managed.set_eligible_at(eligible, Some(now))?;
             self.frame_timing
                 .update_opportunity(now, managed.can_request())?;
         }
@@ -876,7 +1038,7 @@ impl ProbeRuntime {
     fn interrupt_frame_eligibility(&mut self, now: Instant) -> Result<(), HostError> {
         #[cfg(feature = "managed-supervisor-fixture")]
         if let Some(managed) = &mut self.managed {
-            managed.set_eligible(false)?;
+            managed.set_eligible_at(false, Some(now))?;
         }
         self.frame_timing.update_eligibility(now, false)
     }
@@ -956,6 +1118,13 @@ impl ProbeRuntime {
         }
         if let Some(ready) = managed.ready() {
             if observed >= ready.deadline || !self.frames.matches_request(&ready.request) {
+                let identity = ready.identity;
+                let kind = if observed >= ready.deadline {
+                    Kind::Expired
+                } else {
+                    Kind::Stale
+                };
+                managed.record(kind, Some(identity), Some(observed));
                 managed.take_ready();
                 self.frame_timing
                     .update_opportunity(observed, managed.can_request())?;
@@ -978,7 +1147,10 @@ impl ProbeRuntime {
         }
 
         let mut managed = self.managed.take().expect("selected managed fixture");
+        managed.select_evidence();
         let ready = managed.take_ready().expect("ready candidate checked");
+        let identity = ready.identity;
+        let mut native_committed = false;
         let mut fence_needed = false;
         let result = self.publish_prepared_with(
             ready.request,
@@ -986,7 +1158,7 @@ impl ProbeRuntime {
             eligible,
             now,
             |frames, request, frame, input, pointer, host| {
-                publish(
+                let publication = publish(
                     frames,
                     request,
                     frame,
@@ -996,7 +1168,7 @@ impl ProbeRuntime {
                         managed.observe(now)?;
                         let empty = look_ahead(buffered, &mut peek)?;
                         let observed = now();
-                        Ok(empty
+                        let accepted = empty
                             && managed.drained()
                             && managed.healthy()
                             && host.permits_frame(owner_busy(), window.in_flight_moves.is_empty())
@@ -1007,15 +1179,56 @@ impl ProbeRuntime {
                                 .into_iter()
                                 .chain(control_deadline())
                                 .all(|deadline| observed < deadline)
-                            && observed < ready.deadline)
+                            && observed < ready.deadline;
+                        managed.record(
+                            if accepted {
+                                Kind::Admitted
+                            } else if observed >= ready.deadline {
+                                Kind::RefusedExpired
+                            } else {
+                                Kind::Refused
+                            },
+                            Some(identity),
+                            Some(observed),
+                        );
+                        Ok(accepted)
                     },
-                )
+                );
+                native_committed = matches!(
+                    publication,
+                    Ok(x11::render::PreparedPublication::Committed(_))
+                );
+                publication
             },
             |_| {
                 fence_needed = true;
                 Ok(())
             },
         );
+        if native_committed {
+            if managed.evidence.is_some() {
+                managed.record(Kind::Committed, Some(identity), Some(now()));
+            }
+            if !matches!(result, Ok(true)) || !self.body_input_ready() {
+                managed.record(Kind::Unusable, Some(identity), None);
+                if let Some(capture) = &mut managed.evidence {
+                    capture.fail("native commitment did not restore usable input and timing");
+                }
+            }
+        } else {
+            managed.record(
+                if result.is_ok() {
+                    Kind::Skipped
+                } else {
+                    Kind::PublicationFailed
+                },
+                Some(identity),
+                None,
+            );
+            if let Some(capture) = &mut managed.evidence {
+                capture.discard();
+            }
+        }
         self.managed = Some(managed);
         if fence_needed {
             if let Err(cleanup) = fence(self, window) {
@@ -5559,6 +5772,161 @@ fn wm_delete_event(
         && event.data.as_data32()[0] == window.wm_delete_window
 }
 
+#[cfg(feature = "managed-supervisor-fixture")]
+fn observation_target(
+    runtime: &ProbeRuntime,
+    window: &ManagedProbeWindow,
+    pixmap: u32,
+    owner_busy: bool,
+) -> Option<managed_vulkan_evidence::Target> {
+    let frame = runtime.frames.committed()?;
+    let enabled_after = runtime.input_fence.enabled_after?;
+    if !runtime.frame_eligible(window, owner_busy)
+        || runtime.input_fence.empty_confirmed
+        || runtime.pending_map_input.is_some()
+        || window.requested_origin != window.confirmed_origin
+        || frame.metadata.extent().size() != Size::new(160, 160)
+    {
+        return None;
+    }
+    Some(managed_vulkan_evidence::Target {
+        identity: frame.identity,
+        body: window.window,
+        pixmap,
+        origin: window.confirmed_origin,
+        enabled_after,
+        input_blocked: runtime.input_fence.blocked,
+        temporary_empty_confirmed: runtime.input_fence.empty_confirmed,
+        interaction_suppressed: matches!(
+            runtime.interaction.state(),
+            InteractionState::SuppressedUntilRelease { .. }
+        ),
+    })
+}
+
+#[cfg(feature = "managed-supervisor-fixture")]
+#[allow(clippy::too_many_arguments)]
+fn observe_managed_commitment(
+    conn: &impl Connection,
+    runtime: &mut ProbeRuntime,
+    window: &ManagedProbeWindow,
+    renderer: &Renderer,
+    owner: &ControlWindow,
+    root: u32,
+    alpha: x11::visual::AlphaVisualInfo,
+    buffered: &mut Option<(Event, u64)>,
+) {
+    use managed_vulkan_evidence::{Layout, LiveBody, NativeReplies};
+    use x11rb::protocol::{
+        shape::SK,
+        xproto::{ConnectionExt as _, ImageFormat},
+    };
+
+    let Some(mut capture) = runtime
+        .managed
+        .as_mut()
+        .and_then(|managed| managed.evidence.take())
+    else {
+        return;
+    };
+    let managed = runtime.managed.as_ref().expect("managed owner");
+    let target = || observation_target(runtime, window, renderer.pixmap, owner.active().is_some());
+    let at = || {
+        managed
+            .evidence_time(Instant::now())
+            .ok_or("native observation time unavailable")
+    };
+    let live = |target: managed_vulkan_evidence::Target| -> Result<LiveBody, HostError> {
+        let attrs = conn.get_window_attributes(target.body)?.reply()?;
+        let geometry = conn.get_geometry(target.body)?.reply()?;
+        let placement = conn
+            .translate_coordinates(target.body, root, 0, 0)?
+            .reply()?;
+        if geometry.root != root {
+            return Err("body root changed".into());
+        }
+        let live = LiveBody {
+            map_state: attrs.map_state.into(),
+            visual: attrs.visual,
+            depth: geometry.depth,
+            override_redirect: attrs.override_redirect,
+            root: geometry.root,
+            width: geometry.width,
+            height: geometry.height,
+            border: geometry.border_width,
+            same_screen: placement.same_screen,
+            origin: Point::new(placement.dst_x.into(), placement.dst_y.into()),
+        };
+        live.validate(target, alpha.visual_id)?;
+        Ok(live)
+    };
+    capture.observe_pending(
+        buffered,
+        || Ok(conn.poll_for_event_with_sequence()?),
+        target,
+        live,
+        |before| {
+            let mut formats = conn
+                .setup()
+                .pixmap_formats
+                .iter()
+                .filter(|format| format.depth == 32);
+            let format = formats
+                .next()
+                .filter(|_| formats.next().is_none())
+                .ok_or("unsupported depth-32 pixmap formats")?;
+            let image = conn.get_image(
+                ImageFormat::Z_PIXMAP,
+                before.pixmap,
+                0,
+                0,
+                160,
+                160,
+                u32::MAX,
+            )?;
+            let image_sequence = image.sequence_number();
+            let image = image.reply()?;
+            let image_at = at()?;
+            let shape = conn.shape_get_rectangles(before.body, SK::INPUT)?;
+            let shape_sequence = shape.sequence_number();
+            let shape = shape.reply()?;
+            let shape_at = at()?;
+            Ok(NativeReplies {
+                layout: Layout {
+                    visual: alpha.visual_id,
+                    pict_format: alpha.pict_format,
+                    masks: [
+                        alpha.blue_mask,
+                        alpha.green_mask,
+                        alpha.red_mask,
+                        alpha.alpha_mask,
+                    ],
+                    shifts: [
+                        alpha.blue_shift,
+                        alpha.green_shift,
+                        alpha.red_shift,
+                        alpha.alpha_shift,
+                    ],
+                    format_depth: format.depth,
+                    bpp: format.bits_per_pixel,
+                    image_order: conn.setup().image_byte_order.into(),
+                    pad: format.scanline_pad,
+                    reply_depth: 0,
+                    reply_visual: 0,
+                    reply_bytes: 0,
+                },
+                image_sequence,
+                image_at,
+                image,
+                shape_sequence,
+                shape_at,
+                shape,
+            })
+        },
+    );
+    runtime.managed.as_mut().expect("managed owner").evidence = Some(capture);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_probe(
     conn: &x11rb::rust_connection::RustConnection,
@@ -5573,6 +5941,7 @@ fn run_probe(
     owner: &mut ControlWindow,
     initial_bounds: crate::geometry::ValidOriginBounds,
     initial_area: crate::geometry::Rect,
+    #[cfg(feature = "managed-supervisor-fixture")] alpha_visual: x11::visual::AlphaVisualInfo,
 ) -> Result<(), HostError> {
     let root = screen.root;
     let layer_atoms = LayerAtoms::intern(conn)?;
@@ -6341,6 +6710,10 @@ fn run_probe(
                     }
                 }
                 Event::Expose(ev) if ev.window == window.window && ev.count == 0 => {
+                    #[cfg(feature = "managed-supervisor-fixture")]
+                    if let Some(managed) = &mut runtime.managed {
+                        managed.record(Kind::Expose, None, None);
+                    }
                     if let Err(error) = renderer.paint(conn, window.window, &runtime.frames) {
                         runtime.invalidate_frame_and_fence(conn, window);
                         return Err(error);
@@ -6445,7 +6818,7 @@ fn run_probe(
         if runtime.managed.is_some() {
             let body = window.window;
             let maximum_request_bytes = runtime.animated_shape_limit.expect("fixture canvas limit");
-            runtime.managed_presentation_turn(
+            let committed = runtime.managed_presentation_turn(
                 window,
                 presentation,
                 duration_deadline,
@@ -6476,6 +6849,18 @@ fn run_probe(
                 },
                 |runtime, window| runtime.fence_visibility_input(conn, window),
             )?;
+            if committed {
+                observe_managed_commitment(
+                    conn,
+                    runtime,
+                    window,
+                    renderer,
+                    owner,
+                    root,
+                    alpha_visual,
+                    &mut buffered_event,
+                );
+            }
             // Checked native requests can have filled x11rb's event buffer
             // even when the underlying socket is no longer readable.
             if buffered_event.is_none() {
@@ -6792,3 +7177,7 @@ mod show_tests;
 #[cfg(test)]
 #[path = "probe_tests/here_service_tests.rs"]
 mod here_service_tests;
+
+#[cfg(all(test, feature = "managed-supervisor-fixture"))]
+#[path = "probe_tests/managed_vulkan_tests.rs"]
+mod managed_vulkan_tests;

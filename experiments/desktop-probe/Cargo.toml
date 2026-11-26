@@ -2,7 +2,13 @@
 name = "desktop-probe"
 version = "0.1.0"
 edition = "2021"
+default-run = "desktop-probe"
 description = "A00 Desktop probe: validating X11 transparency, input shaping, and non-activating window behavior"
+
+[[bin]]
+name = "managed-vulkan-probe"
+path = "src/bin/managed-vulkan-probe.rs"
+required-features = ["managed-supervisor-fixture"]
 
 [dependencies]
 x11rb = { version = "0.14.0", features = ["render", "shape", "randr"] }
@@ -20,3 +26,8 @@ optional = true
 [dependencies.roomie-worker-protocol]
 path = "../gpu-worker/protocol"
 optional = true
+
+[[bin]]
+name = "managed-vulkan-verify"
+path = "src/bin/managed-vulkan-verify.rs"
+required-features = ["managed-supervisor-fixture"]

@@ -1,4 +1,4 @@
-//! Opt-in GPU-free adapter. D1 owns desktop work, and the supervisor owns IPC
+//! Opt-in managed adapter. D1 owns desktop work, and the supervisor owns IPC
 //! and the child. The owner drives both from the same monotonic observation.
 
 use std::os::unix::fs::PermissionsExt;
@@ -9,8 +9,9 @@ use roomie_worker_protocol::{self as wire, JobKey, Render};
 use roomie_worker_supervisor::machine::{JobState, Outcome, Phase, Policy, Report};
 use roomie_worker_supervisor::{Progress, Readiness, Supervisor, WaitInterest};
 
+use crate::managed_vulkan_evidence::{Capture, Kind};
 use crate::presentation::gpu_handoff::{
-    GpuHandoff, JobCompletion, JobIdentity, ReadyFrame, ScheduleRejection,
+    CompletionStatus, GpuHandoff, JobCompletion, JobIdentity, ReadyFrame, ScheduleRejection,
 };
 use crate::presentation::{
     Action, Facing, FrameMetadata, FrameRequest, HitRegion, Point, PreparedFrame, Rect, RowSpan,
@@ -21,14 +22,17 @@ use crate::HostError;
 const EXIT_OBSERVATION: Duration = Duration::from_millis(50);
 const QUIESCENT_WAIT_LIMIT: Duration = Duration::from_secs(1);
 
-/// Fixture-only configuration. Use an absolute path to the independently
-/// built roomie-worker-supervisor fake-worker executable.
+/// Explicit child configuration. The fixture entry uses an independently built
+/// fake-worker; the experimental native entry validates its own configuration.
 pub struct Fixture<'a> {
     pub executable: &'a Path,
     pub args: &'a [&'a str],
     pub session: u64,
     pub policy: Policy,
 }
+
+/// Neutral name for the same accepted launch contract; fixture API is retained.
+pub type Launch<'a> = Fixture<'a>;
 
 pub struct ManagedSupervisor {
     supervisor: Supervisor,
@@ -38,6 +42,7 @@ pub struct ManagedSupervisor {
     progress: Progress,
     observe_exit_at: Option<Instant>,
     shutting_down: bool,
+    pub(crate) evidence: Option<Capture>,
 }
 
 impl ManagedSupervisor {
@@ -77,6 +82,7 @@ impl ManagedSupervisor {
             },
             observe_exit_at: None,
             shutting_down: false,
+            evidence: None,
         })
     }
 
@@ -99,6 +105,12 @@ impl ManagedSupervisor {
 
     pub fn ready(&self) -> Option<&ReadyFrame<Vec<u8>>> {
         self.handoff.ready()
+    }
+
+    pub(crate) fn select_evidence(&mut self) {
+        if let (Some(capture), Some(ready)) = (&mut self.evidence, self.handoff.ready()) {
+            capture.select(ready, ready.deadline.checked_duration_since(self.origin));
+        }
     }
 
     pub fn take_ready(&mut self) -> Option<ReadyFrame<Vec<u8>>> {
@@ -126,12 +138,21 @@ impl ManagedSupervisor {
     }
 
     pub fn set_eligible(&mut self, eligible: bool) -> Result<(), HostError> {
+        self.set_eligible_at(eligible, None)
+    }
+
+    pub(crate) fn set_eligible_at(
+        &mut self,
+        eligible: bool,
+        now: Option<Instant>,
+    ) -> Result<(), HostError> {
         if self.healthy() {
             if eligible {
                 self.handoff
                     .resume()
                     .map_err(|error| format!("D1 resume: {error:?}"))?;
             } else {
+                self.record_cancellation(now);
                 self.handoff
                     .interrupt()
                     .map_err(|error| format!("D1 interruption: {error:?}"))?;
@@ -139,6 +160,44 @@ impl ManagedSupervisor {
             }
         }
         Ok(())
+    }
+
+    fn record_cancellation(&mut self, now: Option<Instant>) {
+        if self.evidence.is_none() {
+            return;
+        }
+        if let Some(identity) = self.ready().map(|ready| ready.identity) {
+            self.record(Kind::CanceledReady, Some(identity), now);
+        }
+        if let Some(identity) = self.outstanding() {
+            let at = now.and_then(|now| self.relative(now).ok());
+            if let Some(capture) = &mut self.evidence {
+                capture.cancel_pending(identity, at);
+            }
+        }
+    }
+
+    pub(crate) fn record(&mut self, kind: Kind, job: Option<JobIdentity>, now: Option<Instant>) {
+        let origin = self.origin;
+        if let Some(capture) = &mut self.evidence {
+            let at = now.and_then(|now| now.checked_duration_since(origin));
+            if now.is_some() && at.is_none() {
+                capture.fail("owner observation precedes monotonic origin");
+            }
+            capture.event(kind, job, at);
+        }
+    }
+
+    pub(crate) fn evidence_time(&self, now: Instant) -> Option<Duration> {
+        self.relative(now).ok()
+    }
+
+    pub(crate) fn exit_code(&self) -> Option<i32> {
+        self.supervisor.exit_status()?.code()
+    }
+
+    pub(crate) fn diagnostic(&self) -> Option<&str> {
+        self.supervisor.machine().diagnostic()
     }
 
     pub fn admit(
@@ -178,9 +237,13 @@ impl ManagedSupervisor {
             elapsed: request.active_elapsed(),
             delta: request.active_delta(),
         };
+        if let Some(capture) = &mut self.evidence {
+            capture.admitted(identity, Some(observed), request, Some(fresh));
+        }
         if self.supervisor.submit(render, observed).is_err() {
             // Every error from the accepted submit interface occurs before
             // the Render acquires a transport slot.
+            self.record(Kind::Withdrawn, Some(identity), Some(now));
             self.complete(identity, JobCompletion::RejectedBeforeSubmission, now)?;
             return Ok(None);
         }
@@ -232,7 +295,7 @@ impl ManagedSupervisor {
         if outcome.failure.is_some() {
             if !self.shutting_down {
                 eprintln!(
-                    "[MANAGED FIXTURE] Supervisor failure {:?}: {}",
+                    "[MANAGED] Supervisor failure {:?}: {}",
                     outcome.failure,
                     self.supervisor
                         .machine()
@@ -240,10 +303,13 @@ impl ManagedSupervisor {
                         .unwrap_or("no worker diagnostic"),
                 );
             }
+            self.record_cancellation(Some(now));
             self.handoff.device_failed();
             self.begin_shutdown(now)?;
         }
-        self.handoff.expire(now);
+        if let Some(identity) = self.handoff.expire(now) {
+            self.record(Kind::Expired, Some(identity), Some(now));
+        }
         if let Some(report) = self.supervisor.take_report() {
             self.accept_report(outcome.session, report, now)?;
         }
@@ -256,6 +322,7 @@ impl ManagedSupervisor {
                             || (outcome.reaped && outcome.unresolved == Some(status.job)))
                 })
             {
+                self.record(Kind::Unresolved, Some(identity), Some(now));
                 self.complete(
                     identity,
                     JobCompletion::Unresolved(format!(
@@ -297,14 +364,27 @@ impl ManagedSupervisor {
         else {
             return Err("Supervisor report does not match D1 physical work".into());
         };
+        let kind = match &report {
+            Report::Frame { .. } => Kind::Frame,
+            Report::Obsolete(_) => Kind::Obsolete,
+            Report::RejectedBeforeDispatch { .. } => Kind::Withdrawn,
+            Report::Rejected { .. } => Kind::Rejected,
+            Report::Failed { .. } => Kind::Failed,
+        };
+        self.record(kind, Some(identity), Some(now));
         let completion = match report {
             Report::Frame { bgra, .. } => {
                 let request = self
                     .handoff
                     .outstanding_request()
                     .expect("correlated D1 request");
-                prepare_returned(&request, bgra)
-                    .map_or(JobCompletion::SettledWithoutPayload, JobCompletion::Frame)
+                match prepare_returned(&request, bgra) {
+                    Some(frame) => JobCompletion::Frame(frame),
+                    None => {
+                        self.record(Kind::InvalidFrame, Some(identity), Some(now));
+                        JobCompletion::SettledWithoutPayload
+                    }
+                }
             }
             Report::Obsolete(_) => JobCompletion::SettledWithoutPayload,
             Report::RejectedBeforeDispatch { .. } | Report::Rejected { .. } => {
@@ -312,7 +392,15 @@ impl ManagedSupervisor {
             }
             Report::Failed { diagnostic, .. } => JobCompletion::Failed(diagnostic),
         };
-        self.complete(identity, completion, now)
+        let status = self.complete(identity, completion, now)?;
+        match status {
+            CompletionStatus::Ready => self.record(Kind::Ready, Some(identity), Some(now)),
+            CompletionStatus::Obsolete if kind == Kind::Frame => {
+                self.record(Kind::D1Obsolete, Some(identity), Some(now));
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn complete(
@@ -320,15 +408,16 @@ impl ManagedSupervisor {
         job: JobIdentity,
         completion: JobCompletion<Vec<u8>>,
         now: Instant,
-    ) -> Result<(), HostError> {
+    ) -> Result<CompletionStatus, HostError> {
         self.handoff
             .complete(job, completion, now)
-            .map_err(|error| format!("D1 settlement mismatch: {error:?}"))?;
-        Ok(())
+            .map_err(|error| format!("D1 settlement mismatch: {error:?}").into())
     }
 
     pub fn begin_shutdown(&mut self, now: Instant) -> Result<(), HostError> {
         if !self.shutting_down {
+            self.record_cancellation(Some(now));
+            self.record(Kind::Shutdown, None, Some(now));
             self.handoff.shutdown();
             self.supervisor.shutdown(self.relative(now)?);
             self.shutting_down = true;
@@ -372,7 +461,7 @@ impl ManagedSupervisor {
         }
         let outcome = self.outcome();
         eprintln!(
-            "[MANAGED FIXTURE] shutdown={:?}, stopped={}, reaped={}, termination_requested={}, unresolved={:?}, failure={:?}",
+            "[MANAGED] shutdown={:?}, stopped={}, reaped={}, termination_requested={}, unresolved={:?}, failure={:?}",
             outcome.shutdown, outcome.stopped, outcome.reaped, outcome.termination_requested,
             self.unresolved(), outcome.failure,
         );
