@@ -9,7 +9,7 @@ Use this skill when the owner or an assigned mission requests verification of Ru
 
 ## Inputs and boundaries
 
-- Work from the Git repository root, regardless of its local directory name. Read root `AGENTS.md` and the **assigned mission specification** before deciding which checks apply.
+- Work from the Git repository root, regardless of its local directory name. Follow root [AGENTS.md](../../../AGENTS.md) and the **assigned mission specification** before deciding which checks apply. Selectively load applicable architecture/invariants and [WORKFLOW obligations](../../../docs/WORKFLOW.md#risk-and-verification); use its risk/role policy without changing the checks below.
 - Identify the changed component(s), the relevant Cargo manifest(s), any mission-specific tests, and the acceptance requirements. For the current desktop probe, use `experiments/desktop-probe/Cargo.toml`.
 - If the task is **only** documentation, planning, or research, do not run Cargo checks by default: inspect documentation and Git diff instead. If the task is outside DesktopRoomie or the assigned scope is unclear, report that rather than guessing.
 - Follow any stronger constraints in the current mission or owner's instructions. Never interpret this skill as permission to modify application code, run graphical tests, install dependencies, access the network, or change desktop/system configuration.
@@ -36,7 +36,7 @@ Run these from the repository root. Report the real outcome of **each** command,
 
 ## Required handoff format
 
-Give a concise verification report containing:
+Use the canonical [evidence-backed handoff](../../../docs/WORKFLOW.md#evidence-and-handoffs), identifying the verifier and any implementer overlap. For this Rust verification procedure, include:
 
 - **Scope:** mission/fix, examined revision (`HEAD`), affected components, and whether the working tree was clean initially.
 - **Automated checks:** one row per command with `PASS`, `FAIL`, `BLOCKED`, or `NOT RUN`, plus relevant diagnostics or test counts supported by actual output.

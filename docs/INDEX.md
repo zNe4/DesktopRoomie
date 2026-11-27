@@ -1,106 +1,98 @@
 # Documentation index
 
-**A01-C1-C-B2-D3-B — TECHNICALLY ACCEPTED — OWNER APPROVED — PUBLICATION PENDING.** Owner technical acceptance was granted on 2026-11-24 following independent ChatGPT source review PASS (14/14 gates). The accepted I0 dependency preflight and I1 GPU-free owner integration close N01–N03 within the fixture scope. Codex recorded **888 default and 907 managed-feature desktop tests**, with all **1,377 frozen identities preserved**. Owner-native managed X11 behavior is unverified. Managed Vulkan publication, automatic CPU fallback and automatic backend restart remain unimplemented. Production transport is unselected, production empty-SHAPE acceptance is pending, and strict 60 Hz readiness remains unachieved. D3-C requires separate architecture preparation and authorization after D3-B publication. [D3-B acceptance record](A01-C1-C-B2-D3-B-ACCEPTANCE.md), [Ratified D3-B-P specification](plans/A01-C1-C-B2-D3-B-P-SPECIFICATION.md)
-
-**Historical D3-A checkpoint (2026-11-24): A01-C1-C-B2-D3-A — TECHNICALLY ACCEPTED — OWNER APPROVED — 2026-11-24.** Independent ChatGPT source and patch review passed; the owner technically accepted D3-A-I1 with no required R1 correction. The [D3-A acceptance record](A01-C1-C-B2-D3-A-ACCEPTANCE.md) records the shared CPU/deterministic asynchronous publication seam, 887 desktop tests and unchanged worker/B1 identities. Independent ChatGPT D3-A-F documentation review **PASS**, approved by the owner on 2026-11-24. The accepted D3-A implementation and ratified parent D3-P specification are included in the published `a01` baseline `63a71d37d5dc448f4f9632efd82942f43ab82c59`. The [D2-C acceptance record](A01-C1-C-B2-D2-C-ACCEPTANCE.md) retains its distinct nine native workloads and qualified 57.7 Hz observations. The dated A00 checkpoint below retains its original acceptance scope.
-
-**Historical D3-A-F2 closeout.** The completed D3-A-F review verified 61/61 closeout and 326/326 original content hashes, 137/137 experiment files, four authorized documents with zero unauthorized changes, preserved specification/evidence/index identities, both 190/190 exact replays and byte-exact implementation-patch reproduction. It found zero blocking implementation findings, zero technical documentation findings and one minor publication finding, F01, resolved by owner-approved exact-byte specification inclusion (Option A). Final independent F2 verification and publication were pending when that checkpoint was recorded. The accepted D3-A implementation and ratified parent D3-P specification are included in the published `a01` baseline `63a71d37d5dc448f4f9632efd82942f43ab82c59`. The D3-A-F review used recorded Cargo evidence and did not repeat Codex’s complete Markdown reference check. The acceptance record retains the detailed review provenance and eleven-path publication scope.
-
-**Accepted A00 checkpoint (2026-10-23): overall A00 technical acceptance OWNER-APPROVED; M03.4 closeout decision recorded.** The [integrated acceptance](DesktopRoomie-A00-M03.4-integrated-acceptance.md) and [owner-ratified ADR](DesktopRoomie-A00-M03.4-host-architecture-decision.md) select the existing Rust/x11rb managed X11 host on Archcraft/Openbox 3.6.1/Picom v13. Frozen executable `f3458549dbbdd4b9ef42ed85d3bfaeb6ed683863` is unchanged; [CI 39688537222](https://github.com/zNe4/DesktopRoomie/actions/runs/39688537222) passed **760 tests** and all checks. The owner accepted the [explicitly untested scaling qualification](DesktopRoomie-A00-M03.4-integrated-acceptance.md#7-supported-host-envelope-and-qualifications) and disclosed native/deterministic boundaries without further host tests. C2 documents were independently approved by ChatGPT for their reviewed scope. A00-M03.4-C3 documentation changes were independently reviewed and approved by ChatGPT on 2026-10-23. C4 documentation was published as [`ba85fdb…`](https://github.com/zNe4/DesktopRoomie/commit/ba85fdb110190c21c581b48f462319e7e360c6d3); [matching CI 40012131509](https://github.com/zNe4/DesktopRoomie/actions/runs/40012131509) succeeded with 760 passed, 0 failed, and formatting/build/Clippy PASS. That CI applies to C4; it does not verify later documentation changes. A01 checkpoints have their own authorization and evidence below; the full companion, arbitrary scaling/mixed-DPI, other WMs and Wayland are not established by A00.
-
-DesktopRoomie is the reusable software; Project Vanilla is its private character implementation. This map separates implemented facts and evidence from future possibilities. The [current checkpoint](STATUS.md) carries changing status; this index is not a roadmap or implementation authorization.
-
-## Authority
-
-| Material | Role and boundary |
-| --- | --- |
-| Active approved mission contract and explicit approved decisions | Assigned scope and acceptance requirements; approved corrections take precedence over older proposals. |
-| [AGENTS](../AGENTS.md) / [WORKFLOW](WORKFLOW.md) | Mandatory execution restrictions and supervised collaboration/publication process. |
-| [INVARIANTS](INVARIANTS.md) | Accepted non-regression review obligations; do not infer authority to override a specific approved change. |
-| [STATUS](STATUS.md) | Current checkpoint and evidence pointers; no permission to begin work. |
-| [ARCHITECTURE](ARCHITECTURE.md) / [source](../experiments/desktop-probe/src/) | Descriptive ownership map / implemented structure. Correct documentation when source and evidence disagree. |
-| Acceptance records | Observations and review for identified revisions, with host, automated, injected, and pending evidence distinguished. |
-| Implementation notes | Historical rationale and checkpoint state, not a current acceptance ledger. |
-| Roadmaps / research / inventory | Proposals / evidence and recommendations / possibilities; none automatically authorizes coding. |
+Use [STATUS](STATUS.md) for the current checkpoint, [WORKFLOW](WORKFLOW.md#document-responsibilities) for authoritative document homes and [AGENTS](../AGENTS.md) for mandatory bootstrap guardrails. This is a directory, not a parallel acceptance or publication ledger.
 
 ## Reading profiles
 
-- **Implementation:** [AGENTS](../AGENTS.md) → [STATUS](STATUS.md) → [ARCHITECTURE](ARCHITECTURE.md) → [INVARIANTS](INVARIANTS.md) → assigned approved mission. Use this index only for relevant deeper evidence.
-- **Research/design:** STATUS → relevant roadmap and completed study → bounded next mission; follow WORKFLOW for research ownership and approval.
-- **Independent code review:** assigned contract and approved corrections → INVARIANTS → ARCHITECTURE → exact executable-SHA diff and matching CI → applicable acceptance and implementation notes. A docs-only HEAD is not a new tested executable.
-- **Evidence/acceptance:** STATUS → relevant acceptance record and contract checklist → environment record, with revision and date boundaries → WORKFLOW. Preserve previous observations; add only actual new results.
+All roles bootstrap: AGENTS → STATUS → explicit assignment and approved specification → relevant profile below. Before assigned actions, selectively read applicable [ARCHITECTURE](ARCHITECTURE.md), [INVARIANTS](INVARIANTS.md) and [WORKFLOW](WORKFLOW.md) obligations; record applicability or justified non-applicability. Load historical evidence only when a requirement, claim or finding depends on it. No previous conversations are required.
+
+| Role/task | Additional context before action |
+| --- | --- |
+| Architect / research-design | Relevant approved decisions, roadmap and completed research; WORKFLOW role/scope limits. Research is evidence, not coding authority. |
+| Implementer | Affected implemented owners/interfaces, technical contracts and assigned evidence; documentation workers load the owning document and authority sources. |
+| Verifier | Mission check requirements, changed components, applicable invariants and [Rust verification procedure](../.agents/skills/desktoproomie-verify/SKILL.md) for Rust changes; documentation uses WORKFLOW checks. |
+| Independent reviewer | Exact contract/candidate, previous review anchor and open findings, delta plus cumulative diff, affected owners/obligations and evidence actually needed. |
+| Owner / evidence-acceptance | Exact review/evidence records, required native or cold-start gates, environment and revision boundaries, WORKFLOW publication/acceptance authority. |
+
+Source inspection: [implemented modules](../experiments/desktop-probe/src/). Host qualification: [A00 supported envelope](DesktopRoomie-A00-M03.4-integrated-acceptance.md#7-supported-host-envelope-and-qualifications). Build/run entry point: [README](../README.md).
+
+## Workflow contracts
+
+- [D00-M01 accepted context layer](DesktopRoomie-D00-M01-documentation-context-hygiene.md): historical contract and acceptance.
+- [DR-W01 workflow/context contract](plans/DR-W01-SPECIFICATION.md): responsibility map, risk/review design, acceptance gates and DR-W02 boundary; [final acceptance record](plans/DR-W01-SPECIFICATION.md#12-final-acceptance-and-dr-w01-f-closeout--2026-11-26) for exact candidate and review provenance.
+- [WORKFLOW](WORKFLOW.md): assignments, risk, verification, independent review, evidence and publication.
 
 ## Context and mission contracts
 
-- A01-C1-A Modular Rust Foundation records the accepted library/binary boundary, exact source identity, verification and qualified owner-native evidence. [C1-A acceptance](A01-C1-A-ACCEPTANCE.md)
-- A01-C1-B-B1 records the local B1-R1 source identity, independent source review and automated verification of the pure presentation contract. The owner approved B1 technical acceptance on 2026-11-22. [B1 acceptance record](A01-C1-B-B1-ACCEPTANCE.md)
-- A01-C1-B-B2 records the accepted procedural adapter source, exact pixel and hit-region parity, independent review and qualified owner-native confirmation. [B2 acceptance record](A01-C1-B-B2-ACCEPTANCE.md)
-- A01-C1-B-B3a records the accepted committed-geometry implementation patch, locked verification, independent source review, six owner-reported native PASS results and host limits. [B3a acceptance record](A01-C1-B-B3a-ACCEPTANCE.md)
-- A01-C1-B-B3b records the accepted B3b-R1 producer and host coordinator patch, locked verification, independent source review, six owner-reported native PASS results and the limits of synthetic timing coverage. [B3b acceptance record](A01-C1-B-B3b-ACCEPTANCE.md)
-- A01-C1-C-A1/A2 records the exact reviewed synthetic CPU animation patch, automated verification, owner-reported X11 results and limits of the experimental empty-SHAPE cutover. Independent ChatGPT A3 documentation review passed on 2026-11-23. [A1/A2 acceptance record](A01-C1-C-A1-A2-ACCEPTANCE.md)
-- A01-C1-C-B1 records the reviewed source inventory, exact software and owner-hardware Vulkan parity, experimental wall-clock measurements and the 2026-11-23 owner acceptance of standalone GPU readback. [B1 acceptance record](A01-C1-C-B1-ACCEPTANCE.md)
-- A01-C1-C-B2-D1 records owner approval and independent source review of the pure GPU handoff coordinator, its 867-test verification with all 851 baseline identities preserved, and binding integration requirements. Subsequent headless D2 implementation and evidence are recorded separately below; production transport selection and live X11 integration remain open. [D1 acceptance record](A01-C1-C-B2-D1-ACCEPTANCE.md)
-- A01-C1-C-B2-D2-C records reviewed D2-B-R2/D2-C-A-R2 identities, R1/R2 corrections, all nine owner-native acceptance workloads, exact software/hardware parity, resource accounting, N3 rejection and C1–C10 gates. Independent source, native evidence and D2-C-F documentation reviews passed; **TECHNICALLY ACCEPTED — OWNER APPROVED — 2026-11-24**. Both stress windows measured 57.7 Hz against 60 Hz, so strict 60 Hz readiness is not achieved. Its implementation is included in the published D3 baseline; D3-A seam acceptance is recorded separately below. [D2-C acceptance record](A01-C1-C-B2-D2-C-ACCEPTANCE.md)
-- A01-C1-C-B2-D3-A records the accepted six-path D3-A-I1 source identity, independent ChatGPT source/patch review PASS, owner technical approval on 2026-11-24, 887 desktop tests with 20 new identities and zero losses, 58/58 recorded matrix successes, A01–A25 mapping and N01–N03 forward integration obligations. Independent ChatGPT D3-A-F documentation review **PASS**, approved by the owner on 2026-11-24. The accepted D3-A implementation and ratified parent D3-P specification are included in the published `a01` baseline `63a71d37d5dc448f4f9632efd82942f43ab82c59`. [D3-A acceptance record](A01-C1-C-B2-D3-A-ACCEPTANCE.md)
-- [A01-C1-C-B2-D3-P ratified architecture specification](plans/A01-C1-C-B2-D3-P-SPECIFICATION.md) records revision 1.0 and owner approval of P01–P09 on 2026-11-24. The published D3-B baseline tracks the exact owner-provided specification under the F01 Option A resolution.
-- [Ratified D3-B-P specification](plans/A01-C1-C-B2-D3-B-P-SPECIFICATION.md) records owner ratification of B01–B09 and retains its original prospective language. Exact-byte inclusion is pending publication.
-- [D3-B acceptance record](A01-C1-C-B2-D3-B-ACCEPTANCE.md) records accepted I0 and I1 evidence, owner technical acceptance and pending documentation review and publication.
-- A01-C1-B-B4 records the accepted B4-I1 test-only patch, locked Cargo results and preserved test identities, independent source review, and six owner-reported native PASS results. [B4 acceptance record](A01-C1-B-B4-ACCEPTANCE.md)
-- [A00-M03.4 integrated A00 acceptance](DesktopRoomie-A00-M03.4-integrated-acceptance.md): owner-approved technical closeout on 2026-10-23, original G1/G2/G3 mapping, frozen source/CI identities, C1/C2 review provenance and accepted scaling/native-host qualifications; C3 review was approved on 2026-10-23; verified C4 publication and matching CI are recorded in the acceptance record.
-- [A00-M03.4 host architecture decision](DesktopRoomie-A00-M03.4-host-architecture-decision.md): owner-ratified existing Rust/x11rb managed Openbox/X11/Picom approach, required facilities, preserved source boundaries and known limits; no redesign or A01 authority.
-- [D00-M01 documentation/context hygiene](DesktopRoomie-D00-M01-documentation-context-hygiene.md): **accepted** docs-only context layer, with independent review and owner approval recorded in the mission document.
-- [A00-M01 desktop probe](DesktopRoomie-A00-M01-desktop-probe.md): accepted foundation's original contract.
-- [A00-M02 dragging and release](DesktopRoomie-A00-M02-dragging-and-release.md): accepted foundation's original detailed contract.
-- [A00-M03 placement, recovery and host selection](DesktopRoomie-A00-M03-placement-recovery-host-selection.md): accepted M03.1 contract and recovery separation; M03.2 is formally accepted at frozen executable `a46e432…`. Its M03.3 section now points to the owner-approved P0 architecture and staged roadmap for Bring Here and composed Recover.
-- [A00-M03.2 approved implementation design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md): authoritative independently reviewed visibility/IPC/input protocols, tests, host gates, and stop conditions. **Historical approved technical baseline with dated Show-only 2500 ms and Openbox off-workspace amendments; M03.2 is now formally accepted after H-A sign-off. The Stage-G plan below supersedes older Bring Top timing assumptions.**
-- [A00-M03.2-G approved implementation plan](DesktopRoomie-A00-M03.2-stage-G-approved-plan.md): owner-approved visibility→Above composition, structured Partial semantics, narrow off-workspace layer eligibility, event-loop progression, failure/test matrices, and D1/D2 timing (**3500 ms owner / 2500 ms visibility / ≤1000 ms layer; 5000 ms Bring Top caller**). **Historical approved plan, now implemented and owner-accepted at G3 `80d7df4…`; see Stage-G host evidence below.**
-- [A00-M03.2 approved staged implementation roadmap](DesktopRoomie-A00-M03.2-staged-implementation-roadmap.md): historical owner-approved A–H checkpoint boundaries, dependencies, test/host gates, publication rules, and Codex effort guidance. **M03.2 is now formally accepted**; later M03.3 work does not alter that evidence identity.
-- [A00-RF modularization closeout](DesktopRoomie-A00-RF-modularization-plan.md#current-closeout-2026-10-21): RF1 and RF2a–d complete; exact reviewed/published SHA and CI table, owner-reported RF2d native observations, current responsibilities and resolved coupling. RF2e/f are deferred; structural work is closed at RF2d unless a concrete future need justifies reopening it. The original RF-P inventory, line counts, RF1a contract and candidate sequencing remain explicitly archived historical planning evidence, not current source locations or next-step authority. RF3 is conditional.
-- [A00-M03.3 approved staged implementation roadmap](DesktopRoomie-A00-M03.3-staged-implementation-roadmap.md): binding P0 contracts and A–G gates. A/B/H0/C/D/E accepted; Stage F deterministic test-hardening complete; **Stage G integrated native acceptance owner-approved on 2026-10-22**.
-- [A00-M03.3 Stage F-P coverage and architecture audit](DesktopRoomie-A00-M03.3-stage-F-coverage-audit.md): original read-only 737-test audit, preserved as historical findings and proposed G1–G3 work; subsequent F checkpoints are recorded in the separate closeout.
-- [A00-M03.3 Stage-F deterministic closeout](DesktopRoomie-A00-M03.3-stage-F-closeout.md): F-T1a/b, F-T2 and F-T3 SHA/CI chain, 737→760 tests, closed G1–G3 gaps and historically identified Stage G boundaries.
-- [A00-M03.3 Stage-G integrated owner-native acceptance](DesktopRoomie-A00-M03.3-stage-G-acceptance.md): 2026-10-22 signed G0–G4 native matrix, exact code/docs identity, interaction/concurrency/lifecycle observations and explicitly unexercised host/failure scenarios.
-- [A00-M03.3 H0 Openbox feasibility evidence](../experiments/desktop-probe/M03.3-H0-OPENBOX.md): owner-native source-1 `_NET_WM_DESKTOP` relocation evidence, layer/minimization preservation, observed event patterns, geometry classification and Stage-C design boundary.
-- [A00-M03.3 Stage-C implementation/acceptance](../experiments/desktop-probe/M03.3-C-IMPLEMENTATION.md): historical checked transport-only checkpoint, later consumed by accepted Stage D.
-- [A00-M03.3 Stage-D acceptance](../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md): exact D1–D4.1 code/CI chain, rejected original D4 source review, public Here proof/semantics, owner-native evidence and qualified exclusions.
-- [A00-M03.3 Stage-E acceptance](../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md): frozen E4 `aa00f8e94aff1cf2ef1ff6a6cecf734f822d5603`, [CI 39529051360](https://github.com/zNe4/DesktopRoomie/actions/runs/39529051360), 737 tests; E1–E4 source/CI chain, public Recover and qualified N01–N19 owner-native evidence, including the corrected N13 harness incident.
-- [A00-M03.3 Stage-D historical proposed plan](DesktopRoomie-A00-M03.3-stage-D-proposed-plan.md): originally approved checkpoint design; dated future-tense is not the current executable status.
-- [A00-M03.3 Stage-E historical approved E-P implementation plan](DesktopRoomie-A00-M03.3-stage-E-approved-plan.md): preserved read-only Codex architecture, exact phase/deadline/proof/fatal semantics, binding independent review refinements, and **E1–E4** gated source/CI/native sequence, now implemented and accepted. Its original approval/Unsupported statements describe the pre-E1 Stage-D snapshot, not current execution or new authority.
-- [Openbox host integration](host/OPENBOX.md): optional user-managed shortcut/launcher/autostart guidance, distinct from correctness-critical executable behavior. Records historical failed M03.2 F evidence, manual ADD/REMOVE-HIDDEN experiments, implemented request matrix and [corrected F acceptance](host/OPENBOX.md#stage-f-acceptance-recorded-2026-10-13). Hide, local/off-workspace Show, original-workspace Bring Top, standalone Bring Here and composed Recover are accepted on the exercised Openbox host with their recorded qualifications. Optional Openbox shortcuts remain user-managed.
+- A01-C1-A: [C1-A acceptance](A01-C1-A-ACCEPTANCE.md).
+- A01-C1-B-B1: [B1 acceptance record](A01-C1-B-B1-ACCEPTANCE.md).
+- A01-C1-B-B2: [B2 acceptance record](A01-C1-B-B2-ACCEPTANCE.md).
+- A01-C1-B-B3a: [B3a acceptance record](A01-C1-B-B3a-ACCEPTANCE.md).
+- A01-C1-B-B3b: [B3b acceptance record](A01-C1-B-B3b-ACCEPTANCE.md).
+- A01-C1-C-A1/A2: [A1/A2 acceptance record](A01-C1-C-A1-A2-ACCEPTANCE.md).
+- A01-C1-C-B1: [B1 acceptance record](A01-C1-C-B1-ACCEPTANCE.md).
+- A01-C1-C-B2-D1: [D1 acceptance record](A01-C1-C-B2-D1-ACCEPTANCE.md).
+- A01-C1-C-B2-D2-C: [D2-C acceptance record](A01-C1-C-B2-D2-C-ACCEPTANCE.md).
+- A01-C1-C-B2-D3-A: [D3-A acceptance record](A01-C1-C-B2-D3-A-ACCEPTANCE.md).
+- [A01-C1-C-B2-D3-P ratified architecture specification](plans/A01-C1-C-B2-D3-P-SPECIFICATION.md).
+- [Ratified D3-B-P specification](plans/A01-C1-C-B2-D3-B-P-SPECIFICATION.md).
+- [D3-B acceptance record](A01-C1-C-B2-D3-B-ACCEPTANCE.md).
+- A01-C1-B-B4: [B4 acceptance record](A01-C1-B-B4-ACCEPTANCE.md).
+- [A00-M03.4 integrated A00 acceptance](DesktopRoomie-A00-M03.4-integrated-acceptance.md).
+- [A00-M03.4 host architecture decision](DesktopRoomie-A00-M03.4-host-architecture-decision.md).
+- [D00-M01 documentation/context hygiene](DesktopRoomie-D00-M01-documentation-context-hygiene.md).
+- [A00-M01 desktop probe](DesktopRoomie-A00-M01-desktop-probe.md).
+- [A00-M02 dragging and release](DesktopRoomie-A00-M02-dragging-and-release.md).
+- [A00-M03 placement, recovery and host selection](DesktopRoomie-A00-M03-placement-recovery-host-selection.md).
+- [A00-M03.2 approved implementation design](DesktopRoomie-A00-M03.2-approved-implementation-plan.md).
+- [A00-M03.2-G approved implementation plan](DesktopRoomie-A00-M03.2-stage-G-approved-plan.md).
+- [A00-M03.2 approved staged implementation roadmap](DesktopRoomie-A00-M03.2-staged-implementation-roadmap.md).
+- [A00-RF modularization closeout](DesktopRoomie-A00-RF-modularization-plan.md#current-closeout-2026-10-21).
+- [A00-M03.3 approved staged implementation roadmap](DesktopRoomie-A00-M03.3-staged-implementation-roadmap.md).
+- [A00-M03.3 Stage F-P coverage and architecture audit](DesktopRoomie-A00-M03.3-stage-F-coverage-audit.md).
+- [A00-M03.3 Stage-F deterministic closeout](DesktopRoomie-A00-M03.3-stage-F-closeout.md).
+- [A00-M03.3 Stage-G integrated owner-native acceptance](DesktopRoomie-A00-M03.3-stage-G-acceptance.md).
+- [A00-M03.3 H0 Openbox feasibility evidence](../experiments/desktop-probe/M03.3-H0-OPENBOX.md).
+- [A00-M03.3 Stage-C implementation/acceptance](../experiments/desktop-probe/M03.3-C-IMPLEMENTATION.md).
+- [A00-M03.3 Stage-D acceptance](../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md).
+- [A00-M03.3 Stage-E acceptance](../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md); [CI 39529051360](https://github.com/zNe4/DesktopRoomie/actions/runs/39529051360).
+- [A00-M03.3 Stage-D historical proposed plan](DesktopRoomie-A00-M03.3-stage-D-proposed-plan.md).
+- [A00-M03.3 Stage-E historical approved E-P implementation plan](DesktopRoomie-A00-M03.3-stage-E-approved-plan.md).
+- [Openbox host integration](host/OPENBOX.md); [corrected F acceptance](host/OPENBOX.md#stage-f-acceptance-recorded-2026-10-13).
 
 ## Acceptance and historical explanation
 
-| Checkpoint | Evidence | Explanation |
-| --- | --- | --- |
-| M01 | [ACCEPTANCE](../experiments/desktop-probe/ACCEPTANCE.md) | [ENVIRONMENT](../experiments/desktop-probe/ENVIRONMENT.md): dated M01 host facts with M02 reconciliation, not a live host query. |
-| Integrated M02 | [ACCEPTANCE-M02](../experiments/desktop-probe/ACCEPTANCE-M02.md) | [M02.5](../experiments/desktop-probe/M02.5-IMPLEMENTATION.md): movement/lifecycle safety; [M02.6](../experiments/desktop-probe/M02.6-IMPLEMENTATION.md): popup/capture. Later M03.1 extends the menu. |
-| M03.1 | [ACCEPTANCE-M03.1](../experiments/desktop-probe/ACCEPTANCE-M03.1.md) | [M03.1 implementation](../experiments/desktop-probe/M03.1-IMPLEMENTATION.md): layer ownership, protocol, deadline decisions and corrected publication trail. |
-| M03.2 Stage F | [Stage-F acceptance](host/OPENBOX.md#stage-f-acceptance-recorded-2026-10-13): executable `ccd01915bef13850067391f70f1524362a6440dc`, CI 38349035176, 347 tests, owner native gates | [Historical Openbox amendment](host/OPENBOX.md#openbox-off-workspace-visibility-amendment-2026-10-10), including failed original F candidate preserved separately. |
-| M03.2 Stage H | [ACCEPTANCE-M03.2](../experiments/desktop-probe/ACCEPTANCE-M03.2.md): frozen `a46e432…`, [CI 39098551853](https://github.com/zNe4/DesktopRoomie/actions/runs/39098551853), 453 tests and H-N1/N2/N3 owner-native observations. | [M03.2 implementation](../experiments/desktop-probe/M03.2-IMPLEMENTATION.md). H23 conditional/not exercised; H14 unobserved; H28 optional. Final H-A owner sign-off completed 2026-10-18. |
-| M03.2 Stage G | [Stage-G acceptance](host/OPENBOX.md#stage-g-acceptance-recorded-2026-10-13): executable `80d7df4aa1524122bd7c232f5aa09a4e39c8dd9f`, CI 38468930784, 447 tests, G1/G2/G3 review plus owner native gates | [Approved G plan](DesktopRoomie-A00-M03.2-stage-G-approved-plan.md), [architecture](ARCHITECTURE.md), [current checkpoint](STATUS.md). H native verification and final H-A acceptance are separately recorded at the later H SHA. |
-| M03.3 Stage A | [Stage-A implementation](../experiments/desktop-probe/M03.3-A-IMPLEMENTATION.md): corrected executable `d7727b3…`, [CI 39152686625](https://github.com/zNe4/DesktopRoomie/actions/runs/39152686625), 488 tests. | Protocol v2/pure placement and Recover proof foundations accepted after correction; native Bring Here/Recover execution was Unsupported at that Stage-A executable. |
-| M03.3 Stage B | [Stage-B implementation](../experiments/desktop-probe/M03.3-B-IMPLEMENTATION.md): executable `4e2bd4d…`, [CI 39155316992](https://github.com/zNe4/DesktopRoomie/actions/runs/39155316992), 537 tests. | Strict read-only destination count/current/workarea/viewport/retained-monitor/fit evidence and two-read agreement; owner accepted after independent source review. H0 is separately accepted native evidence; Stage C and its transport-only acceptance are recorded independently. |
-| M03.3 Stage C | [Stage-C implementation](../experiments/desktop-probe/M03.3-C-IMPLEMENTATION.md): executable `58a1ffa…`, [CI 39159965288](https://github.com/zNe4/DesktopRoomie/actions/runs/39159965288), 542 tests. | Historical unwired checked `_NET_WM_DESKTOP` transport, later consumed by Stage D. |
-| M03.3 Stage D | [Stage-D acceptance](../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md): `4c67da0b09ffe7b69605ac4a415d256acf8abd23`, [CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762), 677 tests. | Public standalone Bring Here, independent source review including D4.1 fatal correction, owner Openbox N01–N09/N14–N16 qualified gates; Recover was Unsupported at that Stage-D executable. |
-| M03.3 Stage E | [Stage-E acceptance](../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md): frozen E4 `aa00f8e94aff1cf2ef1ff6a6cecf734f822d5603`, [CI 39529051360](https://github.com/zNe4/DesktopRoomie/actions/runs/39529051360), 737 tests, fmt/build/Clippy passed. | E1–E4 complete; public Recover accepted on tested Openbox/X11 with qualified owner N01–N19 evidence. Native forced-failure/Partial/OutcomeUnknown cases remain distinct from deterministic tests; F/G were future gates at that E4 checkpoint and were later completed separately. |
-| M03.3 Stage F | [Deterministic closeout](DesktopRoomie-A00-M03.3-stage-F-closeout.md): `f3458549dbbdd4b9ef42ed85d3bfaeb6ed683863`, [CI 39688537222](https://github.com/zNe4/DesktopRoomie/actions/runs/39688537222), 760 tests. | Four independently reviewed test-only checkpoints, +23 preserved identities, G1–G3 addressed. No new native host acceptance **during F**; Stage G was later accepted separately. |
-| M03.3 Stage G | [Owner-approved native acceptance](DesktopRoomie-A00-M03.3-stage-G-acceptance.md): frozen F-T3 executable, starting docs HEAD `ceedb0aec261531279a76f6dbf93950ac8837a20`, 760-test CI, owner signoff 2026-10-22. | G0–G4 PASS at exercised single-monitor X11/Openbox/Picom scope; drift, hotplug, physical forced-failure and interleaving cases explicitly unexercised. Subsequent M03.4 signoff remains separate evidence. |
-| M03.4 / overall A00 | [Integrated owner signoff](DesktopRoomie-A00-M03.4-integrated-acceptance.md#8-owner-signoff-and-documentation-closeout), 2026-10-23, on unchanged F-T3 and its existing 760-test CI. | [Ratified host ADR](DesktopRoomie-A00-M03.4-host-architecture-decision.md); original A00 requirements satisfied for the recorded target, with accepted untested scaling and all disclosed native/deterministic limits. No new native results; C3 review approved on 2026-10-23; C4 documentation publication/CI verified, distinct from F-T3 executable CI and any future C5 CI. |
-| R00-M13 P2-C2-B2 independent offscreen renderer | [B2 acceptance](renderer/R00-M13-P2-C2-B2/B2-ACCEPTANCE.md): owner closure 2026-11-19, D1 source review PASS and three N1 NVIDIA/Vulkan full-frame matches; frozen worker/source/oracle identities and retained native evidence. | Synthetic complex meshes and intersections only; separate from A00 host, with no live integration. B2-F independent checkpoint review approved on 2026-11-19. The owner subsequently confirmed Git publication. Approved manifest SHA-256 `d9f62fe98e6a7f1ed3f190e9b8a18e5d404b1e93f72a50734f57730a78026ad6`. No next milestone is authorized. |
-| R00-M13 P2-C2-C1 independent offscreen renderer | [C1 acceptance](renderer/R00-M13-P2-C2-C1/C1-ACCEPTANCE.md) records owner closure on 2026-11-21, independent D1 and R1 review, the blocked N1 attempt and three identical NVIDIA/Vulkan retry frames matching the frozen CPU reference. | Tested nonconstant PMA textured meshes with affine UVs and nearest sampling, separate from the A00 host. C2-C1-F independent checkpoint review approved on 2026-11-21. Approved manifest SHA-256 `eed5b0adf122ac19132219aaa71b14240b4779c1d6a09d917a51fa8e7e274786`. |
-| R00-M13 P2-C2-C2 independent offscreen renderer | [C2-C2 acceptance](renderer/R00-M13-P2-C2-C2/C2-C2-ACCEPTANCE.md) records owner closure on 2026-11-21, accepted C2-A/B/C native results, and independently approved F1/F2 preservation. | Tested synthetic atlas rendering only. The consolidated primary C2-C project is the baseline for separately authorized renderer work. |
-| R00-M13 P3 static Vanilla rendering | [P3 acceptance](renderer/R00-M13-P3/P3-ACCEPTANCE.md): owner approval on 2026-11-22, PMA preparation and corrected directional idle rendering. | Private offline/offscreen evaluation. Historical runtime evaluation permissions remain unconfirmed. |
-| R00-M13 P4-C1 native Vanilla animation preview | [P4-C1 acceptance](renderer/R00-M13-P4-C1/P4-C1-ACCEPTANCE.md) records independent source review and November 22 owner-native acceptance of continuous front-facing playback, window lifecycle and persistent renderer resources. | Native device loss remains untested and actual display scanout was unmeasured. |
-| R00-M13 P4-D native animation and directional transitions | [P4-D acceptance](renderer/R00-M13-P4-D/P4-D-ACCEPTANCE.md) records source identity, CPU verification, independent source review, owner-native acceptance and partial native telemetry. | Hard cuts are accepted. Back-facing idle is outside the script. Interactive desktop integration requires a separate assignment. |
+| Checkpoint | Evidence and explanation |
+| --- | --- |
+| M01 | [ACCEPTANCE](../experiments/desktop-probe/ACCEPTANCE.md); [ENVIRONMENT](../experiments/desktop-probe/ENVIRONMENT.md) |
+| Integrated M02 | [ACCEPTANCE-M02](../experiments/desktop-probe/ACCEPTANCE-M02.md); [M02.5](../experiments/desktop-probe/M02.5-IMPLEMENTATION.md); [M02.6](../experiments/desktop-probe/M02.6-IMPLEMENTATION.md) |
+| M03.1 | [ACCEPTANCE-M03.1](../experiments/desktop-probe/ACCEPTANCE-M03.1.md); [M03.1 implementation](../experiments/desktop-probe/M03.1-IMPLEMENTATION.md) |
+| M03.2 Stage F | [Stage-F acceptance](host/OPENBOX.md#stage-f-acceptance-recorded-2026-10-13); [Historical Openbox amendment](host/OPENBOX.md#openbox-off-workspace-visibility-amendment-2026-10-10) |
+| M03.2 Stage H | [ACCEPTANCE-M03.2](../experiments/desktop-probe/ACCEPTANCE-M03.2.md); [CI 39098551853](https://github.com/zNe4/DesktopRoomie/actions/runs/39098551853); [M03.2 implementation](../experiments/desktop-probe/M03.2-IMPLEMENTATION.md) |
+| M03.2 Stage G | [Stage-G acceptance](host/OPENBOX.md#stage-g-acceptance-recorded-2026-10-13); [Approved G plan](DesktopRoomie-A00-M03.2-stage-G-approved-plan.md); [architecture](ARCHITECTURE.md); [current checkpoint](STATUS.md) |
+| M03.3 Stage A | [Stage-A implementation](../experiments/desktop-probe/M03.3-A-IMPLEMENTATION.md); [CI 39152686625](https://github.com/zNe4/DesktopRoomie/actions/runs/39152686625) |
+| M03.3 Stage B | [Stage-B implementation](../experiments/desktop-probe/M03.3-B-IMPLEMENTATION.md); [CI 39155316992](https://github.com/zNe4/DesktopRoomie/actions/runs/39155316992) |
+| M03.3 Stage C | [Stage-C implementation](../experiments/desktop-probe/M03.3-C-IMPLEMENTATION.md); [CI 39159965288](https://github.com/zNe4/DesktopRoomie/actions/runs/39159965288) |
+| M03.3 Stage D | [Stage-D acceptance](../experiments/desktop-probe/M03.3-D-ACCEPTANCE.md); [CI 39377294762](https://github.com/zNe4/DesktopRoomie/actions/runs/39377294762) |
+| M03.3 Stage E | [Stage-E acceptance](../experiments/desktop-probe/M03.3-E-ACCEPTANCE.md); [CI 39529051360](https://github.com/zNe4/DesktopRoomie/actions/runs/39529051360) |
+| M03.3 Stage F | [Deterministic closeout](DesktopRoomie-A00-M03.3-stage-F-closeout.md); [CI 39688537222](https://github.com/zNe4/DesktopRoomie/actions/runs/39688537222) |
+| M03.3 Stage G | [Owner-approved native acceptance](DesktopRoomie-A00-M03.3-stage-G-acceptance.md) |
+| M03.4 / overall A00 | [Integrated owner signoff](DesktopRoomie-A00-M03.4-integrated-acceptance.md#8-owner-signoff-and-documentation-closeout); [Ratified host ADR](DesktopRoomie-A00-M03.4-host-architecture-decision.md) |
+| R00-M13 P2-C2-B2 independent offscreen renderer | [B2 acceptance](renderer/R00-M13-P2-C2-B2/B2-ACCEPTANCE.md) |
+| R00-M13 P2-C2-C1 independent offscreen renderer | [C1 acceptance](renderer/R00-M13-P2-C2-C1/C1-ACCEPTANCE.md) |
+| R00-M13 P2-C2-C2 independent offscreen renderer | [C2-C2 acceptance](renderer/R00-M13-P2-C2-C2/C2-C2-ACCEPTANCE.md) |
+| R00-M13 P3 static Vanilla rendering | [P3 acceptance](renderer/R00-M13-P3/P3-ACCEPTANCE.md) |
+| R00-M13 P4-C1 native Vanilla animation preview | [P4-C1 acceptance](renderer/R00-M13-P4-C1/P4-C1-ACCEPTANCE.md) |
+| R00-M13 P4-D native animation and directional transitions | [P4-D acceptance](renderer/R00-M13-P4-D/P4-D-ACCEPTANCE.md) |
 
-Earlier pending/unimplemented labels describe their original checkpoints. Lifecycle notes point to later acceptance without rewriting historical contracts or observations. **E-P records historical design approval; the separate Stage-E acceptance records its later implementation and qualified native verification.** Stage F deterministic hardening and Stage G owner-native acceptance retain separate accepted closeouts; M03.4 records the subsequent overall A00 decision without broadening their evidence.
+Historical labels apply to their original candidates. Use [STATUS](STATUS.md) for the maintained checkpoint and publication reconciliation; records retain distinct evidence scopes.
 
 ## Plans, research and possibilities
 
-- The R00-M12-S1-B/C owner decision records the separate optional Spine backend and experimental evidence limits. It includes Esoteric Software’s owner-supplied written clarification of the optional backend terms, dated 2026-11-23. [Spine backend separation decision](research/R00-M12-spine-backend-separation-decision.md)
-- [Product roadmap](DesktopRoomie-roadmap-v0.1.md): proposed long-term adventures and private-content directions, not implemented services.
-- [A00/A01 execution plan](DesktopRoomie-A00-A01-plan-v0.1.md): proposed desktop goals, defaults, boundaries and future scenes.
-- [R00 research roadmap](research/ProjectVanilla-R00-external-projects-research-roadmap.md): just-in-time investigations and timing; not a list of required implementations.
-- [Completed R00-M01 host study](research/studies/R00-M01-nekoai-linux-host-a00-g3.md): target-host findings and recommendations informing A00-G3; not authority to adopt third-party code or a new host.
-- [Idea inventory](research/project_vanilla_all_ideas_design_inventory_v0.1.txt): historical design space, alternatives and experiments, not commitments.
-- [DesktopRoomie verification skill](../.agents/skills/desktoproomie-verify/SKILL.md): Rust-change verification procedure; docs-only missions use content/diff review.
+- [Spine backend separation decision](research/R00-M12-spine-backend-separation-decision.md).
+- [Product roadmap](DesktopRoomie-roadmap-v0.1.md).
+- [A00/A01 execution plan](DesktopRoomie-A00-A01-plan-v0.1.md).
+- [R00 research roadmap](research/ProjectVanilla-R00-external-projects-research-roadmap.md).
+- [Completed R00-M01 host study](research/studies/R00-M01-nekoai-linux-host-a00-g3.md).
+- [Idea inventory](research/project_vanilla_all_ideas_design_inventory_v0.1.txt).
+- [DesktopRoomie verification skill](../.agents/skills/desktoproomie-verify/SKILL.md).

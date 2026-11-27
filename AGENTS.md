@@ -1,103 +1,20 @@
-# Project Vanilla / DesktopRoomie — Codex instructions
+# Project Vanilla / DesktopRoomie — Agent instructions
 
-## Identity and principles
+DesktopRoomie (`zNe4/DesktopRoomie`) is the reusable software; Project Vanilla is its private character implementation. Work from the current repository root; `~/Desktop/Utils/ProjectVanilla` is intentional. Do not rename or relocate it. The Rust/X11 probe is a technical foundation, not the complete companion.
 
-Project Vanilla is a long-term modular desktop-companion and character-simulation project. DesktopRoomie (`zNe4/DesktopRoomie`) is the repository and reusable software name; Project Vanilla is its private character implementation. The local directory `~/Desktop/Utils/ProjectVanilla` is intentional. Work from the current Git repository root; do not rename or relocate it.
+## Bootstrap and authority
 
-The Rust/X11 application in `experiments/desktop-probe/` is a technical foundation, not the complete companion. Develop incrementally, keep the executable usable, and avoid speculative infrastructure. Future design favors explicit state ownership, logical module boundaries, replaceable services, and separation of simulation from presentation. These principles do not authorize adding Brain, Spine, memory, or service architecture during unrelated missions.
+Read this file → [STATUS](docs/STATUS.md) → the explicit assignment and its approved specification → the applicable [INDEX profile](docs/INDEX.md#reading-profiles). Before assigned actions, selectively read applicable [ARCHITECTURE](docs/ARCHITECTURE.md), [INVARIANTS](docs/INVARIANTS.md) and [WORKFLOW](docs/WORKFLOW.md) obligations. Record applicability or justified non-applicability in the handoff. Documentation-only tasks do not exempt binding obligations; load deeper contracts/evidence when a claim or action depends on them.
 
-## Responsibilities and mission discipline
+[WORKFLOW](docs/WORKFLOW.md) owns roles, mission authority, verification, review, evidence and publication procedures. STATUS is a checkpoint, not execution authority. Approved specifications and explicit approved decisions define scope; roadmaps, research, idea inventories and historical next-task prose grant none. Fresh sessions must reconstruct authority without previous conversations; use [document responsibilities](docs/WORKFLOW.md#document-responsibilities) to resolve conflicts rather than silently weakening requirements.
 
-The project uses a supervised multi-agent workflow:
+## Mandatory guardrails
 
-- **ChatGPT, in a separate authoritative session:** external research and literature reviews; architecture recommendations and decisions; authoritative research, design and roadmap documentation; bounded implementation specifications and Codex prompts; model/reasoning selection and independent review.
-- **Codex:** inspect code and interfaces; prepare read-only, mission-scoped implementation plans; implement approved coding missions, tests and debugging; perform applicable verification; contribute implementation-specific notes and evidence; report gaps and risks. Codex does not independently adopt research, architecture or roadmap changes.
-- **Human owner:** supervise, approve decisions and scope changes, perform manual desktop acceptance, and authorize mission-scoped Git publication where appropriate. The owner is Codex's intermediary with the authoritative ChatGPT session.
+- Work one assigned mission at a time. Inspect actual branch, HEAD, tracked/untracked status, relevant interfaces and approved contract before editing. Preserve owner changes and verified behavior; prefer small auditable changes. Do not advance missions, implement roadmap features or refactor unrelated code.
+- No branch creation/switch, commit, push, merge, discard or publication without explicit mission-scoped authority. The named branch/base and exact allowed actions must come from the assignment; older examples are not permission. Stop on branch/base mismatch, divergence, unexpected remote movement, unrelated dirty owner changes or rejection of an ordinary non-force push. Do not reconcile automatically. Follow [publication restrictions](docs/WORKFLOW.md#mission-scoped-publication), including no direct main push, merge, force-push, history rewrite, branch deletion or releases/tags by the implementer. Push/CI success is not acceptance.
+- Preserve implemented ownership under ARCHITECTURE and technical guarantees under INVARIANTS and applicable mission contracts: pure logic/native host separation, one explicit state owner, focus isolation, safe pointer capture/release and cleanup, click-through, checked coordinates/bounds, event-driven processing and honest errors. Consequential architecture or guarantee changes require architect resolution and owner ratification; do not invent Brain/Spine/memory/service infrastructure during unrelated work.
+- External/comparative research and architecture/roadmap adoption belong to the assigned architect, not an implementer's initiative. Repository/dependency/API inspection remains implementation work. Report unresolved research/design dependencies without triggering unrelated studies. Build independently; third-party source/assets/prompts/architecture reuse needs approved scope and provenance/license review.
+- Keep public engine and private content separate. Do not put copyrighted NEKOPARA assets, extracted dialogue/voice, trained character models or private sensor data in the public repository. Use synthetic fixtures. Authorized private review evidence stays outside public artifacts under WORKFLOW.
+- Run all applicable required checks; never fabricate execution or acceptance. Rust changes use the [verification procedure](.agents/skills/desktoproomie-verify/SKILL.md) and mission-specific requirements. Documentation-only work uses scoped content/diff/path checks. Automated, injected, CI, independent review and owner-native results have distinct proof boundaries; actual X11/compositor acceptance remains owner-controlled.
 
-Work on one assigned mission at a time. Read its specification and inspect existing code and Git status before editing. Respect explicit scope boundaries, preserve local changes and already verified behavior, and prefer small, auditable changes. Do not implement future roadmap features opportunistically or perform unrelated refactoring. Report ambiguities before consequential decisions. Alternatives may be proposed, but consequential architectural changes require approval.
-
-### Mission-scoped Git authority
-
-By default, do not create branches, commit, push, merge, discard changes, or advance missions without explicit authorization. Older documents and example workflows are not standing authorization.
-
-The owner may authorize publication in a **specific assignment** that names the target mission branch (such as `m03`), expected starting branch/base SHA, and permission to commit/push. In that case, and only for that assignment, Codex may create/switch to the named branch when instructed, commit only verified mission-scoped work, and push that branch to `origin` with an ordinary non-force push.
-
-Codex may not push directly to `main`, merge, force-push, rewrite published history, delete branches, create releases/tags, or include unrelated local/owner changes. Inspect status, HEAD, diff, and intended paths before the commit; preserve existing work. On branch/base mismatch, divergence, unexpected remote movement, unrelated dirty owner changes, or a normal push rejection, stop and report; do not automatically merge, rebase, force, discard, or reconcile. Never treat a successful push or CI run as owner acceptance.
-
-Report the authorized branch, base SHA, new commit/pushed SHA, checks performed, push result, pending CI/manual acceptance, and final Git status. ChatGPT independently reviews the exact published diff and CI; the owner controls acceptance and merges. Follow the detailed process in [docs/WORKFLOW.md](docs/WORKFLOW.md).
-
-## Documentation and authority
-
-The current mission specification and explicitly approved decisions determine implementation scope. Planning documents provide context; their proposals and historical status labels are not proof of current implementation or acceptance. Inspect code and verification evidence.
-
-**Cold-start reading order:** this file → [current checkpoint](docs/STATUS.md) → [implemented architecture](docs/ARCHITECTURE.md) → [accepted invariants](docs/INVARIANTS.md) → the assigned approved mission specification. Use [docs/INDEX.md](docs/INDEX.md) for relevant deeper contracts, evidence, historical explanation, plans, and research; do not load all history by default.
-
-STATUS is a checkpoint, not execution authority. ARCHITECTURE describes implemented source ownership. INVARIANTS are accepted review obligations. Acceptance records distinguish tested executable code from later documentation-only HEADs. The accepted D00-M01 contract established this context layer.
-
-**Current checkpoint (2026-10-23): A00 technical acceptance OWNER-APPROVED; M03.4 closeout decision recorded.** The [integrated acceptance](docs/DesktopRoomie-A00-M03.4-integrated-acceptance.md) and [owner-ratified host ADR](docs/DesktopRoomie-A00-M03.4-host-architecture-decision.md) select the existing Rust/x11rb managed X11 host on Archcraft/Openbox 3.6.1/Picom v13. Frozen accepted F-T3 executable `f3458549dbbdd4b9ef42ed85d3bfaeb6ed683863`, [CI 39688537222](https://github.com/zNe4/DesktopRoomie/actions/runs/39688537222), **760 tests**, is unchanged. The owner accepted the explicitly untested display-scaling qualification and all disclosed native-host/deterministic limits without additional host tests; this is not arbitrary-scaling, mixed-DPI, other-WM or Wayland validation. A00 proves the technical host, not the complete companion. ChatGPT approved the C2 documents for their reviewed scope. A00-M03.4-C3 documentation changes were independently reviewed and approved by ChatGPT on 2026-10-23. C4 documentation was published as [`ba85fdb…`](https://github.com/zNe4/DesktopRoomie/commit/ba85fdb110190c21c581b48f462319e7e360c6d3); [matching CI 40012131509](https://github.com/zNe4/DesktopRoomie/actions/runs/40012131509) succeeded with 760 passed, 0 failed, and formatting/build/Clippy PASS. That CI applies to C4; it does not verify later documentation changes.
-
-The [Stage G closeout](docs/DesktopRoomie-A00-M03.3-stage-G-acceptance.md), [Stage F closeout](docs/DesktopRoomie-A00-M03.3-stage-F-closeout.md), [Stage-E feature acceptance](experiments/desktop-probe/M03.3-E-ACCEPTANCE.md) and [RF architectural closeout](docs/DesktopRoomie-A00-RF-modularization-plan.md#current-closeout-2026-10-21) retain their separate evidence identities; RF2e/f remain deferred. [STATUS](docs/STATUS.md) and [ARCHITECTURE](docs/ARCHITECTURE.md) contain the current checkpoint and unchanged source owners. **A01 is the next adventure and requires separate owner authorization**, including its monitor/workspace and presentation/behavior decisions; this pointer grants none.
-
-Relevant implementation references:
-
-- [Product roadmap](docs/DesktopRoomie-roadmap-v0.1.md): long-term direction and proposed sequencing.
-- [A00/A01 plan](docs/DesktopRoomie-A00-A01-plan-v0.1.md): desktop goals, proposed defaults, boundaries, and acceptance scenes.
-- [Desktop probe specification](docs/DesktopRoomie-A00-M01-desktop-probe.md) and [dragging/release specification](docs/DesktopRoomie-A00-M02-dragging-and-release.md): detailed contracts when the corresponding work is assigned.
-- [Environment record](experiments/desktop-probe/ENVIRONMENT.md) and [M01 acceptance report](experiments/desktop-probe/ACCEPTANCE.md): recorded host facts and verification evidence. The recorded target is Openbox/X11 with Picom; older bspwm ideas do not establish the actual target or compatibility elsewhere.
-
-`docs/research/` preserves possibilities, investigations, and evidence. Distinguish:
-
-1. [Idea inventory](docs/research/project_vanilla_all_ideas_design_inventory_v0.1.txt): possibilities and historical experiments, not approved requirements.
-2. [R00 research roadmap](docs/research/ProjectVanilla-R00-external-projects-research-roadmap.md): future investigations and their timing, not permission to implement findings.
-3. Completed research findings: evidence informing design, not automatic coding instructions.
-4. Approved implementation missions: actual coding instructions and acceptance contracts.
-
-External research belongs to ChatGPT. Codex consumes approved findings and implementation contracts; ordinary inspection of this repository, existing dependencies, and relevant API contracts remains implementation work. Do not independently conduct broad external or comparative research, select a new architecture, or adopt a third-party implementation because it seems preferable. Report unresolved architectural questions or research dependencies to the owner. Do not automatically trigger R00 studies or block unrelated implementation on them.
-
-Build independently. Do not copy third-party source code, assets, prompts, or architecture wholesale. Raise relevant license, attribution, and provenance concerns; actual reuse needs an approved scope decision.
-
-## Engineering and content boundaries
-
-Preserve the existing Rust architecture: pure geometry and interaction logic, X11 host operations under `src/x11/`, and startup/event/lifecycle coordination in `src/main.rs`. Change boundaries only as the assigned mission requires, without introducing a speculative framework.
-
-Preserve these invariants, using mission specifications for detailed requirements:
-
-- Explicit resource ownership and cleanup, including checked release and cleanup attempts after failures.
-- Safe pointer capture acquisition, completion, cancellation, and release.
-- Keyboard-focus isolation and transparent click-through outside intended input regions.
-- Correct distinction between root and local coordinates; checked geometry, arithmetic, fit, and bounds.
-- Event-driven processing where practical, without unnecessary idle polling.
-- Deterministic tests for meaningful pure logic and transitions.
-- Explicit error handling, recovery, and honest diagnostics.
-
-Keep the potentially reusable public engine separate from private character content. Do not introduce copyrighted NEKOPARA assets, extracted dialogue, voice recordings, trained character models, or private sensor data into the public repository. Use synthetic fixtures where appropriate.
-
-## Verification
-
-The probe has its own Cargo manifest. Run these from the repository root after applicable code changes:
-
-```sh
-cargo build --manifest-path experiments/desktop-probe/Cargo.toml
-cargo fmt --manifest-path experiments/desktop-probe/Cargo.toml --check
-cargo clippy --manifest-path experiments/desktop-probe/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path experiments/desktop-probe/Cargo.toml
-```
-
-To apply formatting, use `cargo fmt --manifest-path experiments/desktop-probe/Cargo.toml`.
-
-Run and diagnostic commands:
-
-```sh
-cargo run --manifest-path experiments/desktop-probe/Cargo.toml
-cargo run --manifest-path experiments/desktop-probe/Cargo.toml -- --delay 2 --duration 30
-cargo run --manifest-path experiments/desktop-probe/Cargo.toml -- --duration 5
-cargo run --manifest-path experiments/desktop-probe/Cargo.toml -- --diagnose
-```
-
-Runtime checks require the actual X11 session; visible transparency also depends on the compositor. Automated checks cannot prove focus preservation, click-through, managed movement, or pointer recovery on the desktop. The owner performs manual acceptance against the assigned mission's checklist. Record actual outcomes and distinguish real-host tests from injected failures, untested cases, and accepted limitations. Preserve historical acceptance reports; add or update evidence only within assigned scope.
-
-Run checks appropriate to the change and all checks required by the mission. Documentation-only changes require content/diff review rather than unnecessary desktop execution. Never claim a check ran when it did not. Compilation alone does not complete a mission; required acceptance evidence and review still apply.
-
-## Implementation completion reports
-
-Report the implemented changes, files changed, tests and checks actually executed with results, important technical decisions, remaining risks or limitations, manual testing required, and final Git status. Include commit information when committing was authorized; otherwise state that no commit was made. Clearly distinguish implementation progress from pending manual acceptance or independent review.
+Return the [compact evidence-backed handoff](docs/WORKFLOW.md#evidence-and-handoffs), including final Git state and whether a commit was made. Stop at the assignment's next gate; independent review and owner acceptance are not self-awarded.
